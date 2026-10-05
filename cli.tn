@@ -1,0 +1,507 @@
+# The ternts commands that need no tasks or processes: flags, one file, --outdir, --bench and
+# `ternts build`. Shared by main.tn (native) and wasi.tn (WebAssembly).
+import fs
+import os
+import time
+import packages
+import state
+import ts
+import tsconfig
+
+struct Args:
+    args: [str]                         # as given (dev's command follows `--`)
+    o: ts.Opts                          # from the flags
+    jsx_given: bool
+    project: str                        # -p
+    rest: [str]                         # everything else, in order
+
+fn parse(args: [str]) Args:
+    use_define = false
+    esm = false
+    interop = false
+    strict = false
+    jsx = ts.JSX_AUTO
+    jsx_source = "react"
+    jsx_factory = "React.createElement"
+    jsx_frag = "React.Fragment"
+    jsx_given = false
+    project = ""
+    project_next = false
+    target = 0
+    target_next = false
+    rest: [str] = []
+    for k in 1..len(args):
+        if project_next:
+            project = args[k]
+            project_next = false
+            continue
+        if target_next:
+            target = tsconfig.target_year(args[k].lower())
+            target_next = false
+            continue
+        if args[k] == "--":                 # dev: the app's command follows
+            break
+        if args[k] == "-p" or args[k] == "--project":
+            project_next = true
+        elif args[k].starts_with("--project="):
+            project = args[k][10..]
+        elif args[k] == "--target":
+            target_next = true
+        elif args[k].starts_with("--target="):
+            target = tsconfig.target_year(args[k][9..].lower())
+        elif args[k] == "--define":
+            use_define = true
+        elif args[k] == "--esm":
+            esm = true
+        elif args[k] == "--interop":
+            interop = true
+        elif args[k] == "--strict":
+            strict = true
+        elif args[k].starts_with("--jsx="):
+            jsx = jsx_mode(args[k][6..])
+            jsx_given = true
+        elif args[k].starts_with("--jsx-import-source="):
+            jsx_source = args[k][20..]
+        elif args[k].starts_with("--jsx-factory="):
+            jsx_factory = args[k][14..]
+        elif args[k].starts_with("--jsx-fragment="):
+            jsx_frag = args[k][15..]
+        elif args[k] == "--import-meta-cjs":
+            os.setenv("TERNTS_IMPORT_META_CJS", "1")
+        elif args[k] == "--jest-hoist":
+            os.setenv("TERNTS_JEST_HOIST", "1")
+        elif args[k] == "--sourcemap":
+            os.setenv("TERNTS_SOURCEMAP", "1")
+        elif args[k].starts_with("@"):
+            for line in read_or_exit(args[k][1..]).split("\n"):
+                if line != "":
+                    rest.push(line)
+        else:
+            rest.push(args[k])
+    o = mk_opts(use_define, esm, interop, strict, jsx, jsx_source, jsx_factory, jsx_frag)
+    o.target = target
+    return Args(args, o, jsx_given, project, rest)
+
+# Whether the command needs tasks or processes: dev, build --watch, --serve.
+fn is_async(a: Args) bool:
+    if len(a.rest) >= 1 and a.rest[0] == "--serve":
+        return true
+    if len(a.rest) >= 1 and a.rest[0] == "dev":
+        return true
+    return len(a.rest) >= 1 and a.rest[0] == "build" and has(a.rest, "--watch")
+
+struct Project:
+    src: str
+    out: str
+    o: ts.Opts
+
+# build/dev: SRC, OUT and the options, from the words given and the tsconfig.
+fn project(a: Args) Project:
+    pos = positional(a.rest)
+    o = a.o
+    src = ""
+    out = ""
+    if len(pos) >= 3:
+        src = pos[1]                        # given: they win over the tsconfig's directories
+        out = pos[2]
+    if a.project != "" or len(pos) < 3:
+        # the project in tsconfig.json: its files, options, and (without SRC OUT) directories
+        cfg = a.project
+        if cfg == "":
+            cfg = "tsconfig.json"
+        c = tsconfig.load(cfg)
+        if c.err != "":
+            os.eprint("ternts: " + c.err + " (give SRC and OUT, or -p tsconfig.json)")
+            os.exit(1)
+        for w in c.warnings:
+            os.eprint("ternts: " + cfg + ": " + w)
+        o = tsconfig.options(c, o, a.jsx_given)
+        if src == "":
+            if c.no_emit:
+                os.eprint("ternts: " + cfg + " has noEmit, so tsc writes nothing for it; give SRC and OUT to build it anyway")
+                os.exit(1)
+            src = c.root
+            if src == "":
+                src = common_dir(tsconfig.project_files(c))
+            out = c.out_dir
+            if out == "":
+                out = src                   # no outDir: next to the sources, as tsc
+        if c.source_map:
+            os.setenv("TERNTS_SOURCEMAP", "1")
+        os.setenv("TERNTS_TSCONFIG", c.path)
+    return Project(src, out, o)
+
+# Every command but the async ones (is_async).
+fn run(a: Args):
+    rest = a.rest
+    if len(rest) >= 2 and rest[0] == "--bench":
+        reps = rest[1].to_int(5)
+        files: [str] = []
+        for k in 2..len(rest):
+            files.push(rest[k])
+        srcs: [str] = []
+        total = 0
+        for f in files:
+            s = read_or_exit(f)
+            total += len(s)
+            srcs.push(s)
+        best = 0
+        fails = 0
+        outb = 0
+        for r in 0..reps:
+            t0 = time.mono_ns()
+            fails = 0
+            outb = 0
+            base = a.o
+            for i in 0..len(srcs):
+                o = ts.transpile_with(srcs[i], for_file(base, files[i]), ts.empty_project(), "")
+                if o.err != "":
+                    fails += 1
+                outb += len(o.head) + len(o.code)
+            t = time.mono_ns() - t0
+            if r == 0 or t < best:
+                best = t
+        print(f"ternts\t{len(files)} files\t{total} bytes in\t{outb} out\t{fails} failed\t{best / 1000000} ms\t{float(total) / (float(best) / 1e9) / 1e6} MB/s")
+        return
+    if len(rest) >= 1 and rest[0] == "build":
+        p = project(a)
+        build(p.src, p.out, p.o, has(rest, "--no-spec"), has(rest, "--force"))
+        return
+    if len(rest) >= 2 and rest[0] == "--outdir":
+        dir = rest[1]
+        files: [str] = []
+        for k in 2..len(rest):
+            files.push(rest[k])
+        errs = [""] * len(files)
+        parallel for k in 0..len(files):
+            text = fs.read(files[k])
+            if text == "" and fs.error() != "":
+                errs[k] = "ternts: " + fs.error()
+            else:
+                o = ts.transpile_with(text, for_file(a.o, files[k]), ts.empty_project(), "")
+                if o.err != "":
+                    errs[k] = files[k] + ":" + o.err
+                else:
+                    write_out(f"{dir}/{k}.js", o)
+        bad = 0
+        for e in errs:
+            if e != "":
+                bad += 1
+                os.eprint(e)
+        if bad > 0:
+            os.exit(1)
+        return
+    if len(rest) < 1:
+        os.eprint("usage: ternts IN.ts [OUT.js] | --outdir DIR FILE... | --bench N FILE...")
+        os.exit(1)
+    o = ts.transpile_with(read_or_exit(rest[0]), for_file(a.o, rest[0]), ts.empty_project(), "")
+    if o.err != "":
+        os.eprint(rest[0] + ":" + o.err)
+        os.exit(1)
+    if len(rest) >= 2:
+        write_out(rest[1], o)
+    else:
+        print(o.head + o.code)
+
+fn write_parts(path: str, head: str, code: str):
+    f = fs.create(path)
+    f.put(head)
+    f.put(code)
+    f.close()
+
+fn write_out(path: str, o: ts.Output):
+    f = fs.create(path)
+    f.put(o.head)
+    f.put(o.code)
+    f.close()
+
+fn has(xs: [str], x: str) bool:
+    for y in xs:
+        if y == x:
+            return true
+    return false
+
+fn mkdir_p(dir: str):
+    if dir == "" or fs.exists(dir):
+        return
+    k = len(dir) - 1
+    while k > 0 and dir.byte(k) != 47:
+        k -= 1
+    if k > 0:
+        mkdir_p(dir[..k])
+    fs.mkdir(dir)
+
+# A project: every .ts file under src (not .d.ts, not node_modules) to out, same layout.
+fn build(src: str, out: str, opt: ts.Opts, no_spec: bool, force: bool) int:
+    if not fs.stat(src).is_dir:
+        os.eprint(f"ternts: {src}: no such directory")
+        os.exit(1)
+    timing = os.env("TERNTS_TIME", "") != ""
+    maps = os.env("TERNTS_SOURCEMAP", "") != ""
+    t0 = time.mono_ns()
+    files = sources(src, out, no_spec)
+    outs: [str] = []
+    dirs: {str: bool} = {}
+    for f in files:
+        o = out_name(out + state.below(src, f), opt)
+        outs.push(o)
+        k = len(o) - 1
+        while k > 0 and o.byte(k) != 47:
+            k -= 1
+        dirs[o[..k]] = true
+    t1 = time.mono_ns()
+    for d in dirs.keys():
+        mkdir_p(d)
+    t2 = time.mono_ns()
+    # pass 1: which exports are types, so imports of them can be dropped
+    srcs = [""] * len(files)
+    infos: [ts.Exports] = []
+    for f in files:
+        infos.push(ts.no_exports())
+    parallel for k in 0..len(files):
+        srcs[k] = fs.read(files[k])
+        infos[k] = ts.scan_exports_in(srcs[k], files[k].ends_with(".tsx"))
+        if opt.metadata:
+            ts.scan_meta(srcs[k], files[k].ends_with(".tsx"), &infos[k])   # metadata as a whole-program tsc
+    t3 = time.mono_ns()
+    pr = ts.empty_project()
+    keys: [str] = []
+    for k in 0..len(files):
+        key = strip_ext(files[k])
+        keys.push(key)
+        pr.files[key] = infos[k]
+        pr.abs[tsconfig.absolute(key)] = key     # (tsconfig paths name files absolutely)
+    # and the declarations of imported packages
+    specs: [str] = []
+    spec_dirs: [str] = []                        # each found from its first importer's directory
+    seen_spec: {str: bool} = {}
+    for k in 0..len(files):
+        for s in infos[k].imports:
+            if not (s in seen_spec):
+                seen_spec[s] = true
+                specs.push(s)
+                spec_dirs.push(tsconfig.dir_of(tsconfig.absolute(files[k])))
+    cfg_path = os.env("TERNTS_TSCONFIG", "")
+    mode = "bundler"                             # no tsconfig: find what's there
+    if cfg_path != "":
+        pr.paths = tsconfig.load(cfg_path).paths
+        mode = tsconfig.resolution(cfg_path)
+    packages.load_from(&pr, specs, spec_dirs, mode)
+    if opt.jsx == ts.JSX_AUTO or opt.jsx == ts.JSX_DEV:
+        # where the JSX runtime's types resolve, JSX doesn't count as a use of React
+        by_dir: {str: bool} = {}
+        for k in 0..len(files):
+            if files[k].ends_with(".tsx"):
+                d = tsconfig.dir_of(tsconfig.absolute(files[k]))
+                if not (d in by_dir):
+                    by_dir[d] = packages.resolve(opt.jsx_source + "/jsx-runtime", d) != ""
+                if by_dir[d]:
+                    pr.jsx_typed[keys[k]] = true
+    t3b = time.mono_ns()
+    # skip outputs newer than their source, unless --force or the shape changed (state.tn)
+    before = state.load_state(out)
+    now = state.new_state(opt, maps, src, out, files, outs, infos)
+    removed = state.remove_gone(before, now, out)
+    todo = [true] * len(files)
+    if not force and state.same_shape(before, now):
+        parallel for k in 0..len(files):
+            o = fs.stat(outs[k])
+            if o.exists and o.modified >= fs.stat(files[k]).modified:
+                todo[k] = false
+    errs = [""] * len(files)
+    done = [false] * len(files)
+    parallel for k in 0..len(files):
+        if todo[k]:
+            r = ts.transpile_with(srcs[k], for_file(opt, files[k]), pr, keys[k])
+            if r.err != "":
+                errs[k] = files[k] + ":" + r.err
+            elif maps:
+                code = r.head + r.code
+                name = base_name(outs[k])
+                m = ts.source_map_from(srcs[k], code, len(r.head), name, rel_path(dir_of(outs[k]), files[k]))
+                write_parts(outs[k], code, "\n//# sourceMappingURL=" + name + ".map")
+                fs.write(outs[k] + ".map", m)
+                done[k] = true
+            else:
+                write_out(outs[k], r)
+                done[k] = true
+    written = 0
+    for d in done:
+        if d:
+            written += 1
+    state.save_state(out, now)
+    t4 = time.mono_ns()
+    if timing:
+        os.eprint(f"walk {(t1 - t0) / 1000}us  mkdir {(t2 - t1) / 1000}us  read+scan {(t3 - t2) / 1000}us  packages {(t3b - t3) / 1000}us  transpile+write {(t4 - t3b) / 1000}us  ({written} written)")
+    bad = 0
+    for e in errs:
+        if e != "":
+            bad += 1
+            os.eprint(e)
+    if bad > 0 and not watching(opt):
+        os.exit(1)
+    return written + removed
+
+fn find_byte(s: str, at: int, b: int) int:
+    for k in at..len(s):
+        if s.byte(k) == b:
+            return k
+    return -1
+
+fn mk_opts(use_define: bool, esm: bool, interop: bool, strict: bool, jsx: int, jsx_source: str, jsx_factory: str, jsx_frag: str) ts.Opts:
+    o = ts.opts()
+    o.use_define = use_define
+    o.esm = esm
+    o.interop = interop
+    o.strict = strict
+    o.jsx = jsx
+    o.jsx_source = jsx_source
+    o.jsx_factory = jsx_factory
+    o.jsx_frag = jsx_frag
+    o.import_meta_cjs = os.env("TERNTS_IMPORT_META_CJS", "") != ""
+    o.jest_hoist = os.env("TERNTS_JEST_HOIST", "") != ""
+    return o
+
+fn jsx_mode(s: str) int:
+    if s == "react":
+        return ts.JSX_REACT
+    if s == "preserve":
+        return ts.JSX_PRESERVE
+    if s == "react-jsxdev":
+        return ts.JSX_DEV
+    if s != "react-jsx":
+        os.eprint(f"ternts: unknown --jsx={s} (react-jsx, react-jsxdev, react or preserve)")
+        os.exit(1)
+    return ts.JSX_AUTO
+
+# Per-file options: JSX only in .tsx/.jsx; with node16/nodenext, .mts/.cts/package.json pick the module kind.
+fn for_file(o: ts.Opts, path: str) ts.Opts:
+    r = o
+    r.tsx = path.ends_with(".tsx") or path.ends_with(".jsx")
+    r.file_name = path
+    if o.per_file_module:
+        if path.ends_with(".mts"):
+            r.esm = true
+        elif path.ends_with(".cts"):
+            r.esm = false
+        else:
+            r.esm = tsconfig.package_type(tsconfig.dir_of(tsconfig.absolute(path))) == "module"
+    return r
+
+# Sources under src, skipping node_modules, dot-dirs and out; with a tsconfig, only its includes.
+fn sources(src: str, out: str, no_spec: bool) [str]:
+    cfg = os.env("TERNTS_TSCONFIG", "")
+    c = tsconfig.Config("", "", "", "", "", false, false, false, false, false, false, false, false, false, "", "", "", "", "", "", false, false, false, [], [], [], [], [], false)
+    if cfg != "":
+        c = tsconfig.load(cfg)
+    files: [str] = []
+    for f in source_walk(src, out):
+        if no_spec and (f.ends_with(".spec.ts") or f.ends_with(".test.ts") or f.ends_with(".spec.tsx") or f.ends_with(".test.tsx")):
+            continue
+        if cfg != "" and not tsconfig.included(c, tsconfig.absolute(f)):
+            continue
+        files.push(f)
+    return files
+
+fn source_walk(dir: str, out: str) [str]:
+    files: [str] = []
+    walk_into(dir, out, &files)
+    return files
+
+fn walk_into(dir: str, out: str, files: mut [str]):
+    names = fs.list(dir).sorted()
+    for n in names:
+        path = dir + "/" + n
+        if dir == "." or dir == "":
+            path = n
+        if n.starts_with(".") or n == "node_modules":
+            continue
+        if fs.stat(path).is_dir:
+            if path != out:
+                walk_into(path, out, &files)
+        elif is_source(n):
+            files.push(path)
+
+# SRC OUT given as words; flags (--force, --no-spec...) are skipped.
+fn positional(rest: [str]) [str]:
+    pos: [str] = []
+    for r in rest:
+        if not r.starts_with("--"):
+            pos.push(r)
+    return pos
+
+# The longest directory all the files are in ("." for none).
+fn common_dir(files: [str]) str:
+    if len(files) == 0:
+        return "."
+    d = dir_of(files[0])
+    for f in files:
+        while d != "." and d != "/" and not f.starts_with(d + "/"):
+            d = dir_of(d)
+    return d
+
+fn strip_ext(f: str) str:
+    if f.ends_with(".tsx") or f.ends_with(".mts") or f.ends_with(".cts"):
+        return f[..len(f) - 4]
+    return f[..len(f) - 3]
+
+fn is_source(f: str) bool:
+    return (f.ends_with(".ts") and not f.ends_with(".d.ts")) or f.ends_with(".tsx") or f.ends_with(".mts") or f.ends_with(".cts")
+
+# The output path for a source: .ts/.tsx -> .js (.jsx with jsx: preserve), .mts -> .mjs, .cts -> .cjs.
+fn out_name(f: str, o: ts.Opts) str:
+    if f.ends_with(".mts"):
+        return f[..len(f) - 4] + ".mjs"
+    if f.ends_with(".cts"):
+        return f[..len(f) - 4] + ".cjs"
+    if f.ends_with(".tsx"):
+        if o.jsx == ts.JSX_PRESERVE:
+            return f[..len(f) - 4] + ".jsx"
+        return f[..len(f) - 4] + ".js"
+    return f[..len(f) - 3] + ".js"
+
+fn watching(o: ts.Opts) bool:
+    return os.env("TERNTS_WATCHING", "") != ""
+
+fn stamps(src: str) {str: float}:
+    m: {str: float} = {}
+    for f in source_walk(src, ""):
+        m[f] = fs.stat(f).modified
+    return m
+
+fn base_name(p: str) str:
+    k = len(p) - 1
+    while k >= 0 and p.byte(k) != 47:
+        k -= 1
+    return p[k + 1..]
+
+fn dir_of(p: str) str:
+    k = len(p) - 1
+    while k >= 0 and p.byte(k) != 47:
+        k -= 1
+    if k < 0:
+        return "."
+    return p[..k]
+
+# The path of `to` relative to the directory `from` (both relative to the cwd, or both absolute).
+fn rel_path(src_dir: str, to: str) str:
+    a = src_dir.split("/")
+    b = to.split("/")
+    i = 0
+    while i < len(a) and i < len(b) - 1 and a[i] == b[i]:
+        i += 1
+    parts: [str] = []
+    for j in i..len(a):
+        if a[j] != "." and a[j] != "":
+            parts.push("..")
+    for j in i..len(b):
+        parts.push(b[j])
+    return "/".join(parts)
+
+# A file's text, or exit 1 if it can't be read (an empty file is fine).
+fn read_or_exit(path: str) str:
+    text = fs.read(path)
+    if text == "" and fs.error() != "":
+        os.eprint("ternts: " + fs.error())
+        os.exit(1)
+    return text

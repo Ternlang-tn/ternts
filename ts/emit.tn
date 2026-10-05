@@ -1,0 +1,966 @@
+# Putting the output together: markers resolved (decorators first, since their
+# metadata can use imports), then the prologue tsc writes above the code.
+
+const HELPER_CREATE_BINDING = """var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+"""
+
+const HELPER_REST = """var __rest = (this && this.__rest) || function (s, e) {
+    var t = {};
+    for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p) && e.indexOf(p) < 0)
+        t[p] = s[p];
+    if (s != null && typeof Object.getOwnPropertySymbols === "function")
+        for (var i = 0, p = Object.getOwnPropertySymbols(s); i < p.length; i++) {
+            if (e.indexOf(p[i]) < 0 && Object.prototype.propertyIsEnumerable.call(s, p[i]))
+                t[p[i]] = s[p[i]];
+        }
+    return t;
+};"""
+
+const HELPER_SET_MODULE_DEFAULT = """var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});"""
+
+const HELPER_IMPORT_STAR = """var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();"""
+
+const HELPER_IMPORT_DEFAULT = """var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};"""
+
+const HELPER_DECORATE = """var __decorate = (this && this.__decorate) || function (decorators, target, key, desc) {
+    var c = arguments.length, r = c < 3 ? target : desc === null ? desc = Object.getOwnPropertyDescriptor(target, key) : desc, d;
+    if (typeof Reflect === "object" && typeof Reflect.decorate === "function") r = Reflect.decorate(decorators, target, key, desc);
+    else for (var i = decorators.length - 1; i >= 0; i--) if (d = decorators[i]) r = (c < 3 ? d(r) : c > 3 ? d(target, key, r) : d(target, key)) || r;
+    return c > 3 && r && Object.defineProperty(target, key, r), r;
+};
+"""
+
+const HELPER_EXPORT_STAR = """var __exportStar = (this && this.__exportStar) || function(m, exports) {
+    for (var p in m) if (p !== "default" && !Object.prototype.hasOwnProperty.call(exports, p)) __createBinding(exports, m, p);
+};
+"""
+
+const HELPER_METADATA = """var __metadata = (this && this.__metadata) || function (k, v) {
+    if (typeof Reflect === "object" && typeof Reflect.metadata === "function") return Reflect.metadata(k, v);
+};
+"""
+
+const HELPER_PARAM = """var __param = (this && this.__param) || function (paramIndex, decorator) {
+    return function (target, key) { decorator(target, key, paramIndex); }
+};
+"""
+
+# The helper functions the code uses (tsc's order).
+fn helpers_text(p: mut P) str:
+    pro = ""
+    h = p.helpers
+    if h & H_IMPORT_STAR != 0:
+        h = h | H_CREATE_BINDING
+    if h & H_CREATE_BINDING != 0:
+        pro += HELPER_CREATE_BINDING + "\n"
+    if h & H_IMPORT_STAR != 0:
+        pro += HELPER_SET_MODULE_DEFAULT + "\n"
+    if h & H_DECORATE != 0:
+        pro += HELPER_DECORATE + "\n"
+    pro += esdec_helpers_text(p.esdec_helpers)
+    # (these two in the order the code first needs them)
+    x_first = h & H_EXPORT_STAR != 0 and (h & H_IMPORT_STAR == 0 or p.xstar_at < p.star_at)
+    if x_first:
+        pro += HELPER_EXPORT_STAR + "\n"
+    if h & H_IMPORT_STAR != 0:
+        pro += HELPER_IMPORT_STAR + "\n"
+    if h & H_EXPORT_STAR != 0 and not x_first:
+        pro += HELPER_EXPORT_STAR + "\n"
+    if h & H_METADATA != 0:
+        pro += HELPER_METADATA + "\n"
+    if h & H_PARAM != 0:
+        pro += HELPER_PARAM + "\n"
+    if h & H_AWAITER != 0:
+        pro += HELPER_AWAITER + "\n"
+    # helpers without a priority go last (tsc's compareEmitHelpers), in the order transforms ask
+    if h & H_USING != 0:
+        pro += HELPER_USING + "\n"
+    pk = esdec_wants(p.esdec_helpers, ED_PROPKEY)
+    sn = esdec_wants(p.esdec_helpers, ED_SETNAME)
+    if pk and sn and esdec_first(p.esdec_helpers, ED_PROPKEY, ED_SETNAME):
+        pro += HELPER_PROP_KEY + "\n"
+        pk = false
+    if sn:
+        pro += HELPER_SET_FUNCTION_NAME + "\n"
+    if pk:
+        pro += HELPER_PROP_KEY + "\n"
+    if len(p.priv_order) > 0:
+        pro += priv_helpers_text(&p)
+    rest = h & H_REST != 0
+    if len(p.agen_order) > 0:
+        if rest and p.rest_seq < len(p.agen_order):
+            ra = p.rest_seq
+            pro += agen_helpers_text(&p, ra)
+            rest = false
+        else:
+            pro += agen_helpers_text(&p, -1)
+    if h & H_IMPORT_DEFAULT != 0:
+        pro += HELPER_IMPORT_DEFAULT + "\n"
+    if rest:
+        pro += HELPER_REST + "\n"
+    return pro
+
+fn finish(p: mut P) str:
+    if p.alias_deps != "":                       # import f = foo.M: foo is used if f is
+        for e in p.alias_deps.split(";"):
+            if e != "":
+                f = e.split(" ")
+                a = f[0].to_int(0)
+                v = p.imports[a].var
+                keep = p.imports[a].used or (p.imports[a].top and not p.is_module)
+                for it in p.export_items:
+                    keep = keep or it.local == v
+                for l in p.esm_lists:
+                    for x in l.locals:
+                        keep = keep or (l.origin == "" and x == v)
+                if keep:
+                    p.imports[f[1].to_int(0)].used = true
+    if p.hoisted != "":
+        p.out = p.hoisted + p.out           # --jest-hoist: the mocks before the requires
+    if p.markers:
+        body = p.out
+        p.out = ""
+        body = resolve_markers(&p, body)
+        if p.nested_markers:                     # markers inside decorator texts
+            body = resolve_markers(&p, body)
+        p.out = body
+    pro = p.directives
+    # tsc: "use strict" for CommonJS modules, and (alwaysStrict, or the source's own) for files
+    # that aren't modules; ES module output keeps the source's directive as it is
+    if (not p.esm and (p.is_module or p.always_strict or p.has_use_strict)) or (p.esm and not p.is_module and p.always_strict and not p.has_use_strict):
+        pro += "\"use strict\";\n"
+    if not p.no_emit_helpers:                # noEmitHelpers: the code uses them, defined elsewhere
+        pro += helpers_text(&p)
+    if p.cr_name != "":
+        pro += "import { createRequire as _createRequire } from \"module\";\nconst " + p.cr_name + " = _createRequire(import.meta.url);\n"
+    if len(p.top_pro) > 0:
+        pro += "var " + ", ".join(p.top_pro) + ";\n"
+    for g in p.lt_mod:
+        if len(g) > 0:
+            pro += "var " + ", ".join(g) + ";\n"
+    if len(p.cf_temps) > 0:
+        pro += "var " + ", ".join(p.cf_temps) + ";\n"
+    if len(p.aliases) > 0:
+        pro += "var " + ", ".join(p.aliases) + ";\n"
+    if len(p.temp_names) > 0:
+        pro += "var " + ", ".join(p.temp_names) + ";\n"
+    if find_nul(pro, 0) >= 0:
+        pro = resolve_markers(&p, pro)           # (for await's e_N in a top-level var list)
+    if p.esm and (len(p.jsx_events) > 0 or p.jsx_uses_file):
+        pro += jsx_prologue(&p)
+    if p.esm:
+        if p.is_module and not p.esm_kept and len(p.jsx_events) == 0 and not p.preserve:
+            p.out += "\nexport {};"              # still a module, as tsc keeps it
+        return pro
+    if p.is_module and not p.export_equals:
+        pro += "Object.defineProperty(exports, \"__esModule\", { value: true });\n"
+    # exports.a = exports.b = void 0, newest first, 50 to a statement
+    names: [str] = []
+    seen: {str: bool} = {}
+    for x in p.exported:
+        if x != "" and (x != "default" or p.list_default) and not (x in seen):
+            seen[x] = true
+            names.push(x)
+    i = 0
+    while i < len(names):
+        j = min(i + 50, len(names))
+        line = ""
+        k = j - 1
+        while k >= i:
+            line += "exports" + xname(names[k]) + " = "
+            k -= 1
+        pro += line + "void 0;\n"
+        i = j
+    for f in p.fn_exports:
+        if f != "":
+            pro += f + "\n"
+    if len(p.jsx_events) > 0 or p.jsx_uses_file:
+        pro += jsx_prologue(&p)
+    return pro
+
+fn resolve_markers(p: mut P, body: str) str:
+    starts: [int] = []
+    ends: [int] = []
+    at = 0
+    while true:
+        rest = find_nul(body, at)
+        if rest < 0:
+            break
+        e = find_nul(body, rest + 1)
+        if e < 0:                        # a marker cut in two: report it, don't loop forever
+            p.err = "internal error: an unterminated marker near `" + body[max(0, rest - 60)..min(len(body), rest + 30)].replace("\x00", "<NUL>") + "` (please report this file)"
+            break
+        starts.push(rest)
+        ends.push(e)
+        at = e + 1
+    texts = [""] * len(starts)
+    unames: [str] = []
+    if len(p.u_reqs) > 0:
+        unames = u_names(&p)
+    # decorators and ESM export lists first: they mark imports used
+    for m in 0..len(starts):
+        if body.byte(starts[m] + 1) == 68:
+            texts[m] = decorate_text(&p, body[starts[m] + 2..ends[m]].to_int(0))
+        elif body.byte(starts[m] + 1) == 89:
+            texts[m] = decorate_parts(&p, body[starts[m] + 2..ends[m]].to_int(0), 1)
+        elif body.byte(starts[m] + 1) == 69:
+            texts[m] = esm_list_text(&p, body[starts[m] + 2..ends[m]].to_int(0))
+    for m in 0..len(starts):
+        kind = body.byte(starts[m] + 1)
+        payload = body[starts[m] + 2..ends[m]]
+        if kind == 73:
+            texts[m] = import_text(&p, payload.to_int(0))
+            if texts[m] != "":
+                p.esm_kept = true
+        elif kind == 83:
+            texts[m] = slot_text(&p, payload)
+        elif kind == 78:
+            texts[m] = fold_text(&p, payload)
+        elif kind == 90:
+            texts[m] = plain_super_text(&p, payload.to_int(0))
+        elif kind == 81:
+            texts[m] = super_index_value(&p, payload.to_int(0))
+        elif kind == 86:
+            texts[m] = fn_vars_text(&p, payload.to_int(0))
+        elif kind == 85:
+            texts[m] = unames[payload.to_int(0)]
+        elif kind == 87:
+            texts[m] = using_open_text(&p, unames, payload.to_int(0))
+        elif kind == 88:
+            texts[m] = using_close_text(&p, unames, payload.to_int(0))
+    p.nested_markers = false
+    for t in texts:
+        if find_nul(t, 0) >= 0:
+            p.nested_markers = true
+    out = ""
+    prev = 0
+    for m in 0..len(starts):
+        out += body[prev..starts[m]]
+        out += texts[m]
+        prev = ends[m] + 1
+    out += body[prev..]
+    return out
+
+fn need_star(p: mut P, at: int):
+    p.helpers = p.helpers | H_IMPORT_STAR
+    if p.star_at < 0 or at < p.star_at:
+        p.star_at = at
+
+fn import_text(p: mut P, idx: int) str:
+    im = p.imports[idx]
+    at = p.import_at[idx]
+    text = ""
+    if im.esm:
+        return esm_import_text(im, p.verbatim)
+    if im.side:
+        if p.esm:
+            return "import " + im.spec + ";"
+        text = "require(" + im.spec + ");"
+    elif im.kind == 1 and p.esm and not p.preserve:
+        if im.used or p.verbatim:                # module node16+, an ES module file: createRequire
+            if p.cr_name == "":
+                p.cr_name = "__require"
+                if file_ident(&p, "__require"):
+                    p.cr_name = unique_ident(p.src, "__require")
+            text = "const " + im.var + " = " + p.cr_name + "(" + im.spec + ");"
+    elif im.kind == 1:
+        if im.exported:
+            text = "exports." + im.var + " = require(" + im.spec + ");"
+        elif im.used or p.verbatim:
+            text = "const " + im.var + " = require(" + im.spec + ");"
+    elif im.kind == 2:
+        if im.used or p.verbatim or (im.top and not p.is_module):
+            text = "var " + im.var + " = " + im.spec + ";"
+    elif im.used or im.after != "" or p.verbatim:
+        req = "require(" + im.spec + ")"
+        star = req
+        if p.interop:
+            star = "__importStar(" + req + ")"
+        if im.named and im.ns != "" and im.ns_used and not im.named_used and not im.def_used:
+            text = "const " + im.ns + " = " + star + ";"
+            if p.interop:
+                need_star(&p, at)
+        elif im.named and im.ns != "" and im.ns_used:
+            text = "const " + im.var + " = " + star + ", " + im.ns + " = " + im.var + ";"
+            if p.interop:
+                need_star(&p, at)
+        elif not im.named:
+            text = "const " + im.var + " = " + star + ";"
+            if p.interop:
+                need_star(&p, at)
+        elif p.interop and im.def_used and not im.named_used:
+            text = "const " + im.var + " = __importDefault(" + req + ");"
+            p.helpers = p.helpers | H_IMPORT_DEFAULT
+        elif p.interop and im.def_used:
+            text = "const " + im.var + " = __importStar(" + req + ");"
+            need_star(&p, at)
+        else:
+            text = "const " + im.var + " = " + req + ";"
+    if im.after != "":
+        text += im.after
+    return text
+
+fn slot_text(p: mut P, names: str) str:
+    text = ""
+    for name in names.split(","):
+        if (name in p.ns_folded):
+            continue                             # exported inside its IIFE (fold_text)
+        if (name in p.export_alias):
+            value = name
+            k = find_bind_name(&p, name)
+            if k >= 0 and p.binds[k].kind == B_EXPORT:
+                value = p.binds[k].repl
+            for a in p.export_alias[name]:
+                text += "\nexports" + xname(a) + " = " + value + ";"
+    return text
+
+# An enum's or namespace's export inside its IIFE (see fold_marker): "exports.B = exports.A = ".
+fn fold_text(p: mut P, name: str) str:
+    chain = ""
+    seen: {str: bool} = {}
+    if (name in p.ns_xdecl):
+        chain = "exports." + name + " = "
+        seen[name] = true
+    for it in p.export_items:
+        kind = p.locals.get(name, 0)
+        if it.local == name and kind != 4 and kind != 5 and kind != 7 and not (it.exported in seen):
+            seen[it.exported] = true
+            chain = "exports" + xname(it.exported) + " = " + chain
+    return chain
+
+# Is there a top-level declaration of `name`? (A same-named import is then a type merged with it.)
+fn top_declared(p: mut P, name: str) bool:
+    if (name in p.ns_decl):                      # (an instantiated namespace or an enum)
+        return true
+    for k in 0..len(p.dh):
+        if p.dl[k] == len(name):
+            if p.da[k] >= 0 and p.src[p.da[k]..p.da[k] + p.dl[k]] == name:
+                return true
+            if p.da[k] < 0 and p.star_names[-1 - p.da[k]] == name:
+                return true
+    return false
+
+# `export { a, b as c }` lists: decided at the end, once every declaration is known.
+fn resolve_export_items(p: mut P):
+    by_local: {str: [str]} = {}          # imported local -> exported names
+    for ii in 0..len(p.export_items):
+        it = p.export_items[ii]
+        k = find_bind_name(&p, it.local)
+        if k >= 0 and (p.binds[k].kind == B_IMPORT or p.binds[k].kind == B_NSIMPORT) and p.binds[k].imp >= 0 and not top_declared(&p, it.local):
+            if not (it.local in by_local):
+                by_local[it.local] = []
+            by_local[it.local].push(it.exported)
+            continue
+        kind = 0
+        if (it.local in p.locals):
+            kind = p.locals[it.local]
+        if (kind == 4 or kind == 5) and value_declared(&p, it.local):
+            kind = 0                               # a variable of the same name
+        if kind == 4 or kind == 5 or kind == 7 or (kind == 6 and not (it.local in p.ns_decl)):
+            p.exported[it.order] = ""              # a type (or a namespace without values): nothing to export
+            continue
+        if kind == 2:
+            p.exported[it.order] = ""
+            p.fn_exports[it.fn_slot] = "exports" + xname(it.exported) + " = " + it.local + ";"
+            continue
+        if not (it.local in p.export_alias):
+            p.export_alias[it.local] = []
+        p.export_alias[it.local].push(it.exported)
+    if len(by_local) == 0:
+        return
+    for i in 0..len(p.imports):
+        im = p.imports[i]
+        order = im.names
+        if im.ns != "":
+            order.push(im.ns)
+        if im.kind != 0 and im.var != "":
+            order.push(im.var)
+        for local in order:
+            if not (local in by_local):
+                continue
+            k = find_bind_name(&p, local)
+            if k < 0 or p.binds[k].imp != i:
+                continue
+            for name in by_local[local]:
+                if p.binds[k].kind == B_NSIMPORT:
+                    p.imports[i].after += "\nexports." + name + " = " + local + ";"
+                    p.imports[i].ns_used = true
+                elif p.binds[k].sub == -2 and local == p.imports[i].def:
+                    # `import d from`: copied (tsc), while `import { default as d }` is a live binding
+                    p.imports[i].after += "\nexports." + name + " = " + p.binds[k].repl + ";"
+                    p.imports[i].def_used = true
+                else:
+                    p.imports[i].after += "\n" + getter(name, p.binds[k].repl)
+                    if p.binds[k].sub == -2:
+                        p.imports[i].def_used = true     # (__importDefault with esModuleInterop)
+                    else:
+                        p.imports[i].named_used = true
+            p.imports[i].used = true
+
+# ---------------------------------------------------------------- decorators
+
+fn fn_vars_text(p: mut P, id: int) str:
+    text = ""
+    if id < len(p.fn_lt):
+        for g in p.fn_lt[id]:
+            if len(g) > 0:
+                text += " var " + ", ".join(g) + ";"
+    if len(p.fn_cf_temps[id]) > 0:
+        text += " var " + ", ".join(p.fn_cf_temps[id]) + ";"
+    if len(p.fn_alias[id]) > 0:
+        text += " var " + ", ".join(p.fn_alias[id]) + ";"
+    if len(p.fn_temps[id]) > 0:
+        text += " var " + ", ".join(p.fn_temps[id]) + ";"
+    if id < len(p.fn_pre) and p.fn_pre[id] != "":
+        text += p.fn_pre[id]
+    return text
+
+# A temp name nobody declares (a parameter of generated code: a private setter's value).
+fn fresh_temp(p: mut P) str:
+    while true:
+        n = p.temp_seq
+        p.temp_seq += 1
+        name = ""
+        if n < 26:
+            if n == 8 or n == 13:
+                continue
+            name = "_" + chr(97 + n)
+        else:
+            name = "_" + str(n - 26)
+        taken = len(p.gen_names) > 0 and (name in p.gen_names)   # (a #private name: _f for #f)
+        for u in p.under:
+            if u == name:
+                taken = true
+        if not taken:
+            return name
+    return ""
+
+fn next_temp(p: mut P) str:
+    while true:
+        n = p.temp_seq
+        p.temp_seq += 1
+        name = ""
+        if n < 26:
+            if n == 8 or n == 13:                    # tsc skips _i and _n
+                continue
+            name = "_" + chr(97 + n)
+        else:
+            name = "_" + str(n - 26)
+        taken = len(p.gen_names) > 0 and (name in p.gen_names)   # (a #private name: _f for #f)
+        for u in p.under:
+            if u == name:
+                taken = true
+        if not taken:
+            if p.cur_fn >= 0:
+                p.fn_temps[p.cur_fn].push(name)
+            else:
+                p.temp_names.push(name)
+            p.temps += 1
+            return name
+    return ""
+
+fn decorate_text(p: mut P, idx: int) str:
+    if p.classes[idx].members_static:
+        if p.target < 2022:                      # the static block, lowered
+            return "\n(() => {" + decorate_parts(&p, idx, 1) + "\n})();" + decorate_parts(&p, idx, 2)
+        return decorate_parts(&p, idx, 2)
+    return decorate_parts(&p, idx, 0)
+
+# part 0: the members' __decorate calls, then the class's; 1: only the members'; 2: only the class's.
+fn decorate_parts(p: mut P, idx: int, part: int) str:
+    info = p.classes[idx]
+    p.cur_fn = info.fnid
+    p.helpers = p.helpers | H_DECORATE
+    # class-level metadata is serialized first (temps are numbered in that order)
+    cls = ""
+    if part != 1 and (len(info.decos) > 0 or len(info.ctor.deco_text) > 0):
+        items: [str] = []
+        for d in info.decos:
+            items.push(d)
+        for i in 0..len(info.ctor.deco_text):
+            p.helpers = p.helpers | H_PARAM
+            items.push("__param(" + str(info.ctor.deco_index[i]) + ", " + info.ctor.deco_text[i] + ")")
+        if info.has_ctor and p.metadata:
+            p.helpers = p.helpers | H_METADATA
+            items.push("__metadata(\"design:paramtypes\", [" + param_types(&p, info.ctor.types) + "])")
+        lhs = info.export_as + info.name + " = "
+        if info.export_as == "" and (info.name in p.export_alias) and p.ns_name == "":
+            # exported by a list (export { C as D }): the decorated class is what's exported
+            for a in p.export_alias[info.name]:
+                lhs = "exports" + xname(a) + " = " + lhs
+        if info.alias != "":
+            lhs += info.alias + " = "
+        cls = lhs + "__decorate([\n    " + ",\n    ".join(items) + "\n], " + info.name + ");"
+    text = ""
+    for round in 0..2:
+        for m in info.members:
+            if m.is_static != (round == 1) or part == 2:
+                continue
+            items: [str] = []
+            for d in m.decos:
+                items.push(d)
+            for i in 0..len(m.params.deco_text):
+                p.helpers = p.helpers | H_PARAM
+                items.push("__param(" + str(m.params.deco_index[i]) + ", " + m.params.deco_text[i] + ")")
+            if p.metadata:
+                p.helpers = p.helpers | H_METADATA
+                if m.kind == M_PROP:
+                    items.push("__metadata(\"design:type\", " + ser_text(&p, m.rtype) + ")")
+                elif m.kind == M_ACCESSOR:
+                    items.push("__metadata(\"design:type\", " + ser_text(&p, m.rtype) + ")")
+                elif m.kind == M_GET:
+                    sk = setter_key(m.is_static, m.key)
+                    if not m.has_rtype and (sk in info.setters):
+                        items.push("__metadata(\"design:type\", " + ser_text(&p, info.setters[sk]) + ")")
+                    else:
+                        items.push("__metadata(\"design:type\", " + ser_text(&p, m.rtype) + ")")
+                    if (sk in info.setters):
+                        items.push("__metadata(\"design:paramtypes\", [" + ser_text(&p, info.setters[sk]) + "])")
+                    else:
+                        items.push("__metadata(\"design:paramtypes\", [])")
+                elif m.kind == M_SET:
+                    t = "Object"
+                    if len(m.params.types) > 0:
+                        t = ser_text(&p, m.params.types[0])
+                    sk = setter_key(m.is_static, m.key)
+                    if (sk in info.getters):
+                        # the pair's type is the getter's declared one when it has one
+                        items.push("__metadata(\"design:type\", " + ser_text(&p, info.getters[sk]) + ")")
+                    else:
+                        items.push("__metadata(\"design:type\", " + t + ")")
+                    items.push("__metadata(\"design:paramtypes\", [" + t + "])")
+                else:
+                    items.push("__metadata(\"design:type\", Function)")
+                    items.push("__metadata(\"design:paramtypes\", [" + param_types(&p, m.params.types) + "])")
+                    if m.has_rtype:
+                        items.push("__metadata(\"design:returntype\", " + ser_text(&p, m.rtype) + ")")
+                    else:
+                        items.push("__metadata(\"design:returntype\", void 0)")
+            target = info.name
+            if not m.is_static:
+                target += ".prototype"
+            last = "null"
+            if m.kind == M_PROP:
+                last = "void 0"
+            text += "\n__decorate([\n    " + ",\n    ".join(items) + "\n], " + target + ", " + m.key + ", " + last + ");"
+    if cls != "":
+        text += "\n" + cls
+    return text
+
+fn param_types(p: mut P, ts: [Ser]) str:
+    parts: [str] = []
+    for t in ts:
+        parts.push(ser_text(&p, t))
+    return ", ".join(parts)
+
+# The expression for a serialized type.
+fn ser_text(p: mut P, s: Ser) str:
+    r = ser_resolve(&p, s)
+    e = meta_entity(s, p.strict)
+    if e != "":
+        first = e
+        d = e.find(".")
+        if d >= 0:
+            first = e[..d]
+        k = find_bind_name(&p, first)
+        if k >= 0 and p.binds[k].imp >= 0 and p.binds[k].kind == B_ESMIMPORT:
+            p.imports[p.binds[k].imp].used = true
+            mark_esm_use(&p, k)
+        elif k >= 0 and p.binds[k].imp >= 0 and (p.binds[k].kind == B_IMPORT or p.binds[k].kind == B_NSIMPORT):
+            p.imports[p.binds[k].imp].used = true
+            if p.binds[k].kind == B_NSIMPORT:
+                p.imports[p.binds[k].imp].ns_used = true
+            elif p.binds[k].sub == -2:
+                p.imports[p.binds[k].imp].def_used = true
+            else:
+                p.imports[p.binds[k].imp].named_used = true
+    return r.text
+
+# The type name whose import metadata keeps alive (tsc's getEntityNameForDecoratorMetadata):
+# a union counts only if all its parts name the same identifier.
+fn meta_entity(s: Ser, strict: bool) str:
+    if s.kind == SER_REF:
+        if s.text == "Promise!":
+            return ""
+        return s.text
+    if s.kind != SER_UNION:
+        return ""
+    common = ""
+    for part in s.parts:
+        if part.kind == SER_VOID and part.text != "" and not strict:
+            continue
+        e = meta_entity(part, strict)
+        if e == "":
+            return ""
+        if common != "":
+            if common.contains(".") or e.contains(".") or common != e:
+                return ""
+        else:
+            common = e
+    return common
+
+struct SerOut:
+    text: str
+    ident: bool
+
+fn so(text: str) SerOut:
+    return SerOut(text, true)
+
+fn ser_resolve(p: mut P, s: Ser) SerOut:
+    k = s.kind
+    if k == SER_VOID or k == SER_SKIP:
+        return SerOut("void 0", false)
+    if k == SER_STRING:
+        return so("String")
+    if k == SER_NUMBER:
+        return so("Number")
+    if k == SER_BOOLEAN:
+        return so("Boolean")
+    if k == SER_BIGINT:
+        return bigint_out(&p)
+    if k == SER_SYMBOL:
+        return so("Symbol")
+    if k == SER_ARRAY:
+        return so("Array")
+    if k == SER_FUNCTION:
+        return so("Function")
+    if k == SER_OBJECT or k == SER_ANY:
+        return so("Object")
+    if k == SER_REF:
+        return resolve_ref(&p, s.text)
+    if k == SER_TPARAM:
+        c = s.parts[0]
+        if constraint_any(&p, c, 0):
+            return SerOut("void 0", false)      # any (an unresolved type) is assignable to void
+        return alias_kind(&p, c, s.text, 0)
+    # a union or intersection, the way tsc combines the parts
+    have = false
+    result = SerOut("void 0", false)
+    for part in s.parts:
+        pk = part.kind
+        if pk == SER_VOID and part.text == "" and s.inter:
+            return SerOut("void 0", false)
+        if pk == SER_VOID and part.text == "" and not s.inter and is_never(part):
+            continue
+        if pk == SER_ANY:
+            if part.inter and s.inter:                 # unknown in an intersection
+                continue
+            return so("Object")
+        if pk == SER_VOID and part.text == "null" and not p.strict:
+            continue
+        r = ser_resolve(&p, part)
+        if r.ident and r.text == "Object":
+            return r
+        if have:
+            if not r.ident or not result.ident or r.text != result.text:
+                return so("Object")
+        else:
+            result = r
+            have = true
+    return result
+
+fn is_never(s: Ser) bool:
+    return false
+
+fn resolve_ref(p: mut P, name: str) SerOut:
+    if name == "Promise!":                       # an async method's return type
+        return so("Promise")
+    first = name
+    rest = ""
+    d = name.find(".")
+    if d >= 0:
+        first = name[..d]
+        rest = name[d..]
+    kind = 0
+    if (first in p.locals):
+        kind = p.locals[first]
+    if rest == "":
+        if kind == 1:
+            return so(name)
+        if kind == 3:
+            ek = 1
+            if (first in p.enum_kind):
+                ek = p.enum_kind[first]
+            if ek == 1:
+                return so("Number")
+            if ek == 2:
+                return so("String")
+            return so("Object")
+        if kind == 7:
+            m = imported_meta(&p, first, "", first)
+            if m.text != "":
+                return m
+        if kind == 4 or kind == 7:
+            return so("Object")
+        if kind == 8:
+            return so("Function")
+        if kind == 5 and (first in p.alias_ser):
+            a = p.alias_ser[first]
+            if len(p.project.files) > 0 and (p.file in p.project.files):
+                # project mode: serialize as a whole-program tsc does (resolving local aliases of imports)
+                o = kind_out(type_kind(p.project, p.file, a, p.strict, 0))
+                if o.text == "BigInt":
+                    o = bigint_out(&p)
+                if o.text != "":
+                    return o
+                # a whole-program tsc resolves every local alias (z.infer<...> etc. are object types): no guard
+                return so("Object")
+            if alias_unresolved(&p, a, 0):
+                t = next_temp(&p)
+                return SerOut("typeof (" + t + " = typeof " + name + " !== \"undefined\" && " + name + ") === \"function\" ? " + t + " : Object", false)
+            return alias_kind(&p, a, name, 0)
+    elif kind == 6:
+        return SerOut(name, false)
+    elif kind == 3 and not rest[1..].contains("."):
+        # an enum member's type (E.A): a number or a string, as the member is
+        mk = p.enum_kind.get(first, 1)
+        if (first + rest in p.enum_vals):
+            mk = p.enum_vals[first + rest].kind
+        elif (first + rest in p.enum_strs):
+            mk = 2
+        if mk == 1:
+            return so("Number")
+        if mk == 2:
+            return so("String")
+        return so("Object")
+    elif kind == 7:
+        m = imported_meta(&p, first, rest[1..], first)
+        if m.text != "":
+            return m
+        return so("Object")
+    # not declared here: guard it the way tsc does for an unknown type
+    k = find_bind_name(&p, first)
+    head = first
+    if k >= 0 and (p.binds[k].kind == B_IMPORT or p.binds[k].kind == B_NSIMPORT):
+        if p.binds[k].kind == B_IMPORT:
+            head = p.binds[k].repl
+    # project mode: what a whole-program tsc writes, when the project says what the name is
+    rest_names = ""
+    if rest != "":
+        rest_names = rest[1..]
+    m = imported_meta(&p, first, rest_names, head)
+    if m.text != "":
+        return m
+    if k < 0 and rest == "" and len(p.project.files) > 0:
+        # a whole-program tsc has the library: Promise, Date, Record ... are known
+        if global_class(first):
+            return SerOut(first, true)
+        g = global_kind(first)
+        if g == SER_OBJECT:
+            return so("Object")
+        if g == SER_STRING:
+            return so("String")
+        if g == SER_ARRAY:
+            return so("Array")
+        if g == SER_FUNCTION:
+            return so("Function")
+    parts = rest.split(".")
+    if rest == "":
+        t = next_temp(&p)
+        return SerOut("typeof (" + t + " = typeof " + head + " !== \"undefined\" && " + head + ") === \"function\" ? " + t + " : Object", false)
+    # A.B: typeof A !== "undefined" && A.B; deeper names go through temps
+    left = "typeof " + head + " !== \"undefined\""
+    right = head + "." + parts[1]
+    for i in 2..len(parts):
+        tmp = next_temp(&p)
+        left = left + " && (" + tmp + " = " + right + ") !== void 0"
+        right = tmp + "." + parts[i]
+    checked = left + " && " + right
+    t = next_temp(&p)
+    return SerOut("typeof (" + t + " = " + checked + ") === \"function\" ? " + t + " : Object", false)
+
+# A type alias serializes by the kind of type it names (tsc asks the checker).
+fn alias_kind(p: mut P, s: Ser, name: str, depth: int) SerOut:
+    k = s.kind
+    if depth > 8:
+        return so("Object")
+    if k == SER_REF:
+        first = s.text
+        if (first in p.locals):
+            lk = p.locals[first]
+            if lk == 5 and (first in p.alias_ser):
+                a = p.alias_ser[first]
+                return alias_kind(&p, a, first, depth + 1)
+            if lk == 3:
+                return resolve_ref(&p, first)
+            return so("Object")
+        return so("Object")
+    if k == SER_UNION:
+        have = false
+        result = so("Object")
+        for part in s.parts:
+            if part.kind == SER_VOID and part.text == "null" and not p.strict:
+                continue
+            r = alias_kind(&p, part, name, depth + 1)
+            if have and r.text != result.text:
+                return so("Object")
+            result = r
+            have = true
+        return result
+    return ser_resolve(&p, s)
+
+fn find_nul(s: str, at: int) int:
+    return s.find_from("\x00", at)             # (memchr: this scans every output twice)
+
+# The module variable names tsc would have used, given which imports are emitted.
+# Returns false (and fills p.forced) when they differ from the ones used.
+fn check_names(p: mut P) bool:
+    counts = p.reserved
+    want: [str] = []
+    same = true
+    for i in 0..len(p.name_base):
+        imp = p.name_imp[i]
+        emitted = imp < 0 or p.imports[imp].used or p.imports[imp].after != ""
+        if not emitted:
+            want.push(p.name_got[i])
+            continue
+        n = counts.get(p.name_base[i], 0) + 1
+        name = unique_suffix(p.name_base[i], n)
+        while (name in p.numbered):              # tsc skips names the source uses
+            n += 1
+            name = unique_suffix(p.name_base[i], n)
+        counts[p.name_base[i]] = n
+        want.push(name)
+        if name != p.name_got[i]:
+            same = false
+    if not same:
+        p.forced = want
+    return same
+
+# Does a type alias name something tsc can't resolve on its own (an import, a lib type)?
+fn alias_unresolved(p: mut P, s: Ser, depth: int) bool:
+    if depth > 8:
+        return false
+    if s.kind == SER_OBJECT and s.text == "index" and len(s.parts) >= 1:
+        if len(s.parts) == 2 and s.parts[1].kind == SER_NUMBER and s.parts[0].kind == SER_OBJECT and s.parts[0].text == "typeof":
+            return true                  # (typeof xs)[number]: a per-file tsc has no lib for it
+        return alias_unresolved(&p, s.parts[0], depth + 1)
+    if s.kind == SER_REF:
+        if s.text == "Promise!":
+            return false
+        first = s.text
+        d = first.find(".")
+        if d >= 0:
+            first = first[..d]
+        if (first in p.locals):
+            k = p.locals[first]
+            if k == 5 and (first in p.alias_ser):
+                a = p.alias_ser[first]
+                return alias_unresolved(&p, a, depth + 1)
+            return k == 7
+        return true
+    if s.kind == SER_UNION:
+        for part in s.parts:
+            if alias_unresolved(&p, part, depth + 1):
+                return true
+    return false
+
+# Does a constraint contain any/unknown-to-tsc types (then it is assignable to anything)?
+fn constraint_any(p: mut P, s: Ser, depth: int) bool:
+    if s.kind == SER_ANY:
+        return not s.inter
+    if s.kind == SER_REF or s.kind == SER_UNION:
+        return alias_unresolved(&p, s, depth)
+    return false
+
+# import D, { a, b as c } from "x": only what is used (tsc drops the rest)
+# `verbatim`: verbatimModuleSyntax, every import that isn't `type` stays.
+fn esm_import_text(im: Import, verbatim: bool) str:
+    head: [str] = []
+    if im.def != "" and (im.def_used or verbatim):
+        head.push(im.def)
+    if im.ns != "" and (im.ns_used or verbatim):
+        head.push("* as " + im.ns)
+    named: [str] = []
+    for i in 0..len(im.specs):
+        if im.spec_used[i] or verbatim:
+            named.push(im.specs[i])
+    if len(named) > 0:
+        head.push("{ " + ", ".join(named) + " }")
+    if len(head) == 0:
+        return ""
+    if im.defer:
+        return "import defer " + ", ".join(head) + " from " + im.spec + ";"
+    return "import " + ", ".join(head) + " from " + im.spec + ";"
+
+# Project mode: the metadata a whole-program tsc writes for the imported `first` (then `.rest`):
+# the class itself (via `head`), String .. Object / void 0, or "" when unknown (then guarded).
+fn imported_meta(p: mut P, first: str, rest: str, head: str) SerOut:
+    if not (first in p.import_src) or len(p.project.files) == 0:
+        return SerOut("", false)
+    v = p.import_src[first]
+    cut = v.find("\x01")
+    m = meta_of(p.project, p.file, v[..cut], v[cut + 1..], rest, p.strict)
+    if m == SER_CLASS:
+        if kind_of_local(&p, first) == 7:
+            return so("Function")        # a class through a type-only import: tsc's TypeWithCallSignature
+        t = head
+        if rest != "":
+            t = head + "." + rest
+        return SerOut(t, not t.contains("."))
+    return kind_out(m)
+
+fn kind_of_local(p: mut P, name: str) int:
+    if (name in p.locals):
+        return p.locals[name]
+    return 0
+
+# A type kind (type_kind, meta_of) as metadata text; "" for M_UNKNOWN.
+# BigInt in metadata: below ES2020 tsc guards it (the global may not exist).
+fn bigint_out(p: mut P) SerOut:
+    if p.target < 2020:
+        return SerOut("typeof BigInt === \"function\" ? BigInt : Object", false)
+    return so("BigInt")
+
+fn kind_out(m: int) SerOut:
+    if m == SER_STRING:
+        return so("String")
+    if m == SER_NUMBER:
+        return so("Number")
+    if m == SER_BOOLEAN:
+        return so("Boolean")
+    if m == SER_BIGINT:
+        return so("BigInt")
+    if m == SER_SYMBOL:
+        return so("Symbol")
+    if m == SER_ARRAY:
+        return so("Array")
+    if m == SER_FUNCTION:
+        return so("Function")
+    if m == SER_OBJECT:
+        return so("Object")
+    if m == SER_VOID:
+        return SerOut("void 0", false)
+    return SerOut("", false)

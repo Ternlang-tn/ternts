@@ -1,0 +1,304 @@
+# Reads the type declarations of imported packages, so `ternts build` knows which of their
+# exports are types and drops imports of them, as tsc does.
+import fs
+import json
+import ts
+
+const MAX_FILES = 4000         # .d.ts files read per build, at most
+
+# Finds each package's .d.ts entry from `dir` up, and reads it and the files it re-exports.
+fn load(pr: mut ts.Project, specs: [str], dir: str, mode: str):
+    dirs = [dir] * len(specs)
+    load_from(&pr, specs, dirs, mode)
+
+# The same, each package found from its first importer's directory (monorepos nest node_modules).
+fn load_from(pr: mut ts.Project, specs: [str], dirs: [str], mode: str):
+    todo: [str] = []
+    for i in 0..len(specs):
+        spec = specs[i]
+        entry = resolve_in(spec, dirs[i], mode)
+        if entry == "":
+            continue
+        key = key_of(entry)
+        pr.pkgs[spec] = key
+        todo.push(entry)
+    read_all(&pr, todo, mode)
+
+# A declarations file's path without its extension: its key in pr.files.
+fn key_of(f: str) str:
+    for ext in [".d.ts", ".d.mts", ".d.cts", ".tsx", ".ts"]:
+        if f.ends_with(ext):
+            return f[..len(f) - len(ext)]
+    return f
+
+# Reads .d.ts files (and the relative ones they re-export from), in parallel rounds.
+fn read_all(pr: mut ts.Project, first: [str], mode: str):
+    todo = first
+    count = 0
+    while len(todo) > 0 and count < MAX_FILES:
+        fresh: [str] = []
+        seen: {str: bool} = {}
+        for f in todo:
+            key = key_of(f)
+            if not (key in pr.files) and not (f in seen):
+                seen[f] = true
+                fresh.push(f)
+        infos = [ts.no_exports()] * len(fresh)
+        parallel for k in 0..len(fresh):
+            text = fs.read(fresh[k])
+            infos[k] = ts.scan_exports(text)
+            ts.scan_meta(text, false, &infos[k])
+        next_round: [str] = []
+        for k in 0..len(fresh):
+            key = key_of(fresh[k])
+            pr.files[key] = infos[k]
+            for r in infos[k].reexports:
+                if r.spec.starts_with("./") or r.spec.starts_with("../"):
+                    t = ts.resolve_spec(key, r.spec)
+                    d = dts_of(t)
+                    if d != "":
+                        next_round.push(d)
+                elif not r.spec.starts_with("/") and not (r.spec in pr.pkgs):
+                    # a re-exported package resolves from the re-exporting file's real path
+                    e = resolve_in(r.spec, parent(real(fresh[k])), mode)
+                    if e != "":
+                        pr.pkgs[r.spec] = key_of(e)
+                        next_round.push(e)
+        count += len(fresh)
+        todo = next_round
+
+# The path with symlinks resolved (pnpm puts a package's dependencies beside it in its store).
+fn real(path: str) str:
+    r = fs.realpath(path)
+    if r == "":
+        return path
+    return r
+
+# path -> path.d.ts or path/index.d.ts (tsc prefers a .ts/.tsx source if present), or "".
+fn dts_of(path: str) str:
+    for ext in [".ts", ".tsx", ".d.ts"]:
+        if fs.exists(path + ext) and not (ext == ".ts" and path.ends_with(".d")):
+            return path + ext
+    for ext in ["/index.ts", "/index.tsx", "/index.d.ts"]:
+        if fs.exists(path + ext):
+            return path + ext
+    return ""
+
+# The .d.ts file TypeScript would use for `import ... from spec` in `dir`, or "".
+fn resolve(spec: str, dir: str) str:
+    return resolve_in(spec, dir, "bundler")
+
+# The same for a resolution mode: node10 ignores "exports", classic only looks in @types.
+fn resolve_in(spec: str, dir: str, mode: str) str:
+    exports = mode != "node10" and mode != "classic"
+    name = spec
+    sub = ""
+    parts = spec.split("/")
+    if spec.starts_with("@") and len(parts) >= 2:
+        name = parts[0] + "/" + parts[1]
+        if len(parts) > 2:
+            sub = "/".join(parts[2..])
+    else:
+        name = parts[0]
+        if len(parts) > 1:
+            sub = "/".join(parts[1..])
+    types_name = name
+    if name.starts_with("@"):
+        types_name = name[1..].replace("/", "__")
+    d = dir
+    while true:
+        base = d + "/node_modules/" + name
+        if mode != "classic" and fs.exists(base):
+            e = entry_in(base, sub, exports)
+            if e != "":
+                return e
+        tb = d + "/node_modules/@types/" + types_name
+        if fs.exists(tb):
+            e = entry_in(tb, sub, exports)
+            if e != "":
+                return e
+        if d == "/" or d == "" or d == ".":
+            return ""
+        d = parent(d)
+    return ""
+
+# In a package directory: the declarations for its subpath ("" for the package itself).
+fn entry_in(pkg: str, sub: str, use_exports: bool) str:
+    pj = pkg + "/package.json"
+    if fs.exists(pj):
+        match json.parse(fs.read(pj)):
+            Ok(v):
+                key = "."
+                if sub != "":
+                    key = "./" + sub
+                t = ""
+                if use_exports:
+                    t = exports_types(v.field("exports"), key)
+                if t != "" and fs.exists(pkg + "/" + t) and t.ends_with(".d.ts"):
+                    return clean(pkg + "/" + t)
+                if not use_exports and sub != "":
+                    # node10: typesVersions maps subpaths
+                    tv = types_versions(pkg, v.field("typesVersions"), sub)
+                    if tv != "":
+                        return tv
+                if sub == "":
+                    for field in ["types", "typings"]:
+                        t2 = v.field(field).str_or("")
+                        if t2 != "":
+                            p = clean(pkg + "/" + t2)
+                            if p.ends_with(".d.ts") and fs.exists(p):
+                                return p
+                            q = dts_of(strip_js(p))
+                            if q != "":
+                                return q
+                    m = v.field("main").str_or("")
+                    if m != "":
+                        q = dts_of(strip_js(clean(pkg + "/" + m)))
+                        if q != "":
+                            return q
+            Err(e):
+                pass
+    if sub != "":
+        return dts_of(strip_js(pkg + "/" + sub))
+    return dts_of(pkg + "/index")
+
+# typesVersions' mapping of a subpath, for the first range TypeScript 5.9 is in: the file, or "".
+fn types_versions(pkg: str, tv: json.Value, sub: str) str:
+    match tv:
+        Obj(ranges, maps):
+            for i in 0..len(ranges):
+                if not ts59_in(ranges[i]):
+                    continue
+                match maps[i]:
+                    Obj(pats, targets):
+                        for j in 0..len(pats):
+                            star = pats[j].find("*")
+                            rest = ""
+                            if star < 0:
+                                if pats[j] != sub:
+                                    continue
+                            else:
+                                pre = pats[j][..star]
+                                post = pats[j][star + 1..]
+                                if not (sub.starts_with(pre) and sub.ends_with(post) and len(sub) >= len(pre) + len(post)):
+                                    continue
+                                rest = sub[len(pre)..len(sub) - len(post)]
+                            match targets[j]:
+                                Arr(items):
+                                    for it in items:
+                                        t = clean(pkg + "/" + it.str_or("").replace("*", rest))
+                                        if (t.ends_with(".ts") or t.ends_with(".tsx")) and fs.exists(t):
+                                            return t
+                                        d = dts_of(strip_js(t))
+                                        if d != "":
+                                            return d
+                                _:
+                                    pass
+                        return ""
+                    _:
+                        return ""
+        _:
+            return ""
+    return ""
+
+# Whether TypeScript 5.9 is in a typesVersions range ("*", ">=4.2", "<5.0", ...).
+fn ts59_in(r: str) bool:
+    for part in r.split(" "):
+        if part == "" or part == "*":
+            continue
+        if part.starts_with(">="):
+            if version_num(part[2..]) > 509:
+                return false
+        elif part.starts_with(">"):
+            if version_num(part[1..]) >= 509:
+                return false
+        elif part.starts_with("<="):
+            if version_num(part[2..]) < 509:
+                return false
+        elif part.starts_with("<"):
+            if version_num(part[1..]) <= 509:
+                return false
+        else:
+            return false
+    return true
+
+# "4.2" -> 402, "5" -> 500
+fn version_num(v: str) int:
+    parts = v.split(".")
+    major = parts[0].to_int(0)
+    minor = 0
+    if len(parts) > 1:
+        minor = parts[1].to_int(0)
+    return major * 100 + minor
+
+# The "types" condition of package.json "exports" for a subpath ("." or "./sub"), or "".
+fn exports_types(ex: json.Value, key: str) str:
+    match ex:
+        Str(s):
+            if key == ".":
+                return types_beside(s)
+            return ""
+        Obj(keys, vals):
+            if len(keys) > 0 and keys[0].starts_with("."):
+                for i in 0..len(keys):
+                    if keys[i] == key:
+                        return condition_types(vals[i])
+                return ""
+            if key == ".":
+                return condition_types(ex)
+            return ""
+        _:
+            return ""
+    return ""
+
+# The types of a conditions object (types, import, require, node, default).
+fn condition_types(v: json.Value) str:
+    match v:
+        Str(s):
+            return types_beside(s)
+        Obj(keys, vals):
+            for i in 0..len(keys):
+                if keys[i] == "types":
+                    t = condition_types(vals[i])
+                    if t != "":
+                        return t
+            for i in 0..len(keys):
+                if keys[i] == "import" or keys[i] == "require" or keys[i] == "node" or keys[i] == "default":
+                    t = condition_types(vals[i])
+                    if t != "":
+                        return t
+            return ""
+        Arr(items):
+            for it in items:
+                t = condition_types(it)
+                if t != "":
+                    return t
+            return ""
+        _:
+            return ""
+    return ""
+
+# "./dist/index.js" -> "./dist/index.d.ts" (the declarations usually sit beside the code).
+fn types_beside(s: str) str:
+    if s.ends_with(".d.ts") or s.ends_with(".d.mts") or s.ends_with(".d.cts"):
+        return s
+    if s.ends_with(".js") or s.ends_with(".mjs") or s.ends_with(".cjs"):
+        return strip_js(s) + ".d.ts"
+    return ""
+
+fn strip_js(p: str) str:
+    for ext in [".js", ".mjs", ".cjs"]:
+        if p.ends_with(ext):
+            return p[..len(p) - len(ext)]
+    return p
+
+fn clean(p: str) str:
+    return p.replace("/./", "/")
+
+fn parent(p: str) str:
+    k = len(p) - 1
+    while k > 0 and p.byte(k) != 47:
+        k -= 1
+    if k <= 0:
+        return "/"
+    return p[..k]

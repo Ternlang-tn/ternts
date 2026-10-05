@@ -1,0 +1,1433 @@
+# Expressions. The source is copied as is, except for the edits made here (types removed, names rewritten).
+
+# Remove the type annotation after ":" at the current token.
+fn drop_annotation(p: mut P) Ser:
+    if p.mute == 0:
+        p.ts_syntax += 1                         # (TypeScript syntax: class.tn private names)
+    emit_ts(&p)
+    next(&p)
+    p.bad = false
+    t = parse_type(&p)
+    if p.bad:
+        fail(&p, "bad type")
+    skip_pe(&p)
+    return t
+
+fn drop_return_type(p: mut P) Ser:
+    emit_ts(&p)
+    next(&p)
+    p.bad = false
+    t = return_type(&p)
+    if p.bad:
+        fail(&p, "bad return type")
+    skip_pe(&p)
+    return t
+
+fn parse_expr(p: mut P):
+    assign(&p, false)
+    while at_op(&p, 44):
+        next(&p)
+        assign(&p, false)
+
+fn parse_expr_no_in(p: mut P):
+    assign(&p, true)
+    while at_op(&p, 44):
+        next(&p)
+        assign(&p, true)
+
+fn assign(p: mut P, no_in: bool):
+    if p.ir_mode or p.st_super != "":           # below ES2022, lowering: a tree (ir.tn)
+        if p.ir_skip:
+            p.ir_skip = false
+        elif p.mute == 0 and (p.ir_low or len(p.privs) > 0 or p.st_super != ""):
+            ir_root(&p, no_in)                   # (#private names only matter in their classes)
+            return
+    if p.tok == T_NAME:
+        if p.kw == K_ASYNC:
+            k = peek_tok(&p)
+            if not k.nlb:
+                if k.tok == T_NAME and k.kw != K_FUNCTION:        # async x => ...
+                    s = save(&p)
+                    next(&p)
+                    next(&p)
+                    if at_op(&p, O_ARROW):
+                        restore(&p, s)
+                        p.async_at = p.ts
+                        next(&p)
+                        async_arrow_in_static(&p)
+                        if lower_async(&p):
+                            async_arrow(&p, no_in, true)
+                        else:
+                            native_async_arrow(&p, no_in, true)
+                        return
+                    restore(&p, s)
+                elif k.tok == T_OP and (k.op == 40 or k.op == 60):
+                    s = save(&p)
+                    at = p.ts
+                    next(&p)
+                    if is_arrow_ahead(&p):
+                        async_arrow_in_static(&p)
+                        if lower_async(&p):
+                            p.async_at = at
+                            async_arrow(&p, no_in, false)
+                        else:
+                            native_async_arrow(&p, no_in, false)
+                        return
+                    restore(&p, s)
+        elif p.kw == K_YIELD and p.in_gen > 0 and p.mute == 0 and len(p.aw) > 0 and in_agen(&p):
+            agen_yield(&p, no_in)                # below ES2018 (asyncgen.tn)
+            return
+        elif p.kw == K_YIELD and p.in_gen > 0:
+            next(&p)
+            if not p.nlb:
+                eat_op(&p, 42)
+                if starts_expr(&p):
+                    assign(&p, no_in)
+            return
+        if p.kw == 0 or p.kw > K_WITH:
+            k = peek_tok(&p)
+            if k.tok == T_OP and k.op == O_ARROW and not k.nlb:
+                arrow_ident(&p, no_in)
+                return
+    elif p.tok == T_OP and (p.op == 40 or p.op == 60):
+        if is_arrow_ahead(&p):
+            arrow_parens(&p, no_in)
+            return
+    if p.target < 2022 and p.mute == 0 and len(p.privs) > 0 and not p.ppat and (at_op(&p, 123) or at_op(&p, 91)) and priv_pattern_ahead(&p):
+        assign_priv_pattern(&p, no_in)
+        return
+    if p.target < 2018 and p.mute == 0 and not p.in_pattern and (at_op(&p, 123) or at_op(&p, 91)):
+        assign_rest(&p, no_in)                   # ({ ...r } = o), [{ ...r }] = xs (a nested
+        return                                   # pattern is the outer one's to flatten)
+    conditional(&p, no_in)
+    if p.tok == T_OP:
+        if p.op == 61 or p.op == O_ASSIGN:
+            next(&p)
+            if p.in_pattern:
+                pattern_default(&p, no_in)
+            else:
+                assign(&p, no_in)
+        elif p.op == 62:
+            w = 0
+            op = gt_op(&p, &w)
+            if op == O_ASSIGN:
+                take_gt(&p, w)
+                next(&p)
+                assign(&p, no_in)
+
+# A default in an assignment pattern: an expression again (its { ...o } is a spread).
+fn pattern_default(p: mut P, no_in: bool):
+    p.in_pattern = false
+    assign(&p, no_in)
+    p.in_pattern = true
+
+# assign() at "{" below ES2018: `({ a, ...r } = o)` goes through __rest (lower.tn).
+fn assign_rest(p: mut P, no_in: bool):
+    s0 = save(&p)
+    p.mute += 1
+    skip_group(&p)
+    is_pat = at_op(&p, 61)
+    p.mute -= 1
+    restore(&p, s0)
+    emit_ts(&p)
+    pre = p.out
+    lhs_at = p.ts
+    saved = begin_capture(&p)
+    np = p.in_pattern
+    p.in_pattern = is_pat or np                  # its { ...r } aren't spreads to lower
+    conditional(&p, no_in)
+    p.in_pattern = np
+    emit_pe(&p)
+    lhs = end_capture(&p, saved)
+    if at_op(&p, 61) and needs_rest(lhs):
+        next(&p)
+        skip_ts(&p)
+        a = p.ts
+        saved2 = begin_capture(&p)
+        assign(&p, no_in)
+        emit_pe(&p)
+        init0 = end_capture(&p, saved2)
+        used = not rest_value_unused(&p, pre, lhs_at)
+        t = rest_assign_text(&p, lhs, init0.trim(), simple_copy(p.src[a..p.pe].trim()), used)
+        if used:
+            t = "(" + t + ")"
+        put(&p, t)
+        return
+    put(&p, lhs)
+    if p.tok == T_OP and (p.op == 61 or p.op == O_ASSIGN):
+        next(&p)
+        assign(&p, no_in)
+
+# `lhs = init` with object rest, lowered: a comma list (to parenthesize when used).
+fn rest_assign_text(p: mut P, lhs: str, init: str, init_simple: bool, used: bool) str:
+    if not used:
+        return rest_parts(&p, lhs, init, init_simple, false)
+    # its value is used: the source, through a temp unless it's a name (tsc's needsValue)
+    out: [str] = []
+    src = init
+    if not plain_ident(init):
+        src = low_temp(&p, 2018)
+        out.push(src + " = " + init)
+    rest_flatten(&p, lhs, src, true, false, &out)
+    out.push(src)
+    return ", ".join(out)
+
+# After a lowered `{ ...r } = x` (at lhs_at; pre: the output before it): is its value unused?
+fn rest_value_unused(p: mut P, pre: str, lhs_at: int) bool:
+    n = -1
+    if p.expr_stmt >= 0 and p.expr_stmt <= lhs_at:
+        n = 0
+        for k in p.expr_stmt..lhs_at:
+            c = p.src.byte(k)
+            if c == 40:
+                n += 1
+            elif not (c == 32 or c == 9 or c == 10 or c == 13):
+                n = -1
+                break
+    term = n >= 0
+    if n < 0:
+        t = rtrim(pre)
+        n = 0
+        while t.ends_with("("):
+            n += 1
+            t = rtrim(t[..len(t) - 1])
+        if not (n > 0 and t.ends_with("for") and (len(t) == 3 or not is_id(t.byte(len(t) - 4)))):
+            return false
+        n -= 1                                   # (a for loop's initializer)
+    s = save(&p)
+    p.mute += 1
+    while n > 0 and at_op(&p, 41):
+        next(&p)
+        n -= 1
+    r = n == 0 and at_op(&p, 59)
+    if term:
+        r = n == 0 and (p.tok == T_EOF or p.nlb or at_op(&p, 59) or at_op(&p, 125))
+    p.mute -= 1
+    restore(&p, s)
+    return r
+
+fn starts_expr(p: mut P) bool:
+    if p.tok == T_EOF:
+        return false
+    if p.tok != T_OP:
+        if p.tok == T_NAME:
+            return not (p.kw == K_IN or p.kw == K_OF or p.kw == K_INSTANCEOF or p.kw == K_AS or p.kw == K_SATISFIES)
+        return true
+    o = p.op
+    return o == 40 or o == 91 or o == 123 or o == 43 or o == 45 or o == 33 or o == 126 or o == 47 or o == O_INC or o == O_DEC or o == 60 or o == 64 or (o == O_ASSIGN and p.src.byte(p.ts) == 47) or o == O_DOTS
+
+# At "(" or "<": is an arrow function starting here?
+fn is_arrow_ahead(p: mut P) bool:
+    mine = lookahead_begin(&p)
+    r = is_arrow_scan(&p)
+    lookahead_end(&p, mine)
+    return r
+
+fn is_arrow_scan(p: mut P) bool:
+    s = save(&p)
+    r = false
+    p.bad = false
+    if at_op(&p, 60):
+        skip_type_params(&p)
+        if p.bad or not at_op(&p, 40):
+            restore(&p, s)
+            p.bad = false
+            return false
+    skip_group(&p)
+    if not p.bad:
+        if at_op(&p, O_ARROW) and not p.nlb:
+            r = true
+        elif at_op(&p, 58):
+            next(&p)
+            return_type(&p)
+            r = not p.bad and at_op(&p, O_ARROW) and not p.nlb
+            if r and s.ts == p.cond_at:
+                # `b ? (c): d => e`: in a conditional's first branch an arrow's return type needs the `:` after it
+                next(&p)
+                p.mute += 1
+                if at_op(&p, 123):
+                    skip_group(&p)
+                else:
+                    ca = p.cond_at
+                    p.cond_at = p.ts
+                    assign(&p, false)
+                    p.cond_at = ca
+                p.mute -= 1
+                r = not p.bad and at_op(&p, 58)
+    restore(&p, s)
+    p.bad = false
+    return r
+
+fn arrow_ident(p: mut P, no_in: bool):
+    restricted = p.ts == p.cond_at
+    push_scope_here(&p, true)
+    declare_tok(&p, false)
+    next(&p)
+    expect_op(&p, O_ARROW)
+    if restricted:
+        p.cond_at = p.ts                         # (its body is restricted too: conditional)
+    arrow_body(&p, no_in)
+    pop_scope(&p)
+
+fn arrow_parens(p: mut P, no_in: bool):
+    restricted = p.ts == p.cond_at
+    push_scope_here(&p, true)
+    saved_tp = p.tparams
+    if at_op(&p, 60):
+        emit_ts(&p)
+        for t in type_param_names(&p):
+            p.tparams.push(t)
+        skip_pe(&p)
+    fparams(&p, false)
+    if at_op(&p, 58):
+        drop_return_type(&p)
+    expect_op(&p, O_ARROW)
+    if restricted:
+        p.cond_at = p.ts                         # (its body is restricted too: conditional)
+    arrow_body(&p, no_in)
+    p.tparams = saved_tp
+    pop_scope(&p)
+
+fn arrow_body(p: mut P, no_in: bool):
+    g = p.in_gen
+    p.in_gen = 0
+    if at_op(&p, 123):
+        fn_body(&p)
+    elif at_op(&p, 60) and not p.tsx and assertion_of_object(&p):
+        # `() => <T>{...}`: without the assertion the object needs parentheses
+        emit_ts(&p)
+        put(&p, "(")
+        assign(&p, no_in)
+        emit_pe(&p)
+        put(&p, ")")
+    elif p.target < 2022 and p.mute == 0:
+        concise_body(&p, no_in)
+    else:
+        assign(&p, no_in)
+    p.in_gen = g
+
+# Below ES2022 a concise arrow body may need temps (`x => x.a?.b`): tsc makes it a block declaring them.
+fn concise_body(p: mut P, no_in: bool):
+    emit_ts(&p)
+    id = p.pre_fn
+    p.pre_fn = -1
+    if id < 0:
+        id = fn_open(&p)
+    else:
+        p.fn_stack.push(id)
+    saved = begin_capture(&p)
+    assign(&p, no_in)
+    emit_pe(&p)
+    text = end_capture(&p, saved)
+    p.fn_stack.pop()
+    vars = fn_vars_text(&p, id)
+    if vars == "":
+        put(&p, text)
+    else:
+        put(&p, "{" + vars + " return " + text.trim() + "; }")
+
+fn conditional(p: mut P, no_in: bool):
+    st = p.ts
+    binary(&p, no_in)
+    if at_op(&p, 63):
+        restricted = st == p.cond_at             # (inside a first branch: its second one is too)
+        next(&p)
+        ca = p.cond_at
+        p.cond_at = p.ts                         # (is_arrow_ahead: tsc's allowReturnTypeInArrowFunction)
+        assign(&p, false)
+        p.cond_at = ca
+        expect_op(&p, 58)
+        if restricted:
+            p.cond_at = p.ts
+        assign(&p, no_in)
+
+fn is_binop(o: int) bool:
+    return o == O_AND or o == O_OR or o == O_NULLISH or o == 124 or o == 94 or o == 38 or o == O_EQ2 or o == O_EQ3 or o == O_NE or o == O_NE2 or o == 60 or o == O_LE or o == O_SHL or o == 43 or o == 45 or o == 42 or o == 47 or o == 37 or o == O_POW
+
+fn binary(p: mut P, no_in: bool):
+    unary(&p)
+    plain = p.plain
+    ops = 0
+    while true:
+        if p.tok == T_OP:
+            if is_binop(p.op):
+                ops += 1
+                next(&p)
+                unary(&p)
+                continue
+            if p.op == 62:
+                w = 0
+                op = gt_op(&p, &w)
+                if op == O_ASSIGN:
+                    return
+                take_gt(&p, w)
+                next(&p)
+                unary(&p)
+                ops += 1
+                continue
+            return
+        if p.tok == T_NAME:
+            if p.kw == K_INSTANCEOF or (p.kw == K_IN and not no_in):
+                next(&p)
+                unary(&p)
+                ops += 1
+                continue
+            if (p.kw == K_AS or p.kw == K_SATISFIES) and not p.nlb:
+                if p.mute == 0:
+                    p.ts_syntax += 1
+                emit_pe(&p)
+                next(&p)
+                if at_kw(&p, K_CONST):
+                    next(&p)
+                else:
+                    p.bad = false
+                    parse_type(&p)
+                    if p.bad:
+                        fail(&p, "bad type after as")
+                skip_pe(&p)
+                p.assert_end = p.pe
+                p.assert_lhs = plain and ops == 0
+                continue
+        return
+
+fn unary(p: mut P):
+    if p.tok == T_OP:
+        o = p.op
+        if o == 33 or o == 126 or o == 43 or o == 45 or o == O_INC or o == O_DEC:
+            next(&p)
+            unary(&p)
+            p.plain = false
+            return
+        if o == 60 and not p.tsx:                    # <T>expr
+            emit_ts(&p)
+            next(&p)
+            p.bad = false
+            parse_type(&p)
+            if not at_op(&p, 62):
+                fail(&p, "bad type assertion")
+            next(&p)
+            skip_pe(&p)
+            unary(&p)
+            p.assert_end = p.pe
+            p.assert_lhs = p.plain
+            p.plain = false
+            return
+    elif p.tok == T_NAME:
+        k = p.kw
+        if k == K_TYPEOF or k == K_VOID or k == K_DELETE:
+            next(&p)
+            unary(&p)
+            p.plain = false
+            return
+        if k == K_AWAIT:
+            n = peek_tok(&p)
+            if not n.nlb or p.in_async > 0:
+                if not (n.tok == T_OP and (n.op == 41 or n.op == 44 or n.op == 59 or n.op == 61 or n.op == 58 or n.op == 93 or n.op == 125 or n.op == O_ARROW or n.op == 46)) and n.tok != T_EOF:
+                    if len(p.aw) > 0 and async_top(&p) >= 0 and p.mute == 0:
+                        await_to_yield(&p)               # below ES2017 (lower.tn)
+                        p.plain = false
+                        return
+                    next(&p)
+                    unary(&p)
+                    p.plain = false
+                    return
+    postfix(&p)
+
+# lhs() where a tree may lower it (a class's heritage, a for-await target).
+fn lhs_root(p: mut P):
+    if p.ir_mode and p.mute == 0 and (p.ir_low or len(p.privs) > 0):
+        ir_root_lhs(&p)
+        return
+    lhs(&p)
+
+fn postfix(p: mut P):
+    lhs(&p)
+    p.plain = true
+    if p.tok == T_OP and (p.op == O_INC or p.op == O_DEC) and not p.nlb:
+        next(&p)
+        p.plain = false
+
+# Member access, calls, `!`, type arguments.
+fn lhs(p: mut P):
+    if at_kw(&p, K_NEW):
+        new_expr(&p)
+    else:
+        primary(&p)
+    call_tail(&p)
+
+fn call_tail(p: mut P):
+    while true:
+        if p.tok == T_OP:
+            o = p.op
+            if o == 46:
+                next(&p)
+                next(&p)                             # a name, keyword or #private
+                continue
+            if o == O_QDOT:
+                next(&p)
+                if at_op(&p, 40):
+                    args(&p)
+                elif at_op(&p, 91):
+                    next(&p)
+                    parse_expr(&p)
+                    expect_op(&p, 93)
+                elif at_op(&p, 60):
+                    if not try_type_args(&p):
+                        fail(&p, "bad ?.<")
+                else:
+                    next(&p)
+                continue
+            if o == 91:
+                next(&p)
+                parse_expr(&p)
+                expect_op(&p, 93)
+                continue
+            if o == 40:
+                args(&p)
+                continue
+            if o == 33 and not p.nlb and p.mute == 0:
+                p.ts_syntax += 1
+            if o == 33 and not p.nlb:               # x!
+                emit_ts(&p)
+                skip_te(&p)
+                next(&p)
+                p.assert_end = p.pe
+                p.assert_lhs = true
+                continue
+            if o == 60 or o == O_SHL:
+                if o == 60 and try_type_args(&p):
+                    continue
+                if o == O_SHL and try_shl_type_args(&p):     # f<<T>(x: T) => T>(g)
+                    continue
+                return
+            return
+        if p.tok == T_TPL or p.tok == T_TPL_HEAD:
+            template(&p)
+            continue
+        return
+
+# At "<" after an expression: type arguments of a call or instantiation expression? If so they are removed.
+# At `<<`: type arguments whose first one is a generic function type, as tsc reads it?
+fn try_shl_type_args(p: mut P) bool:
+    s0 = save(&p)
+    split_shl(&p)
+    if try_type_args(&p):
+        return true
+    restore(&p, s0)
+    return false
+
+fn try_type_args(p: mut P) bool:
+    s = save(&p)
+    p.bad = false
+    skip_type_args(&p)
+    if p.bad:
+        restore(&p, s)
+        p.bad = false
+        return false
+    ok = false
+    if p.tok == T_OP:
+        o = p.op
+        if o == 40 or o == 41 or o == 93 or o == 44 or o == 59 or o == 58 or o == 125 or o == 46 or o == O_QDOT or o == O_EQ2 or o == O_EQ3 or o == O_NE or o == O_NE2 or o == 63 or o == O_AND or o == O_OR or o == O_NULLISH or o == 124 or o == 94 or o == 38:
+            ok = true
+        elif o == 42 or o == 47 or o == 37 or o == O_POW or o == O_SHL or o == O_LE:
+            ok = true                            # binary operators (tsc: isBinaryOperator)
+        elif p.nlb and not (o == 43 or o == 45 or o == 60 or o == 62):
+            ok = true
+    elif p.tok == T_TPL or p.tok == T_TPL_HEAD or p.tok == T_EOF:
+        ok = true
+    elif p.nlb:
+        ok = true
+    elif p.tok == T_NAME and (p.kw == K_INSTANCEOF or p.kw == K_IN or p.kw == K_AS or p.kw == K_SATISFIES):
+        ok = true                                # Box<number> instanceof Object
+    if not ok:
+        restore(&p, s)
+        return false
+    end = p.pe
+    restore(&p, s)
+    emit_ts(&p)
+    p.mute += 1
+    skip_type_args(&p)                           # again, to leave the lexer after them
+    p.mute -= 1
+    p.bad = false
+    skip_to(&p, end)
+    return true
+
+fn args(p: mut P):
+    next(&p)
+    while not at_op(&p, 41) and p.tok != T_EOF:
+        eat_op(&p, O_DOTS)
+        assign(&p, false)
+        if not eat_op(&p, 44):
+            break
+    expect_op(&p, 41)
+
+fn new_expr(p: mut P):
+    next(&p)
+    if at_op(&p, 46):                                 # new.target
+        next(&p)
+        next(&p)
+        return
+    w = p.no_wrap
+    p.no_wrap = true
+    if at_kw(&p, K_NEW):
+        new_expr(&p)
+    else:
+        primary(&p)
+    p.no_wrap = w
+    while true:
+        if at_op(&p, 46):
+            next(&p)
+            next(&p)
+        elif at_op(&p, 91):
+            next(&p)
+            parse_expr(&p)
+            expect_op(&p, 93)
+        elif p.tok == T_TPL or p.tok == T_TPL_HEAD:
+            template(&p)
+        else:
+            break
+    if at_op(&p, 60):
+        try_type_args(&p)
+    if at_op(&p, 40):
+        args(&p)
+
+fn template(p: mut P):
+    while p.tok == T_TPL_HEAD:
+        next(&p)
+        parse_expr(&p)
+        if not at_op(&p, 125):
+            fail(&p, "unterminated template")
+            return
+        rescan_tpl(&p)
+    next(&p)
+
+fn primary(p: mut P):
+    nw = p.no_wrap
+    p.no_wrap = false
+    t = p.tok
+    if t == T_NAME:
+        k = p.kw
+        if k == 0 or k > K_WITH:
+            if k == K_ASYNC:
+                n = peek_tok(&p)
+                if n.kw == K_FUNCTION and not n.nlb:
+                    p.async_at = p.ts
+                    next(&p)
+                    function_expr(&p, true)
+                    return
+            p.no_wrap = nw
+            ref(&p)
+            p.no_wrap = false
+            return
+        if k == K_FUNCTION:
+            function_expr(&p, false)
+            return
+        if k == K_CLASS:
+            class_expr(&p)
+            return
+        if k == K_IMPORT:
+            import_expr(&p)
+            return
+        if k == K_THIS and len(p.aw) > 0 and async_top(&p) >= 0 and not p.st_on:
+            p.actx[async_top(&p)].this_used = true
+        if k == K_SUPER and len(p.aw) > 0 and async_top(&p) >= 0 and p.mute == 0 and async_super(&p):
+            return
+        if k == K_SUPER and p.st_on and p.mute == 0 and p.st_kind != ST_DECORATED and p.st_super == "" and peek_tok(&p).tok == T_OP and (peek_tok(&p).op == 46 or peek_tok(&p).op == 91):
+            static_super_hint(&p)                # (super.x in a lowered static: ir.tn, once the class knows)
+        if k == K_SUPER and p.st_on and p.mute == 0 and p.st_kind == ST_DECORATED and peek_tok(&p).tok == T_OP and (peek_tok(&p).op == 46 or peek_tok(&p).op == 91):
+            a = p.ts                             # a decorated class's moved statics: as `this`
+            emit_to(&p, a)                       # there, tsc writes (void 0)
+            put(&p, "(void 0)")
+            next(&p)
+            skip_to(&p, a + 5)
+            return
+        if k == K_THIS and p.st_on and p.mute == 0:
+            a = p.ts
+            emit_to(&p, a)
+            put(&p, static_this(&p))
+            next(&p)
+            skip_to(&p, a + 4)
+            return
+        next(&p)                                     # this super null true false ...
+        return
+    if t == T_NUM and p.target < 2021 and p.mute == 0 and p.src[p.ts..p.te].contains("_"):
+        a = p.ts                                     # 1_000 below ES2021: 1000
+        emit_to(&p, a)
+        put(&p, p.src[p.ts..p.te].replace("_", ""))
+        next(&p)
+        e = p.pe
+        skip_to(&p, e)
+        return
+    if t == T_NUM or t == T_STR or t == T_PRIV or t == T_REGEX:
+        next(&p)
+        return
+    if t == T_TPL or t == T_TPL_HEAD:
+        template(&p)
+        return
+    if t == T_OP:
+        o = p.op
+        if o == 40:
+            emit_ts(&p)
+            opos = len(p.out)
+            next(&p)
+            parse_expr(&p)
+            if at_op(&p, 41) and p.assert_end == p.pe and p.assert_lhs and p.mute == 0:
+                # tsc drops parentheses around a type assertion, but with `?.` after them that moves the chain's end
+                n = peek_tok(&p)
+                if n.tok == T_OP and n.op == O_QDOT and len(p.out) > opos and p.out.byte(opos) == 40:
+                    # and the line break: `return (\n x as T)?.y` must not become `return \n x?.y` (a `return;`)
+                    j = opos + 1
+                    while j < len(p.out) and (p.out.byte(j) == 32 or p.out.byte(j) == 9 or p.out.byte(j) == 10 or p.out.byte(j) == 13):
+                        j += 1
+                    p.out = p.out[..opos] + p.out[j..]
+                    emit_ts(&p)
+                    skip_te(&p)
+            expect_op(&p, 41)
+            return
+        if o == 91:
+            array_lit(&p)
+            return
+        if o == 123:
+            object_lit(&p)
+            return
+        if o == 47 or (o == O_ASSIGN and p.src.byte(p.ts) == 47):
+            rescan_regex(&p)
+            next(&p)
+            return
+        if o == 60 and p.tsx:
+            jsx_expr(&p)
+            return
+        if o == 64:                                  # decorators on a class expression
+            decorators_skip(&p)
+            primary(&p)
+            return
+    fail(&p, f"unexpected '{tok_text(&p)}'")
+    next(&p)
+
+fn array_lit(p: mut P):
+    next(&p)
+    while not at_op(&p, 93) and p.tok != T_EOF:
+        if at_op(&p, 44):
+            next(&p)
+            continue
+        eat_op(&p, O_DOTS)
+        assign(&p, false)
+        if not eat_op(&p, 44):
+            break
+    expect_op(&p, 93)
+
+fn object_lit(p: mut P):
+    keep = p.keep_spread
+    p.keep_spread = false                        # (only this object: its nested ones lower)
+    if p.target < 2018 and p.mute == 0 and not p.in_pattern and not keep:
+        object_lit_lowered(&p)
+        return
+    next(&p)
+    while not at_op(&p, 125) and p.tok != T_EOF:
+        if eat_op(&p, O_DOTS):
+            assign(&p, false)
+        else:
+            object_member(&p)
+        if not eat_op(&p, 44):
+            break
+    expect_op(&p, 125)
+
+# object_lit below ES2018: spreads become Object.assign calls (lower.tn); patterns are left to the assignment.
+fn object_lit_lowered(p: mut P):
+    emit_ts(&p)
+    saved = begin_capture(&p)
+    next(&p)
+    starts: [int] = []
+    ends: [int] = []
+    spread: [bool] = []
+    any = false
+    while not at_op(&p, 125) and p.tok != T_EOF:
+        emit_ts(&p)
+        starts.push(len(p.out))
+        if eat_op(&p, O_DOTS):
+            spread.push(true)
+            any = true
+            assign(&p, false)
+        else:
+            spread.push(false)
+            object_member(&p)
+        emit_pe(&p)
+        ends.push(len(p.out))
+        if not eat_op(&p, 44):
+            break
+    expect_op(&p, 125)
+    emit_pe(&p)
+    text = end_capture(&p, saved)
+    if not any or at_op(&p, 61):
+        put(&p, text)
+        return
+    parts: [str] = []
+    for i in 0..len(starts):
+        part = text[starts[i]..ends[i]].trim()
+        if spread[i]:
+            part = part[3..].trim()
+        parts.push(part)
+    put(&p, object_assign(parts, spread))
+
+fn object_member(p: mut P):
+    is_async = false
+    is_gen = false
+    if p.tok == T_NAME and (p.kw == K_GET or p.kw == K_SET or p.kw == K_ASYNC):
+        n = peek_tok(&p)
+        if not (n.tok == T_OP and (n.op == 58 or n.op == 40 or n.op == 44 or n.op == 125 or n.op == 61 or n.op == 60)):
+            is_async = p.kw == K_ASYNC
+            if is_async:
+                p.async_at = p.ts
+            next(&p)
+    if eat_op(&p, 42):
+        is_gen = true
+    if p.tok == T_NAME and not is_async and not is_gen:
+        n = peek_tok(&p)
+        if n.tok == T_OP and (n.op == 44 or n.op == 125 or n.op == 61):
+            shorthand(&p)
+            if at_op(&p, 61):                         # { a = 1 } in a pattern
+                next(&p)
+                if p.in_pattern:
+                    pattern_default(&p, false)
+                else:
+                    assign(&p, false)
+            return
+    key_at = p.ts
+    prop_name(&p)
+    eat_op(&p, 63)
+    if at_op(&p, 40) or at_op(&p, 60):
+        p.fn_name = "\x01"
+        kt = p.src[key_at..p.pe].trim()
+        if simple_copy(kt) and not is_digit(kt.byte(0)):
+            p.fn_name = kt
+        method_rest(&p, is_async, is_gen)
+        return
+    expect_op(&p, 58)
+    assign(&p, false)
+
+fn prop_name(p: mut P):
+    if at_op(&p, 91):
+        next(&p)
+        so = p.st_on
+        p.st_on = false                          # (`this` in a computed key stays, in a moved
+        assign(&p, false)                        # static too: tsc doesn't rewrite it there)
+        p.st_on = so
+        expect_op(&p, 93)
+    else:
+        next(&p)
+
+# `{ name }`: the name is a reference, and may need `name: mod_1.name`.
+fn shorthand(p: mut P):
+    a = p.ts
+    b = p.te
+    h = p.h
+    seen_mark(&p, h)
+    if len(p.binds) > 0:
+        k = find_bind(&p, a, b, h)
+        if k >= 0 and not shadowed_bind(&p, a, b, h, k):
+            r = use_bind(&p, k, a)
+            if r != "" and p.binds[k].kind != B_SELFPRIV:
+                emit_to(&p, a)
+                put(&p, p.src[a..b] + ": " + r)
+                skip_to(&p, b)
+    next(&p)
+
+# An identifier in an expression.
+fn ref(p: mut P):
+    a = p.ts
+    b = p.te
+    h = p.h
+    seen_mark(&p, h)
+    if len(p.aw) > 0 and b - a == 9 and p.mute == 0 and p.src[a..b] == "arguments" and async_arguments(&p):
+        return
+    if len(p.binds) > 0:
+        k = find_bind(&p, a, b, h)
+        if k >= 0 and (p.binds[k].kind == B_XDECL or p.binds[k].kind == B_XLIST):
+            pk = back_space(p.src, a)            # (a prefix ++x / --x before it?)
+            prefix = pk >= 1 and ((p.src.byte(pk) == 43 and p.src.byte(pk - 1) == 43) or (p.src.byte(pk) == 45 and p.src.byte(pk - 1) == 45))
+            next(&p)
+            if (at_op(&p, 61) or (at_op(&p, O_ASSIGN) and p.src.byte(p.ts) != 47)) and not shadowed_bind(&p, a, b, h, k):
+                emit_to(&p, a)
+                put(&p, p.binds[k].repl + " = ")
+            elif p.binds[k].kind == B_XLIST and p.mute == 0 and not shadowed_bind(&p, a, b, h, k):
+                chain = p.binds[k].repl
+                xlist_update(&p, chain, a, b, pk - 1, prefix, "")
+            return
+        if k >= 0 and not shadowed_bind(&p, a, b, h, k):
+            r = use_bind(&p, k, a)
+            next(&p)
+            note_assigned(&p, a, b)
+            if r != "":
+                kind = p.binds[k].kind
+                if p.has_xalias and kind == B_EXPORT and p.mute == 0 and export_alias_ref(&p, a, b, r):
+                    return
+                emit_to(&p, a)
+                if (kind == B_IMPORT or kind == B_EXPORT) and not p.no_wrap and (is_call_next(&p) or type_args_call_ahead(&p)):
+                    put(&p, "(0, " + r + ")")
+                else:
+                    put(&p, r)
+                skip_to(&p, b)
+            return
+    next(&p)
+    note_assigned(&p, a, b)
+
+# `export let x` re-exported as y (H_XALIAS): x = v is exports.y = exports.x = v. False when not one.
+fn export_alias_ref(p: mut P, a: int, b: int, r: str) bool:
+    chain = ""
+    for x in p.hints:
+        if x.kind == H_XALIAS and x.name == p.src[a..b]:
+            chain = x.repl
+    if chain == "":
+        return false
+    if p.tok == T_OP and (p.op == 61 or (p.op == O_ASSIGN and p.src.byte(p.ts) != 47)):
+        emit_to(&p, a)
+        put(&p, chain + " = " + r)
+        skip_to(&p, b)
+        return true
+    pk = back_space(p.src, a)
+    prefix = pk >= 1 and ((p.src.byte(pk) == 43 and p.src.byte(pk - 1) == 43) or (p.src.byte(pk) == 45 and p.src.byte(pk - 1) == 45))
+    if not prefix and not ((at_op(&p, O_INC) or at_op(&p, O_DEC)) and not p.nlb):
+        return false
+    xlist_update(&p, chain, a, b, pk - 1, prefix, r)
+    return true
+
+# x++ / ++x of a variable an export list exports (B_XLIST): the export follows, as tsc writes it:
+# exports.x = ++x; as a statement exports.x = (x++, x); as a value (exports.x = (_a = x++, x), _a).
+# `rname`: the name's own replacement (an H_XALIAS exports.x), or "" (kept).
+fn xlist_update(p: mut P, chain: str, a: int, b: int, pre_at: int, prefix: bool, rname: str):
+    name = rname
+    if name == "":
+        name = p.src[a..b]
+    if prefix and p.cp <= pre_at:
+        whole = p.expr_stmt == pre_at and (p.tok == T_EOF or p.nlb or (p.tok == T_OP and (p.op == 59 or p.op == 125)))
+        emit_to(&p, pre_at)
+        if whole:
+            put(&p, chain + " = ")               # (a statement: exports.x = ++x;)
+            name_out(&p, a, b, rname)
+        else:
+            put(&p, "(" + chain + " = ")
+            name_out(&p, a, b, rname)
+            put(&p, ")")
+        return
+    if not ((at_op(&p, O_INC) or at_op(&p, O_DEC)) and not p.nlb):
+        return
+    stmt = p.expr_stmt == a and stmt_ends_after(&p)
+    if p.for_inc and peek_tok(&p).tok == T_OP and peek_tok(&p).op == 41:
+        k = back_space(p.src, a)                 # for (...; ...; x++): unused too
+        stmt = k >= 0 and p.src.byte(k) == 59
+    emit_to(&p, a)
+    if stmt:
+        put(&p, chain + " = (")
+        name_out(&p, a, b, rname)
+        next(&p)
+        emit_pe(&p)
+        put(&p, ", " + name + ")")
+        return
+    t = ""
+    if export_fn_scope(&p):
+        saved = p.fn_stack                       # (tsc's module transform visits an exported
+        p.fn_stack = []                          # function's body in the file's scope)
+        t = parse_temp(&p)
+        p.fn_stack = saved
+    else:
+        if not p.has_at and not has_hint_kind(p.hints, 10) and in_fn_scope(&p):
+            p.retry = true                       # (the temp is the function's: parse again
+            p.new_hints.push(Hint(-1, "", 10, "", -1, -1))   # tracking function scopes)
+        t = parse_temp(&p)
+    put(&p, "(" + chain + " = (" + t + " = ")
+    name_out(&p, a, b, rname)
+    next(&p)
+    emit_pe(&p)
+    put(&p, ", " + name + "), " + t + ")")
+
+# Is the innermost function an `export [default] [async] function` declaration (scope starts at its parameters)?
+fn export_fn_scope(p: mut P) bool:
+    i = len(p.sc_fn) - 1
+    while i >= 0 and not p.sc_fn[i]:
+        i -= 1
+    if i < 0:
+        return false
+    k = p.sc_start[i]
+    k = back_space(p.src, k) + 1
+    while k > 0 and is_id(p.src.byte(k - 1)):
+        k -= 1                                   # (the name)
+    words = 0
+    while words < 5:
+        k = back_space(p.src, k) + 1
+        if k > 0 and p.src.byte(k - 1) == 42:
+            k -= 1                               # (function*)
+            continue
+        e = k
+        while k > 0 and is_id(p.src.byte(k - 1)):
+            k -= 1
+        w = p.src[k..e]
+        if w == "export":
+            return true
+        if w != "function" and w != "async" and w != "default":
+            return false
+        words += 1
+    return false
+
+# The name at a..b (the current token's end): as written, or replaced by `rname`.
+fn name_out(p: mut P, a: int, b: int, rname: str):
+    if rname == "":
+        emit_to(&p, b)
+    else:
+        emit_to(&p, a)
+        put(&p, rname)
+        skip_to(&p, b)
+
+# At a postfix ++ / --: does the statement end right after it (its value unused)?
+fn stmt_ends_after(p: mut P) bool:
+    n = peek_tok(&p)
+    return n.tok == T_EOF or n.nlb or (n.tok == T_OP and (n.op == 59 or n.op == 125))
+
+# `name = ...` (or `name += ...`): export lists of classes and variables need to know.
+fn note_assigned(p: mut P, a: int, b: int):
+    if p.tok == T_OP and (p.op == 61 or p.op == O_ASSIGN) and p.mute == 0:
+        p.assigned[p.src[a..b]] = true
+    elif p.has_export_list and p.mute == 0:
+        note_update(&p, a, b)
+
+# x++ / ++x count as assignments too (only an export list asks: kept off the hot path).
+fn note_update(p: mut P, a: int, b: int):
+    if p.tok == T_OP and (p.op == O_INC or p.op == O_DEC) and not p.nlb:
+        p.assigned[p.src[a..b]] = true
+        return
+    k = back_space(p.src, a)
+    if k >= 1 and ((p.src.byte(k) == 43 and p.src.byte(k - 1) == 43) or (p.src.byte(k) == 45 and p.src.byte(k - 1) == 45)):
+        p.assigned[p.src[a..b]] = true
+
+fn is_call_next(p: mut P) bool:
+    if p.tok == T_TPL or p.tok == T_TPL_HEAD:
+        return true
+    if p.tok != T_OP:
+        return false
+    if p.op == 40:
+        return true
+    if p.op == O_QDOT:
+        k = p.te
+        while k < p.n and (p.src.byte(k) == 32 or p.src.byte(k) == 10):
+            k += 1
+        return k < p.n and p.src.byte(k) == 40
+    return false
+
+# Mark a binding used; returns its replacement text ("" when the name stays).
+fn use_bind(p: mut P, k: int, pos: int) str:
+    kind = p.binds[k].kind
+    imp = p.binds[k].imp
+    if imp >= 0:
+        if imp < len(p.imports):
+            p.imports[imp].used = true
+            if kind == B_NSIMPORT:
+                p.imports[imp].ns_used = true
+            elif p.binds[k].sub == -2:
+                p.imports[imp].def_used = true
+            else:
+                p.imports[imp].named_used = true
+        else:
+            p.early_used[imp] = true          # a late import, known from pass 1
+            s = p.binds[k].sub
+            if kind == B_NSIMPORT:
+                s = -3
+            p.early_subs[f"{imp}:{s}"] = true
+    if kind == B_ESMIMPORT:
+        mark_esm_use(&p, k)
+        if p.mute == 0:
+            p.binds[k].last_ref = pos            # (a declaration of the name after it: parse again)
+        return ""
+    if kind == B_NSIMPORT or kind == B_XDECL or kind == B_XLIST:
+        return ""
+    if kind == B_SELF and p.in_static > 0:
+        p.self_static = true
+    if p.mute == 0:
+        p.binds[k].last_ref = pos       # (a muted lookahead parses the same code again for real)
+    return p.binds[k].repl
+
+fn function_expr(p: mut P, is_async: bool):
+    next(&p)                                         # function
+    gen = eat_op(&p, 42)
+    push_scope_here(&p, true)
+    p.fn_name = ""
+    if p.tok == T_NAME:
+        p.fn_name = tok_text(&p)
+        declare_tok(&p, false)
+        next(&p)
+    fn_rest(&p, is_async, gen)
+    pop_scope(&p)
+
+# An async arrow kept as it is (ES2017+): inside a lowered async generator its awaits stay its own.
+fn native_async_arrow(p: mut P, no_in: bool, single: bool):
+    if p.target < 2018:
+        p.aw.push(-1)
+    if single:
+        arrow_ident(&p, no_in)
+    else:
+        arrow_parens(&p, no_in)
+    if p.target < 2018:
+        p.aw.pop()
+
+# From the type parameters or "(" to the end of the body.
+fn fn_rest(p: mut P, is_async: bool, gen: bool):
+    nm = p.fn_name
+    p.fn_name = ""
+    if is_async and gen and p.target < 2018 and p.mute == 0:
+        agen_fn_rest(&p, false, nm)
+        return
+    if is_async and not gen and lower_async(&p):
+        async_fn_rest(&p, false)
+        return
+    if p.target < 2018:                          # (below ES2018 async generators are lowered:
+        plain_fn_open(&p)                        # their awaits aren't this function's)
+    p.this_depth += 1
+    fn_rest_plain(&p, is_async, gen)
+    p.this_depth -= 1
+    if p.target < 2018:
+        p.aw.pop()
+
+fn fn_rest_plain(p: mut P, is_async: bool, gen: bool):
+    saved_tp = p.tparams
+    if at_op(&p, 60):
+        emit_ts(&p)
+        for t in type_param_names(&p):
+            p.tparams.push(t)
+        skip_pe(&p)
+    so = p.st_on
+    p.st_on = false
+    fparams(&p, false)
+    if at_op(&p, 58):
+        drop_return_type(&p)
+    ga = p.in_gen
+    aa = p.in_async
+    p.in_gen = 0
+    p.in_async = 0
+    if gen:
+        p.in_gen = 1
+    if is_async:
+        p.in_async = 1
+    fn_body(&p)
+    p.in_gen = ga
+    p.in_async = aa
+    p.tparams = saved_tp
+    p.st_on = so
+
+fn method_rest(p: mut P, is_async: bool, gen: bool):
+    push_scope_here(&p, true)
+    fn_rest(&p, is_async, gen)
+    pop_scope(&p)
+
+fn fn_body(p: mut P):
+    if not at_op(&p, 123):
+        fail(&p, "expected function body")
+        return
+    ld = p.loop_depth
+    p.loop_depth = 0
+    fn_body_in(&p)
+    p.loop_depth = ld
+
+fn fn_body_in(p: mut P):
+    next(&p)
+    fn_scope_start(&p)
+    if p.target < 2017 and p.mute == 0 and len(p.aw) > 0 and p.aw[len(p.aw) - 1] <= -2:
+        emit_pe(&p)
+        marker(&p, "Z", str(-2 - p.aw[len(p.aw) - 1]))
+    track = p.has_using or p.target < 2018      # (each function owns its generated names: using's,
+    if track:                                    # for await's, parameter copies, by function)
+        p.u_fns += 1
+        p.u_parent.push(u_fn_top(&p))
+        p.u_fn.push(p.u_fns)
+    if p.has_using:
+        emit_pe(&p)
+        id = u_open(&p)
+        statements(&p, false)
+        emit_ts(&p)
+        u_close(&p, id)
+    else:
+        statements(&p, false)
+    if track:
+        p.u_fn.pop()
+    fn_scope_end(&p)
+    expect_op(&p, 125)
+
+# Decorated classes in a function declare helper variables at its top: a marker there, filled in at the end.
+fn fn_scope_start(p: mut P):
+    if p.has_at:
+        emit_pe(&p)
+        id = p.pre_fn
+        p.pre_fn = -1
+        if id < 0:
+            id = fn_open(&p)
+        else:
+            p.fn_stack.push(id)                  # opened for its parameters (fn_params)
+        if p.target < 2022:
+            # below ES2022 the variables (and moved parameter defaults) follow the directive prologue, as tsc puts them
+            while p.tok == T_STR:
+                n = peek_tok(&p)
+                if not ((n.tok == T_OP and (n.op == 59 or n.op == 125)) or n.nlb):
+                    break
+                next(&p)
+                eat_op(&p, 59)
+                emit_pe(&p)
+        marker(&p, "V", str(id))
+
+# A function's helper variable lists; it becomes the innermost.
+fn fn_open(p: mut P) int:
+    id = len(p.fn_alias)
+    p.fn_alias.push([])
+    p.fn_temps.push([])
+    p.fn_cf_temps.push([])
+    if p.target < 2022:
+        p.fn_lt.push([])                     # lowering temps, made only when needed (the default path is hot)
+        p.fn_pre.push("")
+    p.fn_stack.push(id)
+    return id
+
+fn fn_scope_end(p: mut P):
+    if p.has_at:
+        p.fn_stack.pop()
+
+# Parameters, from "(" to ")". In a class, collects decorators, types and parameter properties.
+fn parse_params(p: mut P, collect: bool) Params:
+    info = Params([], [], [], [], [])
+    next(&p)
+    index = 0
+    while not at_op(&p, 41) and p.tok != T_EOF:
+        if at_op(&p, 64):
+            texts = decorators_no_alias(&p)
+            for t in texts:
+                info.deco_index.push(index)
+                info.deco_text.push(t)
+        prop = ""
+        mods_start = p.ts
+        has_mod = false
+        while p.tok == T_NAME and (p.kw == K_PUBLIC or p.kw == K_PRIVATE or p.kw == K_PROTECTED or p.kw == K_READONLY or p.kw == K_OVERRIDE):
+            n = peek_tok(&p)
+            if n.tok == T_NAME or (n.tok == T_OP and (n.op == 123 or n.op == 91)):
+                has_mod = true
+                next(&p)
+            else:
+                break
+        if has_mod and p.keep_pprops:
+            has_mod = false                      # (the TC39 decorators' first pass: kept for the second)
+        if has_mod:
+            emit_to(&p, mods_start)
+            skip_ts(&p)
+        if at_kw(&p, K_THIS) and index == 0:
+            n = peek_tok(&p)
+            if n.tok == T_OP and (n.op == 58 or n.op == 44 or n.op == 41):
+                emit_ts(&p)
+                next(&p)
+                if at_op(&p, 58):
+                    next(&p)
+                    parse_type(&p)
+                eat_op(&p, 44)
+                skip_ts(&p)
+                continue
+        rest = eat_op(&p, O_DOTS)
+        if has_mod and p.tok == T_NAME:
+            prop = tok_text(&p)
+        binding(&p, false)
+        if at_op(&p, 63):
+            emit_ts(&p)
+            skip_te(&p)
+            next(&p)
+        t = ser(SER_OBJECT)
+        if at_op(&p, 58):
+            t = drop_annotation(&p)
+            if rest:
+                t = rest_elem(t)
+        elif rest:
+            t = ser(SER_OBJECT)
+        if at_op(&p, 61):
+            next(&p)
+            assign(&p, false)
+        if collect:
+            info.types.push(t)
+            info.props.push(prop)
+        index += 1
+        if not eat_op(&p, 44):
+            break
+    expect_op(&p, 41)
+    return info
+
+# A rest parameter `...xs: T[]` serializes as its element type.
+fn rest_elem(t: Ser) Ser:
+    if t.kind == SER_ARRAY and t.text == "elem":
+        return t.parts[0]
+    if t.kind == SER_REF and len(t.parts) == 1:        # Array<T>, or any T<X>: X (as tsc)
+        return t.parts[0]
+    return ser(SER_OBJECT)
+
+# A binding name or pattern being declared (with default values inside).
+fn binding(p: mut P, hoist: bool):
+    if p.tok == T_NAME:
+        declare_tok(&p, hoist)
+        next(&p)
+        return
+    if at_op(&p, 123):
+        next(&p)
+        while not at_op(&p, 125) and p.tok != T_EOF:
+            if eat_op(&p, O_DOTS):
+                binding(&p, hoist)
+            else:
+                n = peek_tok(&p)
+                if p.tok == T_NAME and n.tok == T_OP and (n.op == 44 or n.op == 125 or n.op == 61):
+                    declare_tok(&p, hoist)
+                    next(&p)
+                else:
+                    prop_name(&p)
+                    expect_op(&p, 58)
+                    binding(&p, hoist)
+                if at_op(&p, 61):
+                    next(&p)
+                    assign(&p, false)
+            if not eat_op(&p, 44):
+                break
+        expect_op(&p, 125)
+        return
+    if at_op(&p, 91):
+        next(&p)
+        while not at_op(&p, 93) and p.tok != T_EOF:
+            if at_op(&p, 44):
+                next(&p)
+                continue
+            eat_op(&p, O_DOTS)
+            binding(&p, hoist)
+            if at_op(&p, 61):
+                next(&p)
+                assign(&p, false)
+            if not eat_op(&p, 44):
+                break
+        expect_op(&p, 93)
+        return
+    fail(&p, f"expected a name, found '{tok_text(&p)}'")
+    next(&p)
+
+# `import(...)` becomes a require; `import.meta` stays.
+fn import_expr(p: mut P):
+    a = p.ts
+    n = peek_tok(&p)
+    if n.tok == T_OP and n.op == 46 and p.src[n.te..min(n.te + 64, len(p.src))].trim().starts_with("meta"):
+        p.is_module = true                       # import.meta makes the file a module (tsc)
+    if n.tok == T_OP and n.op == 46 and not p.esm and p.import_meta_cjs and import_meta_cjs(&p):
+        return
+    if n.tok == T_OP and n.op == 40 and (p.esm or p.node_module):
+        next(&p)
+        args(&p)
+        return
+    if n.tok == T_OP and n.op == 40:
+        next(&p)
+        next(&p)
+        emit_to(&p, a)
+        skip_ts(&p)
+        if p.tok == T_STR:
+            n2 = peek_tok(&p)
+            if n2.tok == T_OP and (n2.op == 41 or n2.op == 44):
+                if p.interop:
+                    need_star(&p, a)
+                    put(&p, "Promise.resolve().then(() => __importStar(require(")
+                    assign(&p, false)
+                    close_import_call(&p, ")))")
+                    return
+                put(&p, "Promise.resolve().then(() => require(")
+                assign(&p, false)
+                close_import_call(&p, "))")
+                return
+        put(&p, "Promise.resolve(`${")
+        assign(&p, false)
+        emit_pe(&p)
+        if p.interop:
+            need_star(&p, a)
+            put(&p, "}`).then(s => __importStar(require(s)))")
+        else:
+            put(&p, "}`).then(s => require(s))")
+        close_import_call(&p, "")
+        return
+    next(&p)
+
+# `import.meta.url` / `.dirname` / `.filename` in CommonJS output when asked (tsc keeps them): swc's equivalents.
+fn import_meta_cjs(p: mut P) bool:
+    s = save(&p)
+    a = p.ts
+    next(&p)
+    next(&p)
+    if not (p.tok == T_NAME and tok_text(&p) == "meta"):
+        restore(&p, s)
+        return false
+    next(&p)
+    if not at_op(&p, 46):
+        restore(&p, s)
+        return false
+    next(&p)
+    prop = tok_text(&p)
+    text = ""
+    if prop == "url":
+        text = "require(\"url\").pathToFileURL(__filename).toString()"
+    elif prop == "dirname":
+        text = "__dirname"
+    elif prop == "filename":
+        text = "__filename"
+    else:
+        restore(&p, s)
+        return false
+    emit_to(&p, a)
+    put(&p, text)
+    skip_te(&p)
+    next(&p)
+    return true
+
+fn close_import_call(p: mut P, text: str):
+    emit_pe(&p)
+    if eat_op(&p, 44):
+        if not at_op(&p, 41):
+            assign(&p, false)
+        eat_op(&p, 44)
+    put(&p, text)
+    skip_te(&p)
+    expect_op(&p, 41)
+
+# `f<T>(x)`: type arguments, then a call.
+fn type_args_call_ahead(p: mut P) bool:
+    if not at_op(&p, 60):
+        return false
+    s = save(&p)
+    p.bad = false
+    p.mute += 1
+    skip_type_args(&p)
+    p.mute -= 1
+    r = not p.bad and (at_op(&p, 40) or p.tok == T_TPL or p.tok == T_TPL_HEAD)
+    restore(&p, s)
+    p.bad = false
+    return r
+
+fn shadowed_bind(p: mut P, a: int, b: int, h: int, k: int) bool:
+    d = p.binds[k].dbase
+    return is_shadowed(&p, a, b, h, d)
+
+# At "<": a type assertion whose operand is an object literal (through more assertions)?
+fn assertion_of_object(p: mut P) bool:
+    s = save(&p)
+    p.bad = false
+    r = true
+    while r and at_op(&p, 60):
+        next(&p)
+        parse_type(&p)
+        r = not p.bad and at_op(&p, 62)
+        if r:
+            next(&p)
+    r = r and at_op(&p, 123)
+    restore(&p, s)
+    p.bad = false
+    return r
+
+fn mark_esm_use(p: mut P, k: int):
+    imp = p.binds[k].imp
+    if imp < 0 or imp >= len(p.imports):
+        return
+    sub = p.binds[k].sub
+    if sub == -2:
+        p.imports[imp].def_used = true
+    elif sub == -3:
+        p.imports[imp].ns_used = true
+    elif sub >= 0:
+        p.imports[imp].spec_used[sub] = true

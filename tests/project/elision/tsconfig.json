@@ -1,0 +1,8 @@
+{
+  "compilerOptions": {
+    "module": "esnext", "target": "es2022", "rootDir": "src", "outDir": "dist",
+    "experimentalDecorators": true, "emitDecoratorMetadata": true, "removeComments": true,
+    "useDefineForClassFields": false, "types": [], "skipLibCheck": true
+  },
+  "include": ["src"]
+}

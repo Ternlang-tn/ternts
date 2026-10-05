@@ -1,0 +1,1662 @@
+# Classes: fields, parameter properties, and legacy decorators with metadata.
+
+const M_METHOD = 1
+const M_GET = 2
+const M_SET = 3
+const M_PROP = 4
+const M_ACCESSOR = 5    # `accessor x`: a getter and setter over #x_accessor_storage
+
+struct Params:
+    types: [Ser]
+    props: [str]
+    deco_index: [int]
+    deco_text: [str]
+    names: [str]
+
+struct Member:
+    key: str
+    is_static: bool
+    kind: int
+    decos: [str]
+    params: Params
+    rtype: Ser
+    has_rtype: bool
+
+# At a field: does it have an initializer (`static x: T = 1`), an `=` before it ends?
+fn field_has_init(p: mut P) bool:
+    s = save(&p)
+    depth = 0
+    first = true
+    found = false
+    while p.tok != T_EOF:
+        if not first and depth == 0 and p.nlb:
+            break
+        first = false
+        if p.tok == T_OP:
+            o = p.op
+            if o == 40 or o == 91 or o == 123:
+                depth += 1
+            elif o == 41 or o == 93 or o == 125:
+                if depth == 0:
+                    break
+                depth -= 1
+            elif depth == 0 and o == 59:
+                break
+            elif depth == 0 and o == 61:
+                found = true
+                break
+        next(&p)
+    restore(&p, s)
+    return found
+
+struct ClassInfo:
+    name: str
+    alias: str
+    export_as: str       # prefix for the final assignment: "exports.C = "
+    decos: [str]
+    ctor: Params
+    has_ctor: bool
+    members: [Member]
+    after: str           # text after the decorate calls (exports.default = C)
+    key_assigns: [str]   # computed keys of moved fields: `_a = expr`
+    priv_inits: [int]    # which inits are #private ones (kept in place when alone)
+    priv_at: [int]       # where their ` = init` is in the body
+    priv_end: [int]
+    key_mark: int
+    key_flushed: int     # key_assigns before this went into a computed method name
+    fnid: int            # enclosing function (for helper variables), or -1
+    storages: int        # accessor storage names made up for keys that aren't names
+    setters: {str: Ser}  # "s:key" / "i:key" -> a setter's parameter type (a decorated getter's design:paramtypes)
+    getters: {str: Ser}  # the same for a getter's declared return type (the pair's design:type)
+    start: int           # where the class starts (hints about it are keyed by this)
+    hoists: bool         # a field initializer moved into the constructor
+    native_acc: bool     # an `accessor x` was written as it is (target ESNext)
+    members_static: bool # its members' __decorate calls go in a static block (they use #private)
+
+fn setter_key(is_static: bool, key: str) str:
+    if is_static:
+        return "s:" + key
+    return "i:" + key
+
+fn no_params() Params:
+    return Params([], [], [], [], [])
+
+# Decorators at "@": their expression texts, removed from the output.
+fn decorators(p: mut P) [str]:
+    texts: [str] = []
+    if not p.legacy_decorators:
+        # TC39 decorators: kept as written (below ESNext esdecorators.tn rewrites the classes)
+        while at_op(&p, 64):
+            next(&p)
+            deco_expr(&p)
+        return texts
+    while at_op(&p, 64):
+        emit_ts(&p)
+        skip_te(&p)
+        next(&p)
+        saved = begin_capture(&p)
+        skip_ts(&p)
+        deco_expr(&p)
+        emit_pe(&p)
+        texts.push(end_capture(&p, saved))
+        skip_ts(&p)
+    return texts
+
+# Member and parameter decorators run after the class exists: its name isn't aliased there.
+fn decorators_no_alias(p: mut P) [str]:
+    k = p.self_bind
+    if k >= 0:
+        p.binds[k].active = false
+    j = p.spriv_bind
+    if j >= 0:
+        p.binds[j].active = false
+    texts = decorators(&p)
+    if k >= 0:
+        p.binds[k].active = true
+    if j >= 0:
+        p.binds[j].active = true
+    return texts
+
+# TC39 decorators after `export` (export @dec class C): taken out of the output for the class
+# to write in front of itself (CommonJS drops the `export`).
+fn tc39_deco_text(p: mut P, start: int) str:
+    emit_to(&p, start)                           # (the `export` before them goes)
+    at = p.ts
+    skip_to(&p, at)
+    saved = begin_capture(&p)
+    while at_op(&p, 64):
+        next(&p)
+        deco_expr(&p)
+    emit_pe(&p)
+    t = end_capture(&p, saved)
+    return t.trim()
+
+fn decorators_skip(p: mut P):
+    if not p.legacy_decorators:
+        decorators(&p)
+        return
+    p.mute += 1
+    decorators(&p)
+    p.mute -= 1
+
+fn deco_expr(p: mut P):
+    primary(&p)
+    while true:
+        if at_op(&p, 46):
+            next(&p)
+            next(&p)
+        elif at_op(&p, 40):
+            args(&p)
+        elif at_op(&p, 60):
+            if not try_type_args(&p):
+                return
+        elif at_op(&p, 33) and not p.nlb:
+            emit_ts(&p)
+            skip_te(&p)
+            next(&p)
+        else:
+            return
+
+fn class_expr(p: mut P):
+    parse_class(&p, [], false, "", "")
+
+# A class, declaration or expression. `decos` are the decorators before it; `export_as` is how
+# a declaration is exported ("exports.C = ", or ""). Returns the p.classes index when there
+# are decorators to emit, else -1.
+fn parse_class(p: mut P, decos: [str], is_decl: bool, export_as: str, default_name: str) int:
+    defer = p.defer_st
+    p.defer_st = false
+    class_start = p.ts
+    ts_syntax0 = p.ts_syntax
+    emit_to(&p, class_start)
+    if p.pending_deco != "":
+        put(&p, p.pending_deco + " ")
+        p.pending_deco = ""
+    outer = begin_capture(&p)
+    next(&p)                                     # class
+    name = default_name
+    if p.tok == T_NAME and p.kw != K_EXTENDS and p.kw != K_IMPLEMENTS:
+        name = tok_text(&p)
+        if p.ts == p.top_anon:                   # (default_1 = class { }: named by topusing.tn)
+            a0 = p.ts
+            b0 = p.te
+            emit_to(&p, a0)
+            skip_to(&p, b0)
+        if is_decl:
+            declare_tok(&p, false)
+            p.locals[name] = 1
+            mark_declared(&p, name)
+        next(&p)
+    elif default_name != "" and not (len(decos) > 0 or is_hinted_class(&p, class_start)):
+        emit_pe(&p)                              # (decorated: `let default_1 = class {`, unnamed)
+        put(&p, " " + default_name)
+    saved_tp = p.tparams
+    if at_op(&p, 60):
+        emit_ts(&p)
+        for t in type_param_names(&p):
+            p.tparams.push(t)
+        skip_pe(&p)
+    derived = false
+    sup_cls = ""                                 # (the class's and its base's temps, when its
+    sup_base = ""                                # statics use super below ES2022)
+    if at_kw(&p, K_EXTENDS):
+        derived = true
+        next(&p)
+        if p.target < 2022 and p.mute == 0 and super_hinted(&p, class_start):
+            sfn = -1
+            if len(p.fn_stack) > 0:
+                sfn = p.fn_stack[len(p.fn_stack) - 1]
+            sup_cls = class_temp(&p, sfn)
+            sup_base = class_temp(&p, sfn)
+            at0 = p.ts
+            emit_to(&p, at0)
+            put(&p, "(" + sup_base + " = ")
+        lhs_root(&p)
+        if sup_base != "":
+            emit_pe(&p)
+            put(&p, ")")
+        if at_op(&p, 60):
+            emit_ts(&p)
+            skip_type_args(&p)
+            skip_pe(&p)
+    if at_kw(&p, K_IMPLEMENTS):
+        emit_pe(&p)
+        next(&p)
+        p.bad = false
+        parse_type(&p)
+        while eat_op(&p, 44):
+            parse_type(&p)
+        skip_pe(&p)
+        put(&p, " ")
+    if not at_op(&p, 123):
+        fail(&p, "expected class body")
+        p.out = outer + p.out
+        return -1
+    decorated = len(decos) > 0 or is_hinted_class(&p, class_start)
+    self_bind = -1
+    bind_base = len(p.binds)
+    if decorated and name != "":
+        self_bind = add_bind(&p, name, B_SELF, gen_name(name, p.alias_count.get(name, 0) + 1), -1)
+    saved_self = p.self_bind
+    p.self_bind = self_bind
+    emit_te(&p)
+    body_mark = len(p.out)
+    body_open = p.ts
+    next(&p)
+    fnid = -1
+    if len(p.fn_stack) > 0:
+        fnid = p.fn_stack[len(p.fn_stack) - 1]
+    info = ClassInfo(name, "", export_as, decos, no_params(), false, [], "", [], [], [], [], -1, 0, fnid, 0, {}, {}, class_start, false, false, false)
+    lower = p.target < 2022
+    ect = ""                                     # `var X = _classThis = class {` from the TC39
+    ex = ""                                      # decorators' rewrite: its statics are statements
+    if p.esdec_pass and lower and not is_decl and name == "":   # after it, through _classThis
+        pr = esdec_this(p.src, class_start)
+        if len(pr) == 2:
+            ex = pr[0]
+            ect = pr[1]
+    saved_spl = p.spl
+    p.spl = false
+    saved_outer = p.class_outer
+    if p.class_outer < 0:
+        p.class_outer = class_start
+    if p.spl_file and not lower and not is_decl and name == "":
+        pr = esdec_this22(p.src, class_start, body_open)
+        if len(pr) == 2:                         # ES2022: only its static #private members are
+            ex = pr[0]                           # lowered, through _classThis
+            ect = pr[1]
+            p.spl = true
+    so_on = p.st_on
+    so_kind = p.st_kind
+    so_tmp = p.st_tmp
+    so_fn = p.st_fn
+    so_list = p.st_list
+    so_super = p.st_super
+    so_start = p.st_start
+    so_named = p.st_named
+    p.st_named = false
+    p.st_on = false
+    p.st_tmp = sup_cls
+    p.st_super = sup_base
+    p.st_start = class_start
+    p.st_fn = fnid
+    p.st_list = []
+    so_init = p.init_fn
+    so_ctor = p.ctor_fn
+    p.init_fn = -1
+    p.ctor_fn = -1
+    if lower and p.has_at and p.mute == 0:
+        p.init_fn = fn_open(&p)
+        p.fn_stack.pop()
+    p.st_kind = ST_DECL
+    if not is_decl:
+        p.st_kind = ST_EXPR
+    if decorated:
+        p.st_kind = ST_DECORATED
+    saved_statics = p.class_statics
+    p.class_statics = false
+    saved_spriv = p.static_priv
+    p.static_priv = false
+    # a #private instance member that refers to the class makes tsc read the class through a
+    # temp in all its members (`_a = C;` after it): watched, then parsed again
+    spriv_tmp = ""
+    watch = self_bind
+    saved_sbind = p.spriv_bind
+    p.spriv_bind = -1
+    # below ES2022, #private members are lowered (private.tn): known in a second pass
+    so_cur = p.priv_cur
+    p.priv_cur = -1
+    pc_on = false
+    pc_alias = ""
+    recording = (lower or p.spl) and p.mute == 0
+    so_bucket = p.priv_bucket
+    if recording:
+        p.pq.push([])
+        p.pq_member.push(0)
+        p.pq_ctor.push(-1)
+        p.priv_bucket = 2
+        p.priv_rec.push("")
+        rec = priv_hint(&p, class_start)
+        ts_class = rec.starts_with("!")          # tsc's TypeScript pass rewrote the class: the
+        if ts_class:                             # name from `const D =` is gone
+            rec = rec[1..]
+        if rec != "":
+            src_named = name != "" and name != default_name
+            cname = name
+            if not src_named:
+                cname = ""
+                if not is_decl and (not ts_class or static_first(&p)):
+                    cname = context_name(p.src, class_start)   # (named evaluation gives it the name back)
+                if ex != "":
+                    cname = ex
+            p.ct_alias = ect
+            if not is_decl and ect == "" and p.st_tmp == "" and p.mute == 0 and temp_first(&p, name, class_start):
+                p.st_tmp = class_temp(&p, fnid)  # tsc made this temp before the #names
+                p.ct_alias = p.st_tmp            # (a static block comes first)
+            pc = priv_class(&p, rec, class_start, cname, fnid, is_hinted(&p, class_start, 10))
+            p.ct_alias = ""
+            if pc.alias != "":
+                p.st_tmp = pc.alias
+                if is_decl:
+                    spriv_tmp = pc.alias
+                    if src_named and self_bind < 0:
+                        p.spriv_bind = add_bind(&p, name, B_SELFPRIV, pc.alias, -1)
+                elif src_named and self_bind < 0:
+                    p.spriv_bind = add_bind(&p, name, B_SELFPRIV, pc.alias, -1)   # (class R { ... R.#s }: _a)
+            pc_alias = pc.alias
+            for e in priv_env(pc):
+                info.key_assigns.push(e)         # into the first computed member name, if any
+            p.privs.push(pc)
+            p.priv_cur = len(p.privs) - 1
+            pc_on = true
+    if lower and not is_decl and name != "" and is_hinted(&p, class_start, 12) and (p.st_tmp == "" or p.st_tmp == sup_cls):
+        # a named class expression whose statics move out: its name inside is the temp
+        ct = sup_cls
+        if ct == "":
+            ct = class_temp(&p, fnid)
+        p.st_tmp = ct
+        p.spriv_bind = add_bind(&p, name, B_SELFPRIV, ct, -1)
+    if pc_on:
+        pass
+    elif name != "" and is_hinted(&p, class_start, 10):
+        spriv_tmp = sup_cls                      # (taken before the base's temp: static_super)
+        if spriv_tmp == "":
+            spriv_tmp = field_temp(&p)
+        if self_bind < 0 and is_decl:
+            p.spriv_bind = add_bind(&p, name, B_SELFPRIV, spriv_tmp, -1)
+    elif name != "" and p.has_hash and self_bind < 0 and p.spriv_bind < 0:
+        watch = add_bind(&p, name, B_WATCH, "", -1)
+    needs_ref = false
+    saved_static = p.self_static
+    p.self_static = false
+    ctor_mark = -1
+    inits: [str] = []
+    push_scope(&p, class_start, false)
+    p.this_depth += 1
+    if p.target < 2018:
+        p.aw.push(-1)
+    spl = p.spl
+    spl_at = -1                                  # (after its first member: where the lowered
+    nmem = 0                                     # statics' blocks go)
+    while not at_op(&p, 125) and p.tok != T_EOF and p.err == "":
+        if spl and nmem == 1:
+            emit_pe(&p)
+            spl_at = len(p.out)
+        nmem += 1
+        before = -1
+        if watch >= 0:
+            before = p.binds[watch].last_ref
+        static_init = false
+        if at_kw(&p, K_STATIC) and name == "" and default_name == "" and is_decl and p.mute == 0 and not is_hinted(&p, class_start, 13) and not (p.esdec_pass and p.target == 9999):
+            # (not in the decorators' first pass: esdecorators.tn names the class itself)
+            static_init = field_has_init(&p)
+        had_ctor = info.has_ctor
+        if recording:
+            p.pq_member[len(p.pq_member) - 1] += 1   # (helper requests are ordered by member)
+        m = class_member(&p, &info, &inits, &ctor_mark)
+        if recording and info.has_ctor and not had_ctor:
+            p.pq_ctor[len(p.pq_ctor) - 1] = p.pq_member[len(p.pq_member) - 1]
+        if static_init and m.kind == M_PROP and m.is_static:
+            p.retry = true                       # an initialized static of an unnamed default class:
+            p.new_hints.push(Hint(class_start, "", 13, "", -1, -1))   # tsc names it default_1
+        if watch >= 0 and not m.is_static and m.key.starts_with("#") and p.binds[watch].last_ref != before:
+            needs_ref = true
+        if p.want_dn:                            # a static accessor needs the class's name
+            p.want_dn = false
+            if name == "" and default_name == "" and is_decl and p.mute == 0 and not is_hinted(&p, class_start, 13):
+                p.retry = true
+                p.new_hints.push(Hint(class_start, "", 13, "", -1, -1))
+            elif not is_decl and p.mute == 0:
+                fail(&p, "static accessor in a class without a name: give the class a name")
+        if m.key != "" and (len(m.decos) > 0 or len(m.params.deco_text) > 0):
+            info.members.push(m)
+            if name == "" and default_name == "" and is_decl and p.mute == 0 and not is_hinted(&p, class_start, 13):
+                p.retry = true                   # decorated members of an unnamed default class
+                p.new_hints.push(Hint(class_start, "", 13, "", -1, -1))
+        if m.kind == M_SET and m.key != "" and len(m.params.types) > 0:
+            info.setters[setter_key(m.is_static, m.key)] = m.params.types[0]
+        if m.kind == M_GET and m.key != "" and m.has_rtype:
+            info.getters[setter_key(m.is_static, m.key)] = m.rtype
+    p.this_depth -= 1
+    if p.target < 2018:
+        p.aw.pop()
+    pop_scope(&p)
+    class_statics = p.class_statics
+    emit_ts(&p)
+    body = p.out
+    p.out = outer
+    props: [str] = []
+    for pr in info.ctor.props:
+        if pr != "":
+            props.push(pr)
+    # constructor assignments: parameter properties, then (useDefine off) field initializers
+    ins = ""
+    if pc_on and p.privs[p.priv_cur].inst != "":
+        ins = " " + p.privs[p.priv_cur].inst + ".add(this);"
+    for pr in props:
+        if p.define_low:
+            ins += " " + define_text("this", "\"" + pr + "\"", pr) + ";"
+        else:
+            ins += " this." + pr + " = " + pr + ";"
+    move_priv = len(inits) > len(info.priv_inits)
+    cut_at: [int] = []
+    cut_end: [int] = []
+    for i in 0..len(inits):
+        is_priv = false
+        for j in 0..len(info.priv_inits):
+            if info.priv_inits[j] == i:
+                is_priv = true
+                if move_priv:
+                    cut_at.push(info.priv_at[j])
+                    cut_end.push(info.priv_end[j])
+        if move_priv or not is_priv:
+            ins += inits[i]
+    fields = ""
+    if p.use_define:
+        for pr in props:
+            fields += " " + pr + ";"
+    alias_block = ""
+    alias_assign = ""
+    if self_bind >= 0 and p.binds[self_bind].last_ref >= 0:
+        info.alias = p.binds[self_bind].repl
+        p.alias_count[name] = p.alias_count.get(name, 0) + 1
+        if fnid >= 0:
+            p.fn_alias[fnid].push(info.alias)
+        else:
+            p.aliases.push(info.alias)
+        if class_statics and not lower:
+            alias_block = " static { " + info.alias + " = this; }"
+        else:
+            alias_assign = info.alias + " = "
+    p.self_static = saved_static
+    # the head of the body: fields for parameter properties (useDefine), a made-up constructor,
+    # computed keys, the class alias
+    head = fields
+    if p.use_define:
+        # the decorator transform inserts its alias block ahead of the fields
+        head = alias_block + fields
+        alias_block = ""
+    cvars = ""
+    if p.init_fn >= 0:
+        if p.ctor_fn >= 0:
+            fa = p.init_fn
+            fb = p.ctor_fn
+            merge_fn_vars(&p, fa, fb)
+        else:
+            p.markers = true
+            cvars = "\x00V" + str(p.init_fn) + "\x00"
+    if ins != "" and ctor_mark < 0:
+        if derived:
+            head += " constructor() {" + cvars + " super(...arguments);" + ins + " }"
+        else:
+            head += " constructor() {" + cvars + ins + " }"
+        ins = ""
+    keys: [str] = []
+    if info.key_flushed < len(info.key_assigns):
+        rest: [str] = []
+        for i in info.key_flushed..len(info.key_assigns):
+            rest.push(info.key_assigns[i])
+        if lower:
+            keys = rest                          # after the class, ahead of the statics
+        else:
+            head += " static { " + ", ".join(rest) + "; }"
+    pinit: [str] = []
+    if pc_on:
+        aof = ""
+        if is_decl and not decorated:
+            aof = name
+        nenv = len(priv_env(p.privs[p.priv_cur]))
+        flushed = info.key_flushed >= nenv and nenv > 0
+        pinit = priv_inits(p.privs[p.priv_cur], aof, not flushed)
+        if not flushed and nenv > 0:
+            rest_keys: [str] = []
+            for i in nenv..len(keys):
+                rest_keys.push(keys[i])
+            keys = rest_keys
+        p.privs.pop()
+    p.priv_cur = so_cur
+    if recording:
+        priv_flush(&p)
+        p.priv_bucket = so_bucket
+        r0 = p.priv_rec.pop()
+        if r0 != "" and not pc_on:
+            p.retry = true                       # its private members, known next pass
+            if p.ts_syntax != ts_syntax0:
+                r0 = "!" + r0                    # (TypeScript syntax in the class: see priv names)
+            p.new_hints.push(Hint(class_start, "", 11, r0, -1, -1))
+    wrap = lower and not is_decl and (len(p.st_list) > 0 or len(keys) > 0 or len(pinit) > 0)
+    if wrap and name != "" and not is_hinted(&p, class_start, 12) and p.mute == 0:
+        p.retry = true
+        p.new_hints.push(Hint(class_start, "", 12, "", -1, -1))
+    if wrap and p.st_tmp == "" and ect != "":
+        p.st_tmp = ect
+    if wrap and p.st_tmp == "":
+        if p.mute > 0:
+            p.st_tmp = "_"                       # (a muted look-ahead: no temp, no text)
+        else:
+            p.st_tmp = class_temp(&p, fnid)
+    head += alias_block
+    if decorated:
+        if pc_alias != "":
+            alias_assign += pc_alias + " = "     # let C = C_1 = _a = class C
+        if is_decl and p.top_u >= 0 and u_top(&p) == p.top_u:
+            # hoisted (a module's top-level using block): exported by its list, the export goes in
+            # front (exports.C = C = class C), as for a folded enum
+            fold = ""
+            if not p.esm:
+                p.ns_folded[name] = true
+                p.markers = true
+                fold = "\x00N" + name + "\x00"
+            put(&p, fold + name + " = " + alias_assign)
+        else:
+            put(&p, "let " + name + " = " + alias_assign)
+    at: [int] = [body_mark]
+    what: [str] = [head]
+    if ctor_mark >= 0 and ins != "":
+        at.push(ctor_mark)
+        what.push(ins)
+    if spl and spl_at >= 0 and pc_on:
+        # ES2022, a TC39-decorated class: its lowered static #private members' functions go in a
+        # static block after `static { _classThis = this; }`
+        if not esdec_wants(p.esdec_helpers, ED_SETNAME):
+            p.esdec_helpers.push(ED_SETNAME)     # (the decorators transform's named evaluation)
+        st = " static { __setFunctionName(this, \"" + ex + "\"); }"
+        if len(pinit) > 0:
+            st += " static { " + ", ".join(pinit) + "; }"
+        at.push(spl_at)
+        what.push(st)
+    o = p.out
+    p.out = ""
+    if wrap and p.mute == 0 and ect == "":
+        o += "(" + p.st_tmp + " = "
+    skip: [int] = [0] * len(at)
+    for i in 0..len(cut_at):
+        at.push(cut_at[i])
+        what.push("")
+        skip.push(cut_end[i] - cut_at[i])
+    if p.mute > 0:
+        pass
+    elif len(at) == 1 and head == "":
+        o += body
+    else:
+        order = sorted_positions(at)
+        prev = 0
+        for i in order:
+            o += body[prev..at[i]]
+            o += what[i]
+            prev = at[i] + skip[i]
+        o += body[prev..]
+    if len(info.members) > 0 and p.mute == 0 and decos_use_private(info):
+        # a member decorator reads a #private name: tsc puts the members' __decorate calls in a
+        # static block where the name is in scope (below ES2022, an arrow called after the class)
+        info.members_static = true
+        if p.target >= 2022:
+            p.markers = true
+            o += " static {\x00Y" + str(len(p.classes)) + "\x00 }"
+    p.out = o
+    if self_bind >= 0 or watch >= 0 or p.spriv_bind >= 0:
+        deactivate_from(&p, bind_base)
+    # tsc sometimes reads `C.#x` through a temp in classes with static #private members;
+    # the exact trigger isn't known
+    if needs_ref and spriv_tmp == "":
+        p.retry = true
+        p.new_hints.push(Hint(class_start, "", 10, "", -1, -1))
+    p.static_priv = saved_spriv
+    p.spl = saved_spl
+    p.class_outer = saved_outer
+    p.self_bind = saved_self
+    p.class_statics = saved_statics
+    p.tparams = saved_tp
+    next(&p)                                     # }
+    emit_pe(&p)
+    if wrap and ect != "":
+        parts: [str] = []                        # (statements, the source's `;` ends the last)
+        for s in pinit:
+            parts.push(s)
+        if len(keys) > 0:
+            parts.push(", ".join(keys))
+        for s in p.st_list:
+            parts.push(s.replace("\x02", p.st_tmp))
+        if len(parts) > 0:
+            put(&p, ";\n" + ";\n".join(parts))
+    elif wrap:
+        parts: [str] = []
+        cn = ""
+        if name == "" and not p.st_named:
+            cn = context_name(p.src, class_start)
+        for s in pinit:
+            if s.ends_with("new WeakMap()") or s.ends_with("new WeakSet()"):
+                parts.push(s)                    # (instances' inits first, as tsc)
+        if cn != "" and (len(p.st_list) > 0 or len(keys) > 0):
+            priv_helper(&p, H_SET_FUNCTION_NAME)  # (classFields' request: with its #private ones)
+            parts.push("__setFunctionName(" + p.st_tmp + ", \"" + cn + "\")")
+        for s in pinit:
+            if not (s.ends_with("new WeakMap()") or s.ends_with("new WeakSet()")):
+                parts.push(s)
+        if len(keys) > 0:
+            parts.push(", ".join(keys))
+        for s in p.st_list:
+            parts.push(s.replace("\x02", p.st_tmp))
+        parts.push(p.st_tmp + ")")
+        put(&p, ",\n" + ",\n".join(parts))
+    if decorated:
+        emit_pe(&p)
+        put(&p, ";")
+    if p.spriv_bind >= 0 and not pc_on and is_decl:
+        if export_as != "":
+            p.class_ref = "\n" + spriv_tmp + " = " + name + ";"
+        else:
+            put(&p, "\n" + spriv_tmp + " = " + name + ";")
+    if pc_on and is_decl:
+        if pc_alias == "" and p.st_tmp != "" and p.st_kind == ST_DECL:
+            cref = name                          # (no #private alias: the statics' class temp
+            if cref == "":                       # leads the inits: _a = C, _C_x = ...)
+                cref = default_name
+            lead: [str] = [p.st_tmp + " = " + cref]
+            for x in pinit:
+                lead.push(x)
+            pinit = lead
+        p.st_tmp = ""                            # its `_a = C` leads the inits
+        if decorated:
+            p.priv_init = ";\n".join(pinit)      # (a decorated class: one statement each)
+        else:
+            p.priv_init = ", ".join(pinit)
+    if lower and is_decl and (len(p.st_list) > 0 or len(keys) > 0 or p.st_tmp != "" or p.priv_init != ""):
+        if p.st_tmp != "" and p.spriv_bind < 0 and name != "" and self_bind < 0 and len(info.ctor.deco_text) == 0 and not pc_on:
+            # `this` in a static: tsc reads the class through a temp in all its members: parse again
+            p.retry = true
+            p.new_hints.push(Hint(class_start, "", 10, "", -1, -1))
+        ref = name
+        if ref == "":
+            ref = default_name
+        if ref == "" and p.mute == 0 and not is_hinted(&p, class_start, 14):
+            p.retry = true                       # an unnamed default class whose statics move
+            p.new_hints.push(Hint(class_start, "", 14, "", -1, -1))   # out: default_1, as tsc
+        if p.esm_default_at == class_start and name != "" and p.mute == 0 and not is_hinted(&p, class_start, 15):
+            p.retry = true                       # export default class C with statements after it:
+            p.new_hints.push(Hint(class_start, "", 15, "", -1, -1))   # class C; ...; export default C
+        if p.spriv_bind >= 0:
+            p.st_tmp = ""                        # its `_a = C;` is written above
+        stext = statics_text(&p, ref, keys)
+        p.priv_init = ""
+        if export_as != "" or (defer and p.has_export_list and p.ns_name == ""):
+            p.class_ref += stext                 # after `exports.C = C;` (or its list's slot)
+        else:
+            put(&p, stext)
+    p.init_fn = so_init
+    p.ctor_fn = so_ctor
+    p.st_on = so_on
+    p.st_kind = so_kind
+    p.st_tmp = so_tmp
+    p.st_fn = so_fn
+    p.st_list = so_list
+    p.st_super = so_super
+    p.st_start = so_start
+    p.st_named = so_named
+    p.spriv_bind = saved_sbind
+    if not decorated and len(info.ctor.deco_text) > 0:
+        # constructor parameter decorators make it a decorated class: parse again knowing it
+        p.retry = true
+        p.new_hints.push(Hint(class_start, "", 9, "", -1, -1))
+    if decorated or len(info.members) > 0 or len(info.ctor.deco_text) > 0:
+        p.classes.push(info)
+        return len(p.classes) - 1
+    return -1
+
+fn is_modifier(k: int) bool:
+    return k == K_PUBLIC or k == K_PRIVATE or k == K_PROTECTED or k == K_READONLY or k == K_ABSTRACT or k == K_OVERRIDE or k == K_DECLARE or k == K_STATIC or k == K_ACCESSOR or k == K_ASYNC
+
+# One class member. Returns what decorators need to know about it.
+fn class_member(p: mut P, info: mut ClassInfo, inits: mut [str], ctor_mark: mut int) Member:
+    none = Member("", false, 0, [], no_params(), ser(SER_VOID), false)
+    if eat_op(&p, 59):
+        return none
+    member_start = p.ts
+    emit_to(&p, member_start)
+    decos: [str] = []
+    if at_op(&p, 64):
+        decos = decorators_no_alias(&p)
+    # modifiers
+    is_static = false
+    is_abstract = false
+    is_declare = false
+    is_async = false
+    is_accessor = false
+    acc_a = 0                                    # where `accessor` is (dropped when it's lowered)
+    acc_b = 0
+    drops: [int] = []
+    while p.tok == T_NAME and is_modifier(p.kw):
+        n = peek_tok(&p)
+        # a modifier is followed by a name, a string, "[", "#x", "*" or "{" (static block)
+        if n.nlb and p.kw != K_STATIC:
+            break
+        if not (n.tok == T_NAME or n.tok == T_STR or n.tok == T_NUM or n.tok == T_PRIV or (n.tok == T_OP and (n.op == 91 or n.op == 42 or n.op == 123))):
+            break
+        if n.tok == T_OP and n.op == 123 and p.kw != K_STATIC:
+            break
+        k = p.kw
+        if p.mute == 0 and k != K_STATIC and k != K_ASYNC and k != K_ACCESSOR:
+            p.ts_syntax += 1                     # (public, readonly, declare...: TypeScript)
+        if k == K_STATIC:
+            is_static = true
+        elif k == K_ABSTRACT:
+            is_abstract = true
+        elif k == K_DECLARE:
+            is_declare = true
+        elif k == K_ASYNC:
+            is_async = true
+            p.async_at = p.ts
+        elif k == K_ACCESSOR:
+            is_accessor = true
+        if k == K_ACCESSOR:
+            acc_a = p.ts
+            acc_b = n.ts
+        elif k != K_STATIC and k != K_ASYNC:
+            drops.push(p.ts)
+            drops.push(n.ts)
+        next(&p)
+    # target ESNext keeps `accessor x`, unless field initializers move into the constructor
+    # (useDefineForClassFields off): then tsc lowers them to keep the order
+    native = is_accessor and p.native_accessor and not is_abstract and not is_declare and (p.use_define or not (info.hoists or has_hint(&p, str(info.start), 12)))
+    if is_accessor and not native:
+        drops.push(acc_a)
+        drops.push(acc_b)
+        drops = sorted_pairs(drops)
+    # static block
+    if is_static and p.tok == T_PRIV:
+        p.static_priv = true
+    if is_static and at_op(&p, 123):
+        p.class_statics = true
+        if p.target < 2022:
+            # below ES2022: (() => { ... })(); after the class
+            skip_ts(&p)
+            saved = begin_capture(&p)
+            push_scope_here(&p, true)
+            p.in_static += 1
+            p.st_on = true
+            pb3 = p.priv_bucket
+            p.priv_bucket = 3                    # (tsc transforms statics after the members)
+            p.this_depth -= 1                    # an arrow at the top level, once moved out
+            fn_body(&p)
+            p.this_depth += 1
+            p.st_on = false
+            p.priv_bucket = pb3
+            p.in_static -= 1
+            pop_scope(&p)
+            emit_pe(&p)
+            block = end_capture(&p, saved)
+            inner = block.trim()
+            if len(inner) >= 2:
+                inner = strip_ends(inner)
+            if inner.starts_with("\x00V") and inner[1..].find("\x00") > 0:
+                inner = inner[inner[1..].find("\x00") + 2..].trim()   # (its helper-variable marker)
+            if inner.starts_with("__setFunctionName(") and inner.ends_with(");") and inner.find(";") == len(inner) - 1:
+                # a named-evaluation block (TC39 decorators): tsc writes the call
+                p.st_list.push(inner[..len(inner) - 1])
+                p.st_named = true
+            else:
+                p.st_list.push("(() => " + block.trim() + ")()")
+            return none
+        apply_drops(&p, drops)
+        push_scope_here(&p, true)
+        p.in_static += 1
+        fn_body(&p)
+        p.in_static -= 1
+        pop_scope(&p)
+        return none
+    # index signature: [key: T]: U
+    if at_op(&p, 91) and is_index_signature(&p):
+        emit_to(&p, member_start)
+        p.mute += 1
+        skip_group(&p)
+        if at_op(&p, 58):
+            next(&p)
+            parse_type(&p)
+        eat_op(&p, 59)
+        p.mute -= 1
+        skip_pe(&p)
+        return none
+    gen = eat_op(&p, 42)
+    kind = M_METHOD
+    if p.tok == T_NAME and (p.kw == K_GET or p.kw == K_SET):
+        n = peek_tok(&p)
+        if n.tok == T_NAME or n.tok == T_STR or n.tok == T_NUM or n.tok == T_PRIV or (n.tok == T_OP and n.op == 91):
+            if not n.nlb:
+                if p.kw == K_GET:
+                    kind = M_GET
+                else:
+                    kind = M_SET
+                next(&p)
+    key_start = p.ts
+    saved = begin_capture(&p)
+    apply_drops(&p, drops)
+    emit_to(&p, key_start)
+    pre_text = end_capture(&p, saved)
+    skip_to(&p, key_start)
+    saved = begin_capture(&p)
+    key = member_key(&p)
+    emit_pe(&p)
+    key_text = end_capture(&p, saved)
+    skip_pe(&p)
+    key_end = p.pe
+    is_ctor = key == "\"constructor\"" and not is_static and p.src.byte(key_start) != 91
+    # optional / definite markers, removed once we know the member stays
+    q_pos = -1
+    if at_op(&p, 63) or (at_op(&p, 33) and not p.nlb):
+        q_pos = p.ts
+        next(&p)
+    if at_op(&p, 40) or at_op(&p, 60):
+        # method, accessor or constructor
+        if is_abstract or is_declare or not has_body_ahead(&p):
+            p.mute += 1
+            if at_op(&p, 60):
+                skip_type_params(&p)
+            skip_group(&p)
+            if at_op(&p, 58):
+                next(&p)
+                return_type(&p)
+            p.mute -= 1
+            return drop_member(&p, member_start)
+        pm = (p.target < 2022 or (p.spl and is_static)) and p.mute == 0 and p.src.byte(key_start) == 35
+        if pm:
+            priv_record(&p, key_text.trim()[1..], pk_of(kind), is_static, false)
+        pmark = -1
+        if pm and p.priv_cur >= 0:
+            pmark = len(p.out)                   # (private.tn: the function moves out)
+        elif p.src.byte(key_start) == 91 and len(decos) > 0 and bracket_literal(key_text) and info.key_flushed == len(info.key_assigns):
+            key = key_text.trim()[1..len(key_text.trim()) - 1].trim()   # ["plain"]: tsc passes "plain"
+            put(&p, pre_text + key_text)
+        elif p.src.byte(key_start) == 91 and len(decos) > 0:
+            # a decorated computed name is evaluated once, into a temp the decorator call reuses
+            tmp = parse_temp(&p)
+            inner = key_text.trim()
+            kx = tmp + " = " + strip_ends(inner)
+            if info.key_flushed < len(info.key_assigns):
+                pend: [str] = []
+                for i in info.key_flushed..len(info.key_assigns):
+                    pend.push(info.key_assigns[i])
+                info.key_flushed = len(info.key_assigns)
+                kx = "(" + ", ".join(pend) + ", " + kx + ")"
+            put(&p, pre_text + "[" + kx + "]")
+            key = tmp
+        elif p.src.byte(key_start) == 91 and info.key_flushed < len(info.key_assigns):
+            pending: [str] = []
+            for i in info.key_flushed..len(info.key_assigns):
+                pending.push(info.key_assigns[i])
+            info.key_flushed = len(info.key_assigns)
+            inner = key_text.trim()
+            put(&p, pre_text + "[(" + ", ".join(pending) + ", " + unbracket(inner) + ")]")
+        else:
+            put(&p, pre_text + key_text)
+        if q_pos >= 0:
+            emit_to(&p, q_pos)
+            skip_to(&p, q_pos + 1)
+        saved_tp = p.tparams
+        if at_op(&p, 60):
+            emit_ts(&p)
+            skip_type_params(&p)
+            skip_pe(&p)
+        push_scope_here(&p, true)
+        if is_async and gen and p.target < 2018 and p.mute == 0:
+            gn = "\x01"
+            kt = key_text.trim()
+            if simple_copy(kt) and not is_digit(kt.byte(0)):
+                gn = kt
+            ar = agen_fn_rest(&p, true, gn)      # below ES2018 (asyncgen.tn)
+            pop_scope(&p)
+            p.tparams = saved_tp
+            if pmark >= 0:
+                priv_method_out(&p, pmark, key_text.trim()[1..], pk_of(kind), false, false)
+            return Member(key, is_static, kind, decos, ar.params, ar.rt, ar.has_rt)
+        if is_async and not gen and not is_ctor and lower_async(&p):
+            ar = async_fn_rest(&p, true)         # below ES2017 (lower.tn)
+            pop_scope(&p)
+            p.tparams = saved_tp
+            rt0 = ar.rt
+            has0 = ar.has_rt
+            if kind == M_METHOD and not has0:
+                rt0 = Ser(SER_REF, "Promise!", [], false)
+                has0 = true
+            if pmark >= 0:
+                priv_method_out(&p, pmark, key_text.trim()[1..], pk_of(kind), false, gen)
+            return Member(key, is_static, kind, decos, ar.params, rt0, has0)
+        if p.target < 2018:
+            plain_fn_open(&p)
+        params = fparams(&p, true)
+        rt = ser(SER_VOID)
+        has_rt = false
+        if at_op(&p, 58):
+            rt = drop_return_type(&p)
+            has_rt = true
+        ga = p.in_gen
+        aa = p.in_async
+        p.in_gen = 0
+        p.in_async = 0
+        if gen:
+            p.in_gen = 1
+        if is_async:
+            p.in_async = 1
+        if is_ctor:
+            info.ctor = params
+            info.has_ctor = true
+            p.ctor_fn = p.pre_fn
+            pb0 = p.priv_bucket
+            p.priv_bucket = 0
+            ctor_body(&p, &ctor_mark)
+            p.priv_bucket = pb0
+        else:
+            fn_body(&p)
+        if p.target < 2018:
+            p.aw.pop()
+        p.in_gen = ga
+        p.in_async = aa
+        pop_scope(&p)
+        p.tparams = saved_tp
+        if is_ctor:
+            return none
+        if pmark >= 0:
+            priv_method_out(&p, pmark, key_text.trim()[1..], pk_of(kind), is_async, gen)
+        if kind == M_GET and not has_rt:
+            rt = ser(SER_OBJECT)
+        if kind == M_METHOD and not has_rt and is_async:
+            rt = Ser(SER_REF, "Promise!", [], false)
+            has_rt = true
+        return Member(key, is_static, kind, decos, params, rt, has_rt)
+    # a property
+    if is_static and not is_declare and not is_abstract:
+        p.class_statics = true
+    private = p.src.byte(key_start) == 35
+    keep = p.use_define or native
+    acc = ""
+    if is_accessor and not is_abstract and not is_declare and not native:
+        # the field becomes #storage, followed by a getter and setter
+        c = p.src.byte(key_start)
+        name = key_text.trim()
+        if c == 35 and len(name) > 0:            # (muted: no text)
+            name = name[1..]
+        elif not is_id_start(c):
+            name = "_" + chr(97 + info.storages)
+            info.storages += 1
+        store = "#" + name + "_accessor_storage"
+        nth = 1
+        co = p.class_outer                       # (private names: its classes', not others')
+        if co < 0:
+            co = info.start
+        ctext = p.src[co..class_text_end(p.src, co)]
+        while ctext.contains(store):
+            store = "#" + name + "_" + str(nth) + "_accessor_storage"   # taken: #a_1_accessor_storage, as tsc
+            nth += 1
+        get_key = key_text.trim()
+        set_key = get_key
+        cached = ""
+        if c == 91:
+            cached = cached_key(strip_ends(get_key))
+        if c == 91 and cached != "":
+            set_key = "[" + cached + "]"         # (the decorators' rewrite cached it already)
+            key = cached
+        elif c == 91 and not bracket_literal(key_text):
+            tmp = field_temp(&p)
+            get_key = "[" + tmp + " = " + strip_ends(get_key) + "]"
+            set_key = "[" + tmp + "]"
+            key = tmp
+        if c == 91 and info.key_flushed < len(info.key_assigns):
+            pend: [str] = []                     # (the class's pending inits go in the
+            for i in info.key_flushed..len(info.key_assigns):   # first computed name, as tsc)
+                pend.push(info.key_assigns[i])
+            info.key_flushed = len(info.key_assigns)
+            get_key = "[(" + ", ".join(pend) + ", " + strip_ends(get_key) + ")]"
+        recv = "this"
+        st = ""
+        if is_static:
+            recv = info.name
+            if recv == "" and p.target >= 2022:  # (below, the storage goes through the class's temp)
+                recv = context_name(p.src, info.start)
+                if recv == "" or recv.starts_with("#") or recv == "default":
+                    recv = "default_1"           # (an unnamed default class: parse_class names it)
+                    p.want_dn = true
+            st = "static "
+        acc = " " + st + "get " + get_key + "() { return " + recv + "." + store + "; } " + st + "set " + set_key + "(value) { " + recv + "." + store + " = value; }"
+        if c == 35 and (p.target < 2022 or (p.spl and is_static)) and p.mute == 0 and not is_abstract and not is_declare:
+            priv_record(&p, name, PK_GET, is_static, false)      # (accessor #a: #a is lowered too)
+            priv_record(&p, name, PK_SET, is_static, false)
+        if (p.target < 2022 or (p.spl and is_static)) and p.priv_cur >= 0:
+            acc = priv_accessor_text(&p, store[1..], is_static, st, get_key, set_key)
+        key_text = store
+        private = true
+        if q_pos >= 0:
+            emit_to(&p, q_pos)
+            skip_to(&p, q_pos + 1)
+            q_pos = -1
+    if (p.target < 2022 or (p.spl and is_static)) and p.mute == 0 and private and not is_abstract and not is_declare:
+        priv_record(&p, key_text.trim()[1..], PK_FIELD, is_static, acc != "")
+        if p.priv_cur >= 0:
+            if is_static:
+                p.class_statics = true
+            pt = ser(SER_OBJECT)
+            if at_op(&p, 58):
+                if p.mute == 0:
+                    p.ts_syntax += 1             # (#x: T)
+                s0 = save(&p)
+                next(&p)
+                p.mute += 1
+                p.bad = false
+                pt = parse_type(&p)
+                p.mute -= 1
+                p.bad = false
+                restore(&p, s0)
+            priv_field(&p, &inits, key_text.trim()[1..], is_static, member_start, acc)
+            if acc != "":
+                return Member(key, is_static, M_ACCESSOR, decos, no_params(), pt, true)
+            return Member(key, is_static, M_PROP, decos, no_params(), pt, true)
+    decorated_key = acc == "" and len(decos) > 0 and p.src.byte(key_start) == 91 and not is_abstract and not is_declare
+    if keep and decorated_key and bracket_literal(key_text):
+        key = key_text.trim()[1..len(key_text.trim()) - 1].trim()  # ["d"]: as it is, and "d" to __decorate
+    elif keep and decorated_key:
+        # a decorated computed key is evaluated once, into a temp the decorator call reuses
+        tmp = parse_temp(&p)
+        inner = key_text.trim()
+        key_text = "[" + tmp + " = " + strip_ends(inner) + "]"
+        key = tmp
+    if keep and not is_abstract and not is_declare:
+        put(&p, pre_text + key_text)
+    if keep and q_pos >= 0:
+        emit_to(&p, q_pos)
+        skip_to(&p, q_pos + 1)
+    t = ser(SER_OBJECT)
+    if at_op(&p, 58):
+        if keep and not is_abstract and not is_declare:
+            t = drop_annotation(&p)
+        else:
+            if p.mute == 0:
+                p.ts_syntax += 1                 # (x: T)
+            next(&p)
+            p.bad = false
+            t = parse_type(&p)
+    if is_abstract or is_declare:
+        if at_op(&p, 61):
+            next(&p)
+            p.mute += 1
+            assign(&p, false)
+            p.mute -= 1
+        drop_member(&p, member_start)
+        if len(decos) > 0 and p.src.byte(key_start) == 91:
+            key = strip_ends(key_text.trim()).trim()   # (declare [k]: __decorate gets k, as written)
+        return Member(key, is_static, M_PROP, decos, no_params(), t, true)
+    if keep:
+        if at_op(&p, 61):
+            next(&p)
+            if is_static:
+                p.in_static += 1
+            assign(&p, false)
+            if is_static:
+                p.in_static -= 1
+        eat_op(&p, 59)
+        if acc != "":
+            accessor_tail(&p, acc)
+            return Member(key, is_static, M_ACCESSOR, decos, no_params(), t, true)
+        if native:
+            info.native_acc = true
+            return Member(key, is_static, M_ACCESSOR, decos, no_params(), t, true)
+    else:
+        # the field moves into the constructor (or a static block); a #private field keeps its declaration
+        if private and not is_static and not is_declare:
+            # stays in place with its initializer unless another field moves to the constructor
+            # (then it moves too, to keep the order): decided at the end
+            put(&p, pre_text + key_text)
+            if at_op(&p, 61):
+                next(&p)
+                skip_ts(&p)
+                start = len(p.out)
+                saved = begin_capture(&p)
+                assign(&p, false)
+                emit_pe(&p)
+                init = end_capture(&p, saved)
+                put(&p, " = " + init.trim())
+                inits.push(" this." + key_text.trim() + " = " + init.trim() + ";")
+                info.priv_inits.push(len(inits) - 1)
+                info.priv_at.push(start)
+                info.priv_end.push(len(p.out))
+            put(&p, ";")
+            eat_op(&p, 59)
+            skip_pe(&p)
+            if acc != "":
+                put(&p, acc)
+                return Member(key, is_static, M_ACCESSOR, decos, no_params(), t, true)
+            return Member(key, is_static, M_PROP, decos, no_params(), t, true)
+        if private and is_static:
+            put(&p, pre_text + key_text)
+            skip_pe(&p)
+            if at_op(&p, 61):
+                next(&p)
+                p.in_static += 1
+                assign(&p, false)
+                p.in_static -= 1
+            eat_op(&p, 59)
+            emit_pe(&p)
+            if acc != "":
+                accessor_tail(&p, acc)
+                return Member(key, is_static, M_ACCESSOR, decos, no_params(), t, true)
+            return Member(key, is_static, M_PROP, decos, no_params(), t, true)
+        target = "this" + member_target(&p, key, key_start, key_end)
+        literal_key = p.src.byte(key_start) == 91 and bracket_literal(key_text)
+        if literal_key and decorated_key:
+            key = key_text.trim()[1..len(key_text.trim()) - 1].trim()   # ["plain"]: tsc passes "plain"
+        if p.src.byte(key_start) == 91 and (at_op(&p, 61) or decorated_key or p.define_low) and not literal_key:
+            # a computed key is evaluated once, in class order, into a temp (a decorated one's is
+            # the decorator transform's, which the __decorate call reuses)
+            tmp = ""
+            cached = ""
+            if not decorated_key:
+                cached = cached_key(bracket_inner(key_text, p.src[key_start..key_end]))
+            if cached != "":
+                tmp = cached                     # (cached by the decorators' rewrite)
+                info.key_assigns.push(strip_parens(bracket_inner(key_text, p.src[key_start..key_end])))
+            elif decorated_key:
+                tmp = parse_temp(&p)
+                key = tmp
+                info.key_assigns.push(tmp + " = " + bracket_inner(key_text, p.src[key_start..key_end]))
+            else:
+                tmp = field_temp(&p)
+                info.key_assigns.push(tmp + " = " + bracket_inner(key_text, p.src[key_start..key_end]))
+            target = "this[" + tmp + "]"
+        elif p.src.byte(key_start) == 91 and not literal_key and not at_op(&p, 61) and not simple_key(strip_ends(p.src[key_start..key_end].trim()), bracket_inner(key_text, p.src[key_start..key_end])):
+            # a computed key without an initializer is still evaluated, in class order, without a temp
+            # (tsc's getPropertyNameExpressionIfNeeded)
+            info.key_assigns.push(bracket_inner(key_text, p.src[key_start..key_end]))
+        if at_op(&p, 61):
+            next(&p)
+            skip_ts(&p)
+            saved = begin_capture(&p)
+            fb = p.priv_bucket
+            p.priv_bucket = 1                    # (an instance initializer: with the constructor)
+            if is_static:
+                p.priv_bucket = 3                # (statics: after the members)
+                p.in_static += 1
+                p.st_on = p.target < 2022
+                if p.target < 2022:
+                    p.this_depth -= 1            # moved out of the class: the top level
+            elif p.init_fn >= 0:
+                p.fn_stack.push(p.init_fn)
+            assign(&p, false)
+            p.priv_bucket = fb
+            if is_static:
+                p.in_static -= 1
+                p.st_on = false
+                if p.target < 2022:
+                    p.this_depth += 1
+            elif p.init_fn >= 0:
+                p.fn_stack.pop()
+            emit_pe(&p)
+            init = end_capture(&p, saved)
+            if is_static and p.target < 2022:
+                emit_to(&p, member_start)
+                skip_pe(&p)
+                if p.define_low:
+                    p.st_list.push(define_text("\x02", define_key(target[4..]), init.trim()))
+                else:
+                    p.st_list.push("\x02" + target[4..] + " = " + init.trim())
+            elif is_static:
+                emit_to(&p, member_start)
+                skip_pe(&p)
+                put(&p, "static { " + target + " = " + init.trim() + "; }")
+            elif p.define_low:
+                inits.push(" " + define_text("this", define_key(target[4..]), init.trim()) + ";")
+                info.hoists = true
+            else:
+                inits.push(" " + target + " = " + init.trim() + ";")
+                info.hoists = true
+                if info.native_acc and not has_hint(&p, str(info.start), 12):
+                    p.retry = true                  # an accessor above stayed as it is: lower it
+                    p.new_hints.push(Hint(info.start, str(info.start), 12, "", -1, -1))
+        elif p.define_low and not is_static:
+            inits.push(" " + define_text("this", define_key(target[4..]), "void 0") + ";")
+            info.hoists = true                   # (useDefineForClassFields: defined even without a value)
+        eat_op(&p, 59)
+        emit_to(&p, member_start)
+        skip_pe(&p)
+    return Member(key, is_static, M_PROP, decos, no_params(), t, true)
+
+# At a class expression's first member: does tsc see a static block first (written, or the
+# named evaluation's static { __setFunctionName(this, "D") } for `const D = class` with statics)?
+# Then tsc made its temp before the #names.
+fn temp_first(p: mut P, name: str, class_start: int) bool:
+    if at_kw(&p, K_STATIC) and peek_tok(&p).tok == T_OP and peek_tok(&p).op == 123:
+        s = save(&p)                             # (a static block reading `this`: the temp then)
+        p.mute += 1
+        next(&p)
+        next(&p)
+        depth = 1
+        r = false
+        while p.tok != T_EOF and depth > 0 and not r:
+            if at_op(&p, 123):
+                depth += 1
+            elif at_op(&p, 125):
+                depth -= 1
+            elif at_kw(&p, K_THIS):
+                r = true
+            next(&p)
+        p.mute -= 1
+        restore(&p, s)
+        if r:
+            return true
+    return name == "" and context_name(p.src, class_start) != "" and static_first(&p)
+
+# At the class's first member: does the class have a static block, an initialized static
+# field or a static accessor?
+fn static_first(p: mut P) bool:
+    s = save(&p)
+    p.mute += 1
+    r = false
+    depth = 0
+    while p.tok != T_EOF and not r:
+        if at_op(&p, 123) or at_op(&p, 40) or at_op(&p, 91):
+            depth += 1
+        elif at_op(&p, 125) or at_op(&p, 41) or at_op(&p, 93):
+            if depth == 0:
+                break
+            depth -= 1
+        elif depth == 0 and at_kw(&p, K_STATIC):
+            n = peek_tok(&p)
+            if n.tok == T_OP and n.op == 123:
+                r = true
+            elif n.tok == T_NAME and n.kw == K_ACCESSOR:
+                r = true
+            elif n.tok == T_NAME or n.tok == T_PRIV or n.tok == T_STR or (n.tok == T_OP and n.op == 91):
+                next(&p)
+                if at_op(&p, 91):
+                    skip_group(&p)
+                else:
+                    next(&p)
+                if at_op(&p, 63) or at_op(&p, 33):
+                    next(&p)
+                if at_op(&p, 58):
+                    next(&p)
+                    parse_type(&p)
+                    p.bad = false
+                r = at_op(&p, 61)                # (an initializer)
+                continue
+        next(&p)
+    p.mute -= 1
+    restore(&p, s)
+    return r
+
+# The text without the parentheses around all of it.
+fn strip_parens(t0: str) str:
+    t = t0.trim()
+    while t.starts_with("(") and t.ends_with(")") and group_end(t, 0) == len(t) - 1:
+        t = t[1..len(t) - 1].trim()
+    return t
+
+# A computed key ending in a temp assignment (`(..., _a = __propKey(k))`): that temp (tsc's
+# findComputedPropertyNameCacheAssignment), else "".
+fn cached_key(inner: str) str:
+    t = inner.trim()
+    while t.starts_with("(") and t.ends_with(")") and group_end(t, 0) == len(t) - 1:
+        t = t[1..len(t) - 1].trim()
+    parts = top_split(t, 44)
+    last = parts[len(parts) - 1].trim()
+    k = top_assign(last)
+    if k < 0:
+        return ""
+    name = last[..k].trim()
+    if name.starts_with("_") and plain_ident(name) and last[k + 1..].trim().starts_with("__propKey("):
+        return name
+    return ""
+
+# A computed key tsc doesn't evaluate when nothing reads it: a name, or a literal or keyword
+# once type assertions are gone.
+fn simple_key(src_inner: str, out_inner: str) bool:
+    return plain_ident(src_inner) or plain_ident(out_inner) or inline_literal(out_inner)
+
+# useDefineForClassFields below ES2022: a field is Object.defineProperty(obj, key, { ... }).
+fn define_text(obj: str, key: str, value: str) str:
+    return "Object.defineProperty(" + obj + ", " + key + ", {\n    enumerable: true,\n    configurable: true,\n    writable: true,\n    value: " + value + "\n})"
+
+# A member target's ".x" / "[k]" as defineProperty's key: "x" / k.
+fn define_key(sfx: str) str:
+    if sfx.starts_with("."):
+        return "\"" + sfx[1..] + "\""
+    return strip_ends(sfx)
+
+# The text without its first and last characters, or as it is when too short to have both.
+fn strip_ends(t: str) str:
+    if len(t) < 2:
+        return t
+    return t[1..len(t) - 1].trim()
+
+# `[x]` -> `x` (anything else as it is: a key whose text was rewritten).
+fn unbracket(t0: str) str:
+    t = t0.trim()
+    if len(t) >= 2 and t.byte(0) == 91 and t.byte(len(t) - 1) == 93:
+        return t[1..len(t) - 1].trim()
+    return t
+
+# What's inside a computed key's brackets (from its source when the text isn't bracketed).
+fn bracket_inner(key_text: str, src_key: str) str:
+    t = key_text.trim()
+    if len(t) < 2 or t.byte(0) != 91 or t.byte(len(t) - 1) != 93:
+        t = src_key.trim()
+    if len(t) < 2:
+        return t
+    return t[1..len(t) - 1].trim()
+
+# `["a"]` / `[1]`: a bracketed literal key (the text may be something else after a rewrite).
+fn bracket_literal(key_text: str) bool:
+    t = key_text.trim()
+    return len(t) >= 2 and t.byte(0) == 91 and t.byte(len(t) - 1) == 93 and is_literal_key(t[1..len(t) - 1].trim())
+
+# A computed key tsc uses as it is, without a temp: a string or number literal, or a template
+# without substitutions.
+fn is_literal_key(t: str) bool:
+    n = len(t)
+    if n == 0:
+        return false
+    q = t.byte(0)
+    if q == 34 or q == 39 or q == 96:
+        if n < 2 or t.byte(n - 1) != q:
+            return false
+        k = 1
+        while k < n - 1:
+            c = t.byte(k)
+            if c == 92:
+                k += 2
+                continue
+            if c == q or (q == 96 and c == 36 and k + 1 < n - 1 and t.byte(k + 1) == 123):
+                return false
+            k += 1
+        return k == n - 1
+    if q < 48 or q > 57:
+        if not (q == 46 and n > 1):
+            return false
+    for k in 0..n:
+        c = t.byte(k)
+        if not ((c >= 48 and c <= 57) or (c >= 97 and c <= 122) or (c >= 65 and c <= 90) or c == 46 or c == 95):
+            return false
+    return true
+
+# After an accessor's storage field: its getter and setter (the field needs its ";").
+fn accessor_tail(p: mut P, acc: str):
+    emit_pe(&p)
+    if p.src.byte(p.pe - 1) != 59:
+        put(&p, ";")
+    put(&p, acc)
+
+# Remove the TypeScript modifiers (public, readonly...) of a member that stays.
+# (start, end) pairs sorted by start.
+fn sorted_pairs(d: [int]) [int]:
+    out: [int] = []
+    used = [false] * (len(d) / 2)
+    for r in 0..len(d) / 2:
+        best = -1
+        for i in 0..len(d) / 2:
+            if not used[i] and (best < 0 or d[2 * i] < d[2 * best]):
+                best = i
+        used[best] = true
+        out.push(d[2 * best])
+        out.push(d[2 * best + 1])
+    return out
+
+fn apply_drops(p: mut P, drops: [int]):
+    i = 0
+    while i < len(drops):
+        emit_to(&p, drops[i])
+        skip_to(&p, drops[i + 1])
+        i += 2
+
+fn drop_member(p: mut P, member_start: int) Member:
+    p.mute += 1
+    eat_op(&p, 59)
+    p.mute -= 1
+    emit_to(&p, member_start)
+    skip_pe(&p)
+    return Member("", false, 0, [], no_params(), ser(SER_VOID), false)
+
+fn is_index_signature(p: mut P) bool:
+    s = save(&p)
+    next(&p)
+    r = false
+    if p.tok == T_NAME:
+        next(&p)
+        r = at_op(&p, 58)
+    restore(&p, s)
+    return r
+
+# The member name as a decorate key ("\"name\""), consuming it.
+fn member_key(p: mut P) str:
+    if at_op(&p, 91):
+        a = p.ts
+        next(&p)
+        k = p.spriv_bind
+        if k >= 0:
+            p.binds[k].active = false
+        assign(&p, false)
+        if k >= 0:
+            p.binds[k].active = true
+        expect_op(&p, 93)
+        return p.src[a..p.pe]
+    t = p.tok
+    text = tok_text(&p)
+    next(&p)
+    if t == T_NAME:
+        return "\"" + text + "\""
+    return text
+
+# `.name`, `["a-b"]` or `[expr]` for `this` + key.
+fn member_target(p: mut P, key: str, a: int, b: int) str:
+    c = p.src.byte(a)
+    if c == 91:
+        return p.src[a..b]
+    if is_id_start(c) or c == 35:
+        return "." + p.src[a..b]
+    return "[" + p.src[a..b] + "]"
+
+# A constructor body: remembers where the assignments go (after `super(...)`).
+fn ctor_body(p: mut P, mark: mut int):
+    if not at_op(&p, 123):
+        fail(&p, "expected constructor body")
+        return
+    next(&p)
+    fn_scope_start(&p)
+    emit_pe(&p)
+    while p.tok == T_STR:                        # a directive prologue ("ngInject";) stays first
+        n = peek_tok(&p)
+        if not ((n.tok == T_OP and (n.op == 59 or n.op == 125)) or n.nlb):
+            break
+        statement(&p, false)
+        emit_pe(&p)
+    mark = len(p.out)                            # (field assignments: before a `using` block's
+    uid = -1                                     # env, or after super() inside its try, as tsc)
+    track = p.has_using or p.target < 2018
+    if track:
+        p.u_fns += 1
+        p.u_parent.push(u_fn_top(&p))
+        p.u_fn.push(p.u_fns)
+    if p.has_using:
+        uid = u_open(&p)
+    else:
+        p.u_stack.push(-1)
+    while not at_op(&p, 125) and p.tok != T_EOF and p.err == "":
+        is_super = at_kw(&p, K_SUPER) and peek_tok(&p).tok == T_OP and peek_tok(&p).op == 40 and super_alone(&p)
+        statement(&p, false)
+        if is_super:
+            emit_pe(&p)
+            if not ends_with_semicolon(p.out):
+                put(&p, ";")                     # `super() }` (minified): the assignments follow it
+            mark = len(p.out)
+    if p.has_using:
+        emit_ts(&p)
+        u_close(&p, uid)
+    else:
+        p.u_stack.pop()
+    if track:
+        p.u_fn.pop()
+    fn_scope_end(&p)
+    expect_op(&p, 125)
+
+# `super(...)` is the whole statement (tsc puts the assignments after such a statement only;
+# for `super(), this.x = 1` it puts them first).
+fn super_alone(p: mut P) bool:
+    s = save(&p)
+    p.mute += 1
+    next(&p)
+    skip_group(&p)
+    alone = at_op(&p, 59) or at_op(&p, 125) or p.tok == T_EOF or p.nlb
+    p.mute -= 1
+    restore(&p, s)
+    return alone
+
+fn ends_with_semicolon(s: str) bool:
+    k = len(s) - 1
+    while k >= 0 and (s.byte(k) == 32 or s.byte(k) == 9 or s.byte(k) == 10 or s.byte(k) == 13):
+        k -= 1
+    return k >= 0 and s.byte(k) == 59
+
+fn is_hinted(p: mut P, pos: int, kind: int) bool:
+    for h in p.hints:
+        if h.kind == kind and h.pos == pos:
+            return true
+    return false
+
+fn is_hinted_class(p: mut P, pos: int) bool:
+    for h in p.hints:
+        if h.kind == 9 and h.pos == pos:
+            return true
+    return false
+
+# Indexes of `at` sorted by position (stable).
+fn sorted_positions(at: [int]) [int]:
+    idx: [int] = []
+    for i in 0..len(at):
+        k = len(idx)
+        idx.push(i)
+        while k > 0 and at[idx[k - 1]] > at[i]:
+            idx[k] = idx[k - 1]
+            k -= 1
+        idx[k] = i
+    return idx
+
+# A temp variable made while parsing, declared in the enclosing function (or module).
+fn parse_temp(p: mut P) str:
+    if not p.has_at and p.ns_name != "" and not has_hint_kind(p.hints, 10):
+        # a temp inside a namespace belongs to its IIFE: parse again tracking function scopes
+        p.retry = true
+        p.new_hints.push(Hint(-1, "", 10, "", -1, -1))
+    saved = p.cur_fn
+    p.cur_fn = -1
+    if len(p.fn_stack) > 0:
+        p.cur_fn = p.fn_stack[len(p.fn_stack) - 1]
+    t = next_temp(&p)
+    p.cur_fn = saved
+    return t
+
+# A temp of tsc's class fields transform: in its own `var` statement, above the decorator
+# aliases and the other temps.
+fn field_temp(p: mut P) str:
+    t = parse_temp(&p)
+    if len(p.fn_stack) > 0:
+        f = p.fn_stack[len(p.fn_stack) - 1]
+        p.fn_temps[f].pop()
+        p.fn_cf_temps[f].push(t)
+    else:
+        p.temp_names.pop()
+        p.cf_temps.push(t)
+    return t
+
+# C_1, or C_2 when another class in the file already has C_1.
+fn unique_alias(p: mut P, name: str) str:
+    n = p.alias_count.get(name, 0) + 1
+    p.alias_count[name] = n
+    return gen_name(name, n)
+
+# Where the class at `start` ends (after its body's "}"), by a scan that skips strings,
+# templates and comments.
+fn class_text_end(src: str, start: int) int:
+    k = start
+    n = len(src)
+    while k < n and src.byte(k) != 123:
+        k += 1
+    depth = 0
+    while k < n:
+        c = src.byte(k)
+        if c == 34 or c == 39 or c == 96:
+            k += 1
+            while k < n and src.byte(k) != c:
+                if src.byte(k) == 92:
+                    k += 1
+                k += 1
+        elif c == 47 and k + 1 < n and src.byte(k + 1) == 47:
+            while k < n and src.byte(k) != 10:
+                k += 1
+        elif c == 47 and k + 1 < n and src.byte(k + 1) == 42:
+            k += 2
+            while k + 1 < n and not (src.byte(k) == 42 and src.byte(k + 1) == 47):
+                k += 1
+            k += 1
+        elif c == 123:
+            depth += 1
+        elif c == 125:
+            depth -= 1
+            if depth == 0:
+                return k + 1
+        k += 1
+    return n
+
+# `var X = class { static { CT = this; }` (the TC39 decorators' rewrite at ES2022) at `at`
+# (the class) and `body` (its "{"): [X, CT], or [].
+fn esdec_this22(src: str, at: int, body: int) [str]:
+    k = back_space(src, at)
+    if k < 0 or src.byte(k) != 61:
+        return []
+    x = back_ident(src, back_space(src, k))
+    if x == "":
+        return []
+    k3 = back_space(src, back_space(src, k) - len(x) + 1)
+    if k3 < 2 or src[k3 - 2..k3 + 1] != "var":
+        return []
+    t = src[body + 1..min(body + 80, len(src))].trim()
+    if not t.starts_with("static { _classThis"):
+        return []
+    e = t.find(" = this; }")
+    if e < 0:
+        return []
+    return [x, t[9..e]]
+
+# `var X = CT = class` (CT a _classThis name of the TC39 decorators' rewrite) before `at`:
+# [X, CT], or [].
+fn esdec_this(src: str, at: int) [str]:
+    k = back_space(src, at)
+    if k < 0 or src.byte(k) != 61:
+        return []
+    ct = back_ident(src, back_space(src, k))
+    if not ct.starts_with("_classThis"):
+        return []
+    k2 = back_space(src, back_space(src, k) - len(ct) + 1)
+    if k2 < 0 or src.byte(k2) != 61:
+        return []
+    x = back_ident(src, back_space(src, k2))
+    if x == "":
+        return []
+    k3 = back_space(src, back_space(src, k2) - len(x) + 1)
+    if k3 < 2 or src[k3 - 2..k3 + 1] != "var":
+        return []
+    return [x, ct]
+
+fn decos_use_private(info: ClassInfo) bool:
+    for m in info.members:
+        for d in m.decos:
+            if has_private_ref(d):
+                return true
+        for d in m.params.deco_text:
+            if has_private_ref(d):
+                return true
+    return false
+
+fn has_private_ref(t: str) bool:
+    if t.contains("__classPrivateField"):        # (below ES2022 the name is already lowered)
+        return true
+    k = t.find("#")
+    while k >= 0:
+        if k + 1 < len(t) and is_id_start(t.byte(k + 1)):
+            return true
+        k = t.find_from("#", k + 1)
+    return false

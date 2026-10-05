@@ -1,0 +1,1711 @@
+# TC39 decorators (without experimentalDecorators), lowered as tsc's esDecorators transform does
+# for targets below ESNext: each decorated class is rewritten in the JS, then the result is compiled again.
+
+const ED_RUN = "R"          # helper names, in the order the rewrite first needed them
+const ED_DECORATE = "E"
+const ED_SETNAME = "S"
+const ED_PROPKEY = "P"
+
+const HELPER_ES_DECORATE = """var __esDecorate = (this && this.__esDecorate) || function (ctor, descriptorIn, decorators, contextIn, initializers, extraInitializers) {
+    function accept(f) { if (f !== void 0 && typeof f !== "function") throw new TypeError("Function expected"); return f; }
+    var kind = contextIn.kind, key = kind === "getter" ? "get" : kind === "setter" ? "set" : "value";
+    var target = !descriptorIn && ctor ? contextIn["static"] ? ctor : ctor.prototype : null;
+    var descriptor = descriptorIn || (target ? Object.getOwnPropertyDescriptor(target, contextIn.name) : {});
+    var _, done = false;
+    for (var i = decorators.length - 1; i >= 0; i--) {
+        var context = {};
+        for (var p in contextIn) context[p] = p === "access" ? {} : contextIn[p];
+        for (var p in contextIn.access) context.access[p] = contextIn.access[p];
+        context.addInitializer = function (f) { if (done) throw new TypeError("Cannot add initializers after decoration has completed"); extraInitializers.push(accept(f || null)); };
+        var result = (0, decorators[i])(kind === "accessor" ? { get: descriptor.get, set: descriptor.set } : descriptor[key], context);
+        if (kind === "accessor") {
+            if (result === void 0) continue;
+            if (result === null || typeof result !== "object") throw new TypeError("Object expected");
+            if (_ = accept(result.get)) descriptor.get = _;
+            if (_ = accept(result.set)) descriptor.set = _;
+            if (_ = accept(result.init)) initializers.unshift(_);
+        }
+        else if (_ = accept(result)) {
+            if (kind === "field") initializers.unshift(_);
+            else descriptor[key] = _;
+        }
+    }
+    if (target) Object.defineProperty(target, contextIn.name, descriptor);
+    done = true;
+};"""
+
+const HELPER_RUN_INITIALIZERS = """var __runInitializers = (this && this.__runInitializers) || function (thisArg, initializers, value) {
+    var useValue = arguments.length > 2;
+    for (var i = 0; i < initializers.length; i++) {
+        value = useValue ? initializers[i].call(thisArg, value) : initializers[i].call(thisArg);
+    }
+    return useValue ? value : void 0;
+};"""
+
+const HELPER_PROP_KEY = """var __propKey = (this && this.__propKey) || function (x) {
+    return typeof x === "symbol" ? x : "".concat(x);
+};"""
+
+const MK_OTHER = 0          # `;`
+const MK_METHOD = 1
+const MK_GET = 2
+const MK_SET = 3
+const MK_FIELD = 4
+const MK_ACCESSOR = 5       # `accessor x = 1`
+const MK_CTOR = 6
+const MK_BLOCK = 7          # static { }
+
+const NK_IDENT = 0
+const NK_STR = 1
+const NK_NUM = 2
+const NK_COMPUTED = 3
+const NK_PRIV = 4
+
+struct DMember:
+    kind: int
+    is_static: bool
+    is_async: bool
+    is_gen: bool
+    decos: [str]        # decorator expressions, as written
+    name: str           # as written: x, "s", 1, [k], #p ("" for a static block)
+    nk: int
+    key: str            # a computed name's expression
+    params: str         # "(a, b)"
+    body: str           # "{ ... }"
+    init: str           # a field's initializer ("" when it has none)
+    has_init: bool
+
+struct DClass:
+    ok: bool
+    start: int          # where the replaced text starts (the decorators, `export`, or `class`)
+    end: int
+    decos: [str]
+    name: str
+    ext: str            # the `extends` expression ("" without one)
+    members: [DMember]
+    decorated: bool     # the class or one of its members has decorators
+    xctx: int           # `@dec export class`: 1, `@dec export default class`: 2 (else 0)
+
+# What the rewrite of a whole file shares: the helpers needed and the file's unique names.
+struct EdFile:
+    helpers: [str]
+    names: {str: bool}
+    target: int             # the real target (below ES2022 a decorated
+    define: bool            # declaration's statics become statements after it)
+
+# The state of one class's rewrite.
+struct DGen:
+    ids: {str: bool}        # identifiers of the file (generated names avoid them)
+    used: {str: bool}       # names generated in this class's function
+    temps: [str]            # its hoisted `var` temps
+    temp_n: int
+    f: EdFile               # the file's (helpers, names)
+    outer_this: str
+    last_init: str          # (field_out) the initializer it wrote
+
+# Rewrites every class with TC39 decorators in `src` (JavaScript). `helpers` collects the
+# helper functions the result needs.
+fn esdec_rewrite(src: str, ids: {str: bool}, ef: mut EdFile) str:
+    return esdec_frag(src, ids, &ef, 0, "")
+
+# The same for a piece of a class: `prev0` 3 when it's an expression; `outer` the name a class
+# at its very start gets (a field `x = class {}`).
+fn esdec_frag(src: str, ids: {str: bool}, ef: mut EdFile, prev0: int, outer: str) str:
+    p = new_p(src, false)
+    p.mute += 1
+    p.legacy_decorators = false
+    ed_next(&p)
+    out = ""
+    copied = 0
+    prev = prev0             # 0 start/statement boundary, 1 `export`, 2 `export default`, 3 other
+    exp_at = -1              # where that `export` is
+    while p.tok != T_EOF:
+        if (p.tok == T_OP and p.op == 64) or (p.tok == T_NAME and p.kw == K_CLASS):
+            s = save(&p)
+            ctx = prev
+            c = parse_dclass(&p, ctx)
+            if c.xctx > 0:
+                ctx = c.xctx
+            if c.ok and c.decorated:
+                stmt = ctx == 0 or ctx == 1 or ctx == 2
+                start = c.start
+                if (ctx == 1 or ctx == 2) and exp_at >= 0:
+                    start = exp_at
+                name_ctx = ""
+                if not stmt:
+                    name_ctx = ed_context_name(src, c.start)
+                    if outer != "" and src[..c.start].trim().replace("(", "") == "":
+                        name_ctx = outer
+                out += src[copied..start]
+                out += gen_class(c, ids, &ef, stmt, ctx, name_ctx)
+                copied = c.end
+                prev = 3
+                exp_at = -1
+                if stmt:
+                    prev = 0                     # (a declaration ends a statement)
+                continue
+            restore(&p, s)
+            if p.tok == T_OP and p.op == 64:
+                ed_next(&p)
+                prev = 3
+                continue
+            ed_next(&p)                          # `class`: look inside it
+            prev = 3
+            continue
+        if p.tok == T_TPL_HEAD:
+            ed_skip_template(&p)
+            prev = 3
+            continue
+        if p.tok == T_OP and (p.op == 59 or p.op == 123 or p.op == 125):
+            prev = 0
+            exp_at = -1
+        elif p.tok == T_NAME and p.kw == K_EXPORT and prev == 0:
+            prev = 1
+            exp_at = p.ts
+        elif p.tok == T_NAME and p.kw == K_DEFAULT and prev == 1:
+            prev = 2
+        else:
+            prev = 3
+            exp_at = -1
+        ed_next(&p)
+    if copied == 0:
+        return src
+    return out + src[copied..]
+
+fn ed_next(p: mut P):
+    next(&p)
+    if p.tok == T_OP and (p.op == 47 or (p.op == O_ASSIGN and p.src.byte(p.ts) == 47)) and regex_ok_prev(&p):
+        rescan_regex(&p)
+
+# At "@" (or `class`): decorators, then [export [default]], then a class.
+fn parse_dclass(p: mut P, ctx: int) DClass:
+    c = DClass(false, p.ts, 0, [], "", "", [], false, 0)
+    c.decos = deco_list(&p)
+    if p.tok == T_NAME and p.kw == K_EXPORT and ctx == 0:
+        ed_next(&p)                              # @dec export [default] class
+        c.xctx = 1
+        if p.tok == T_NAME and p.kw == K_DEFAULT:
+            ed_next(&p)
+            c.xctx = 2
+    if not (p.tok == T_NAME and p.kw == K_CLASS):
+        return c
+    ed_next(&p)
+    if p.tok == T_NAME and p.kw != K_EXTENDS:
+        c.name = tok_text(&p)
+        ed_next(&p)
+    if p.tok == T_NAME and p.kw == K_EXTENDS:
+        ed_next(&p)
+        a = p.ts
+        ed_skip_heritage(&p)
+        c.ext = p.src[a..p.pe].trim()
+    if not (p.tok == T_OP and p.op == 123):
+        return c
+    ed_next(&p)
+    c.decorated = len(c.decos) > 0
+    while p.tok != T_EOF and not (p.tok == T_OP and p.op == 125):
+        m = parse_dmember(&p)
+        if len(m.decos) > 0:
+            c.decorated = true
+        c.members.push(m)
+    if p.tok != T_OP or p.op != 125:
+        return c
+    c.end = p.te
+    ed_next(&p)
+    c.ok = true
+    return c
+
+# Decorators at "@": their expressions' texts.
+fn deco_list(p: mut P) [str]:
+    texts: [str] = []
+    while p.tok == T_OP and p.op == 64:
+        ed_next(&p)
+        a = p.ts
+        if p.tok == T_OP and p.op == 40:
+            skip_group(&p)
+        else:
+            ed_next(&p)
+        while true:
+            if p.tok == T_OP and p.op == 46:
+                ed_next(&p)
+                ed_next(&p)
+            elif p.tok == T_OP and p.op == 40 and not p.nlb:
+                skip_group(&p)
+            else:
+                break
+        texts.push(p.src[a..p.pe])
+    return texts
+
+fn is_member_name_start(t: LexState) bool:
+    if t.tok == T_NAME or t.tok == T_STR or t.tok == T_NUM or t.tok == T_PRIV:
+        return true
+    return t.tok == T_OP and (t.op == 91 or t.op == 42)
+
+fn parse_dmember(p: mut P) DMember:
+    m = DMember(MK_OTHER, false, false, false, [], "", NK_IDENT, "", "", "", "", false)
+    if p.tok == T_OP and p.op == 59:
+        ed_next(&p)
+        return m
+    m.decos = deco_list(&p)
+    getset = 0
+    while p.tok == T_NAME:
+        k = p.kw
+        n = peek_tok(&p)
+        if k == K_STATIC and n.tok == T_OP and n.op == 123:
+            m.is_static = true
+            ed_next(&p)
+            a = p.ts
+            skip_group(&p)
+            m.kind = MK_BLOCK
+            m.body = p.src[a..p.pe]
+            return m
+        if k == K_STATIC and is_member_name_start(n):
+            m.is_static = true
+        elif k == K_ASYNC and is_member_name_start(n) and not n.nlb:
+            m.is_async = true
+        elif k == K_ACCESSOR and is_member_name_start(n) and not n.nlb:
+            m.kind = MK_ACCESSOR
+        elif (k == K_GET or k == K_SET) and is_member_name_start(n) and not (n.tok == T_OP and n.op == 42):
+            getset = k
+        else:
+            break
+        ed_next(&p)
+    if p.tok == T_OP and p.op == 42:
+        m.is_gen = true
+        ed_next(&p)
+    a = p.ts
+    if p.tok == T_OP and p.op == 91:
+        skip_group(&p)
+        m.nk = NK_COMPUTED
+        m.name = p.src[a..p.pe]
+        m.key = m.name[1..len(m.name) - 1].trim()
+    else:
+        if p.tok == T_STR:
+            m.nk = NK_STR
+        elif p.tok == T_NUM:
+            m.nk = NK_NUM
+        elif p.tok == T_PRIV:
+            m.nk = NK_PRIV
+        m.name = tok_text(&p)
+        ed_next(&p)
+    if p.tok == T_OP and p.op == 40:
+        b = p.ts
+        skip_group(&p)
+        m.params = p.src[b..p.pe]
+        b2 = p.ts
+        skip_group(&p)
+        m.body = p.src[b2..p.pe]
+        if getset == K_GET:
+            m.kind = MK_GET
+        elif getset == K_SET:
+            m.kind = MK_SET
+        elif m.name == "constructor" and m.nk == NK_IDENT and not m.is_static:
+            m.kind = MK_CTOR
+        else:
+            m.kind = MK_METHOD
+        return m
+    if m.kind != MK_ACCESSOR:
+        m.kind = MK_FIELD
+    if p.tok == T_OP and p.op == 61:
+        ed_next(&p)
+        b = p.ts
+        ed_skip_expr(&p, true)
+        m.init = p.src[b..p.pe].trim()
+        m.has_init = true
+    if p.tok == T_OP and p.op == 59:
+        ed_next(&p)
+    return m
+
+# ---- names
+
+fn ed_name(g: mut DGen, base: str) str:
+    name = base
+    n = 0
+    while (name in g.ids) or (name in g.used):
+        n += 1
+        name = base + "_" + str(n)
+    g.used[name] = true
+    return name
+
+# A hoisted temp (_a, _b, ...), declared by the class's function.
+fn ed_temp(g: mut DGen) str:
+    while true:
+        n = g.temp_n
+        g.temp_n += 1
+        t = ""
+        if n < 26:
+            t = "_" + chr(97 + n)
+        else:
+            t = "_" + str(n - 26)
+        if not (t in g.ids) and not (t in g.used):
+            g.used[t] = true
+            g.temps.push(t)
+            return t
+    return ""
+
+fn need(g: mut DGen, h: str):
+    for x in g.f.helpers:
+        if x == h:
+            return
+    g.f.helpers.push(h)
+
+# A generated name unique in the file (tsc's makeUniqueName): base_1, base_2, ...
+fn ed_file_name(g: mut DGen, base: str) str:
+    n = 1
+    while true:
+        name = base + "_" + str(n)
+        if not (name in g.ids) and not (name in g.f.names) and not (name in g.used):
+            g.f.names[name] = true
+            return name
+        n += 1
+    return ""
+
+# tsc's getHelperVariableName: _x, _get_x, _private_x, _static_x ... ("member" for others).
+fn helper_base(m: DMember) str:
+    d = "member"
+    if m.nk == NK_IDENT:
+        d = m.name
+    elif m.nk == NK_PRIV:
+        d = m.name[1..]
+    elif m.nk == NK_STR and is_ident_text(m.name[1..len(m.name) - 1]):
+        d = m.name[1..len(m.name) - 1]
+    if m.kind == MK_GET:
+        d = "get_" + d
+    if m.kind == MK_SET:
+        d = "set_" + d
+    if m.nk == NK_PRIV:
+        d = "private_" + d
+    if m.is_static:
+        d = "static_" + d
+    return "_" + d
+
+fn is_ident_text(s: str) bool:
+    if len(s) == 0:
+        return false
+    for k in 0..len(s):
+        c = s.byte(k)
+        ok = (c >= 97 and c <= 122) or (c >= 65 and c <= 90) or c == 95 or c == 36 or (k > 0 and c >= 48 and c <= 57) or c >= 128
+        if not ok:
+            return false
+    return true
+
+# A string literal for a name tsc reads with createStringLiteralFromNode.
+fn name_string(m: DMember) str:
+    if m.nk == NK_STR:
+        return m.name
+    return "\"" + m.name + "\""
+
+fn is_literal_text(s: str) bool:
+    if len(s) == 0:
+        return false
+    c = s.byte(0)
+    if c == 34 or c == 39:
+        return s.byte(len(s) - 1) == c and s.find("\\") < 0 and s[1..len(s) - 1].find(s[0..1]) < 0
+    if c == 96:
+        return s.byte(len(s) - 1) == 96 and s.find("${") < 0
+    for k in 0..len(s):
+        d = s.byte(k)
+        if not ((d >= 48 and d <= 57) or d == 46 or d == 95 or (d >= 97 and d <= 122) or (d >= 65 and d <= 90)):
+            return false
+    return c >= 48 and c <= 57
+
+# `a, b` as an expression where one is needed: parenthesized when it's a list.
+fn comma(xs: [str]) str:
+    if len(xs) == 1:
+        return xs[0]
+    return "(" + ", ".join(xs) + ")"
+
+# tsc's transformDecorator: `@a.b` becomes `(_a = a).b.bind(_a)` (so `this` is right).
+fn deco_text(g: mut DGen, d: str) str:
+    t = d.trim()
+    inner = t
+    parens = 0
+    while inner.starts_with("(") and inner.ends_with(")") and group_end(inner, 0) == len(inner) - 1:
+        inner = inner[1..len(inner) - 1].trim()
+        parens += 1
+    cut = last_access(inner)
+    if cut <= 0:
+        return t
+    obj = inner[..cut]
+    rest = inner[cut..]
+    r = ""
+    if obj.trim() == "super":
+        # super can't go in a temp: bound to the class's outer `this`, as tsc
+        if g.outer_this == "":
+            g.outer_this = ed_name(&g, "_outerThis")
+        r = "super" + rest + ".bind(" + g.outer_this + ")"
+    else:
+        tmp = ed_temp(&g)
+        r = "(" + tmp + " = " + obj + ")" + rest + ".bind(" + tmp + ")"
+    for i in 0..parens:
+        r = "(" + r + ")"
+    return r
+
+# Where the last `.x` / `[x]` of an access expression starts (-1 if `s` isn't one, e.g. a call).
+fn last_access(s: str) int:
+    n = len(s)
+    if n == 0:
+        return -1
+    last = s.byte(n - 1)
+    if last == 41:
+        return -1                                # a call
+    if last == 93:
+        k = group_start(s, n - 1)
+        if k <= 0:
+            return -1
+        return k
+    k = n - 1
+    while k >= 0 and (is_id_byte(s.byte(k)) or s.byte(k) == 35):
+        k -= 1
+    if k <= 0 or s.byte(k) != 46:
+        return -1
+    if k >= 1 and s.byte(k - 1) == 63:
+        return -1                                # a?.b
+    return k
+
+fn is_id_byte(c: int) bool:
+    return (c >= 97 and c <= 122) or (c >= 65 and c <= 90) or (c >= 48 and c <= 57) or c == 95 or c == 36 or c >= 128
+
+# The index of the bracket closing the one at `at` (strings skipped), or -1.
+fn group_end(s: str, at: int) int:
+    depth = 0
+    k = at
+    while k < len(s):
+        c = s.byte(k)
+        if c == 34 or c == 39 or c == 96:
+            k = ed_skip_quoted(s, k)
+            continue
+        if c == 40 or c == 91 or c == 123:
+            depth += 1
+        elif c == 41 or c == 93 or c == 125:
+            depth -= 1
+            if depth == 0:
+                return k
+        k += 1
+    return -1
+
+fn group_start(s: str, at: int) int:
+    depth = 0
+    k = at
+    while k >= 0:
+        c = s.byte(k)
+        if c == 41 or c == 93 or c == 125:
+            depth += 1
+        elif c == 40 or c == 91 or c == 123:
+            depth -= 1
+            if depth == 0:
+                return k
+        k -= 1
+    return -1
+
+fn ed_skip_quoted(s: str, at: int) int:
+    q = s.byte(at)
+    k = at + 1
+    while k < len(s):
+        c = s.byte(k)
+        if c == 92:
+            k += 2
+            continue
+        if c == q:
+            return k + 1
+        k += 1
+    return k
+
+# ---- the class
+
+# The access object of a member's decorator context.
+fn access_text(m: DMember, nm: str, computed: bool, get: bool, set: bool) str:
+    has = ""
+    acc = ""
+    if m.nk == NK_PRIV:
+        has = m.name
+        acc = "obj." + m.name
+    elif computed:
+        has = nm
+        acc = "obj[" + nm + "]"
+    else:
+        has = "\"" + m.name + "\""
+        acc = "obj." + m.name
+    parts = ["has: obj => " + has + " in obj"]
+    if get:
+        parts.push("get: obj => " + acc)
+    if set:
+        parts.push("set: (obj, value) => { " + acc + " = value; }")
+    return "{ " + ", ".join(parts) + " }"
+
+fn kind_text(m: DMember) str:
+    if m.kind == MK_GET:
+        return "getter"
+    if m.kind == MK_SET:
+        return "setter"
+    if m.kind == MK_METHOD:
+        return "method"
+    if m.kind == MK_ACCESSOR:
+        return "accessor"
+    return "field"
+
+fn bool_word(b: bool) str:
+    if b:
+        return "true"
+    return "false"
+
+fn gen_class(c0: DClass, ids: {str: bool}, ef: mut EdFile, stmt: bool, ctx: int, name_ctx: str) str:
+    g = DGen(ids, {}, [], 0, ef, "", "")
+    c = c0
+    if c.name == "" and stmt and ctx == 2 and default_needs_name(c):
+        c.name = ed_file_name(&g, "default")     # tsc's TypeScript pass names it first (ClassFacts.NeedsName)
+    class_dec = len(c.decos) > 0
+    anon = c.name == ""
+    if anon and (class_dec or (stmt and ctx == 2) or name_ctx != ""):
+        need(&g, ED_SETNAME)                     # (named evaluation comes before the rest)
+    # what tsc's createClassInfo works out first
+    class_this = ""
+    if class_dec:
+        class_this = ed_name(&g, "_classThis")
+    inst_extra = ""
+    static_extra = ""
+    has_static_init = false
+    pend_static: [str] = []
+    pend_inst: [str] = []
+    for m in c.members:
+        if len(m.decos) > 0 and (m.kind == MK_METHOD or m.kind == MK_GET or m.kind == MK_SET):
+            if m.is_static and static_extra == "":
+                static_extra = ed_name(&g, "_staticExtraInitializers")
+                need(&g, ED_RUN)
+                tv = class_this
+                if tv == "":
+                    tv = "this"
+                pend_static.push("__runInitializers(" + tv + ", " + static_extra + ")")
+            elif not m.is_static and inst_extra == "":
+                inst_extra = ed_name(&g, "_instanceExtraInitializers")
+                need(&g, ED_RUN)
+                pend_inst.push("__runInitializers(this, " + inst_extra + ")")
+        if m.kind == MK_BLOCK:
+            has_static_init = true
+        elif (m.kind == MK_FIELD or m.kind == MK_ACCESSOR) and m.is_static:
+            if m.has_init or len(m.decos) > 0:
+                has_static_init = true
+    # below ES2022 a decorated class declaration's statics are statements after it (tsc's
+    # class-fields transform)
+    smode = class_dec and g.f.target < 2022
+    # (xmode) with #private names they stay in the class as static blocks and fields, and the
+    # class-fields pass writes them as those statements (class.tn)
+    xmode = smode and class_uses_private(c)
+    if xmode:
+        smode = false
+    sstmts: [str] = []           # (smode) those statements, in member order
+    defs: [str] = []             # the function's statements
+    cdecos = ""
+    cdesc = ""
+    cextra = ""
+    if class_dec:
+        cdecos = ed_name(&g, "_classDecorators")
+        cdesc = ed_name(&g, "_classDescriptor")
+        cextra = ed_name(&g, "_classExtraInitializers")
+        dl: [str] = []
+        for d in c.decos:
+            dl.push(deco_text(&g, esdec_frag(d, ids, &g.f, 3, "")))
+        defs.push("let " + cdecos + " = [" + ", ".join(dl) + "];")
+        defs.push("let " + cdesc + ";")
+        defs.push("let " + cextra + " = [];")
+        defs.push("let " + class_this + ";")
+    csuper = ""
+    heritage = ""
+    if c.ext != "":
+        csuper = ed_name(&g, "_classSuper")
+        ext = esdec_frag(c.ext, ids, &g.f, 3, "")
+        if anon_fn_like(ext):
+            ext = "(0, " + ext + ")"
+        defs.push("let " + csuper + " = " + ext + ";")
+        heritage = " extends " + csuper
+    md = ed_name(&g, "_metadata")
+    meta_from = "null"
+    if csuper != "":
+        meta_from = csuper + "[Symbol.metadata] ?? null"
+    leading: [str] = ["const " + md + " = typeof Symbol === \"function\" && Symbol.metadata ? Object.create(" + meta_from + ") : void 0;"]
+    pending: [str] = []          # decorator lists (and computed keys) not yet placed
+    s_nf: [str] = []
+    n_nf: [str] = []
+    s_f: [str] = []
+    n_f: [str] = []
+    lets_static: [str] = []
+    lets_inst: [str] = []
+    outs: [str] = []             # the members, transformed
+    ctor_at = -1
+    for m in c.members:
+        if m.kind == MK_CTOR:
+            outs.push("")
+            ctor_at = len(outs) - 1
+            continue
+        if m.kind == MK_OTHER:
+            continue
+        if m.kind == MK_BLOCK:
+            body = esdec_frag(m.body, ids, &g.f, 3, "")
+            if class_this != "":
+                body = sub_this_block(body, class_this, csuper)
+            if len(pend_static) > 0:
+                if smode:
+                    sstmts.push("(() => { " + "; ".join(pend_static) + "; })();")
+                else:
+                    outs.push("static { " + "; ".join(pend_static) + "; }")
+                pend_static = []
+            has_static_init = true
+            if smode:
+                sstmts.push("(() => " + body + ")();")
+            else:
+                outs.push("static " + body)
+            continue
+        st = ""
+        if m.is_static:
+            st = "static "
+        name_out = m.name
+        if m.nk == NK_COMPUTED:
+            name_out = "[" + esdec_frag(m.key, ids, &g.f, 3, "") + "]"
+        if len(m.decos) == 0:
+            if m.nk == NK_COMPUTED and len(pending) > 0 and not is_literal_text(m.key):
+                pending.push(esdec_frag(m.key, ids, &g.f, 3, ""))
+                name_out = "[" + comma(pending) + "]"
+                pending = []
+            if m.kind == MK_FIELD or m.kind == MK_ACCESSOR:
+                fo0 = field_out(&g, m, st, name_out, "", "", class_this, csuper, &pend_static, &pend_inst, &has_static_init)
+                if smode and m.is_static and m.kind == MK_FIELD and m.nk != NK_PRIV:
+                    if g.last_init != "":
+                        sstmts.push(static_stmt(g.f.define, class_this, m, name_out, g.last_init))
+                else:
+                    outs.push(fo0)
+            else:
+                outs.push(method_out(m, st, name_out, esdec_frag(m.params, ids, &g.f, 3, ""), esdec_frag(m.body, ids, &g.f, 3, "")))
+            continue
+        # a decorated member (tsc's partialTransformClassElement)
+        hb = helper_base(m)
+        dn = ed_name(&g, hb + "_decorators")
+        dl: [str] = []
+        for d in m.decos:
+            dl.push(deco_text(&g, esdec_frag(d, ids, &g.f, 3, "")))
+        pending.push(dn + " = [" + ", ".join(dl) + "]")
+        lets: [str] = ["let " + dn + ";"]
+        computed = false
+        nm = ""
+        if m.nk == NK_IDENT or m.nk == NK_PRIV:
+            nm = "\"" + m.name + "\""
+        elif m.nk == NK_STR or m.nk == NK_NUM:
+            computed = true
+            nm = name_string(m)
+        elif is_literal_text(m.key) and not is_ident_text(m.key):
+            computed = true
+            k0 = m.key
+            if k0.starts_with("\"") or k0.starts_with("'"):
+                nm = k0
+            else:
+                nm = "\"" + k0 + "\""
+        else:
+            computed = true
+            nm = ed_temp(&g)
+            need(&g, ED_PROPKEY)
+            pending.push(nm + " = __propKey(" + esdec_frag(m.key, ids, &g.f, 3, "") + ")")
+            name_out = "[" + comma(pending) + "]"
+            pending = []
+        is_field = m.kind == MK_FIELD or m.kind == MK_ACCESSOR
+        get = m.kind == MK_FIELD or m.kind == MK_ACCESSOR or m.kind == MK_GET or m.kind == MK_METHOD
+        set = m.kind == MK_FIELD or m.kind == MK_ACCESSOR or m.kind == MK_SET
+        ctxo = "{ kind: \"" + kind_text(m) + "\", name: " + nm + ", static: " + bool_word(m.is_static) + ", private: " + bool_word(m.nk == NK_PRIV) + ", access: " + access_text(m, nm, computed, get, set) + ", metadata: " + md + " }"
+        need(&g, ED_DECORATE)
+        if not is_field:
+            extra = inst_extra
+            if m.is_static:
+                extra = static_extra
+            desc = "null"
+            dname = ""
+            params = esdec_frag(m.params, ids, &g.f, 3, "")
+            body = esdec_frag(m.body, ids, &g.f, 3, "")
+            if m.nk == NK_PRIV:
+                dname = ed_name(&g, hb + "_descriptor")
+                lets.push("let " + dname + ";")
+                need(&g, ED_SETNAME)
+                fnk = "function"
+                if m.is_async:
+                    fnk = "async function"
+                if m.is_gen:
+                    fnk += "*"
+                if m.kind == MK_GET:
+                    desc = dname + " = { get: __setFunctionName(function () " + body + ", \"" + m.name + "\", \"get\") }"
+                elif m.kind == MK_SET:
+                    desc = dname + " = { set: __setFunctionName(function " + params + " " + body + ", \"" + m.name + "\", \"set\") }"
+                else:
+                    desc = dname + " = { value: __setFunctionName(" + fnk + " " + params + " " + body + ", \"" + m.name + "\") }"
+            tharg = "this"
+            if smode or xmode:
+                tharg = class_this
+            stmt_t = "__esDecorate(" + tharg + ", " + desc + ", " + dn + ", " + ctxo + ", null, " + extra + ");"
+            if m.is_static:
+                s_nf.push(stmt_t)
+            else:
+                n_nf.push(stmt_t)
+            if dname != "":
+                if m.kind == MK_GET:
+                    outs.push(st + "get " + m.name + "() { return " + dname + ".get.call(this); }")
+                elif m.kind == MK_SET:
+                    outs.push(st + "set " + m.name + "(value) { return " + dname + ".set.call(this, value); }")
+                else:
+                    outs.push(st + "get " + m.name + "() { return " + dname + ".value; }")
+            else:
+                outs.push(method_out(m, st, name_out, params, body))
+        else:
+            initn = ed_name(&g, hb + "_initializers")
+            extran = ed_name(&g, hb + "_extraInitializers")
+            lets.push("let " + initn + " = [];")
+            lets.push("let " + extran + " = [];")
+            desc = "null"
+            dname = ""
+            store = ""
+            if m.kind == MK_ACCESSOR and m.nk == NK_PRIV:
+                dname = ed_name(&g, hb + "_descriptor")
+                lets.push("let " + dname + ";")
+                need(&g, ED_SETNAME)
+                store = "#" + m.name[1..] + "_accessor_storage"
+                desc = dname + " = { get: __setFunctionName(function () { return this." + store + "; }, \"" + m.name + "\", \"get\"), set: __setFunctionName(function (value) { this." + store + " = value; }, \"" + m.name + "\", \"set\") }"
+            first = "null"
+            if m.kind == MK_ACCESSOR:
+                first = "this"
+                if smode or xmode:
+                    first = class_this
+            stmt_t = "__esDecorate(" + first + ", " + desc + ", " + dn + ", " + ctxo + ", " + initn + ", " + extran + ");"
+            if m.kind == MK_ACCESSOR:
+                if m.is_static:
+                    s_nf.push(stmt_t)
+                else:
+                    n_nf.push(stmt_t)
+            elif m.is_static:
+                s_f.push(stmt_t)
+            else:
+                n_f.push(stmt_t)
+            need(&g, ED_RUN)
+            fo = field_out(&g, m, st, name_out, initn, extran, class_this, csuper, &pend_static, &pend_inst, &has_static_init)
+            if dname != "":
+                # the private accessor: its storage, and forwarders to the descriptor
+                fo = st + store + fo[len(st) + len("accessor ") + len(m.name)..]
+                outs.push(fo)
+                outs.push(st + "get " + m.name + "() { return " + dname + ".get.call(this); }")
+                outs.push(st + "set " + m.name + "(value) { return " + dname + ".set.call(this, value); }")
+            elif smode and m.is_static and m.kind == MK_FIELD and m.nk != NK_PRIV:
+                if g.last_init != "":
+                    sstmts.push(static_stmt(g.f.define, class_this, m, name_out, g.last_init))
+            else:
+                outs.push(fo)
+        if m.is_static:
+            for l in lets:
+                lets_static.push(l)
+        else:
+            for l in lets:
+                lets_inst.push(l)
+    # the constructor (visited last), or one made up for the instance initializers left
+    synth = ""
+    for m in c.members:
+        if m.kind == MK_CTOR:
+            body = esdec_frag(m.body, ids, &g.f, 3, "")
+            if len(pend_inst) > 0:
+                body = ctor_inject(body, ", ".join(pend_inst) + ";")
+                pend_inst = []
+            outs[ctor_at] = "constructor" + esdec_frag(m.params, ids, &g.f, 3, "") + " " + body
+    if len(pend_inst) > 0:
+        if c.ext != "" and c.ext.trim() != "null":
+            synth = "constructor() { super(...arguments); " + ", ".join(pend_inst) + "; }"
+        else:
+            synth = "constructor() { " + ", ".join(pend_inst) + "; }"
+        pend_inst = []
+    # decorator lists no computed name took: statements in the leading block (`this` there is
+    # _outerThis)
+    for e in pending:
+        x = e
+        if has_this(x):
+            if g.outer_this == "":
+                g.outer_this = ed_name(&g, "_outerThis")
+            x = sub_this(x, g.outer_this, "")
+        leading.push(x + ";")
+    if static_extra != "":
+        defs.push("let " + static_extra + " = [];")
+    if inst_extra != "":
+        defs.push("let " + inst_extra + " = [];")
+    for l in lets_static:
+        defs.push(l)
+    for l in lets_inst:
+        defs.push(l)
+    for s in s_nf:
+        leading.push(s)
+    for s in n_nf:
+        leading.push(s)
+    for s in s_f:
+        leading.push(s)
+    for s in n_f:
+        leading.push(s)
+    local = c.name
+    if anon and class_dec:
+        if ctx == 2 and stmt:
+            local = ed_file_name(&g, "default")
+        else:
+            local = ed_file_name(&g, "class")
+    if class_dec:
+        need(&g, ED_DECORATE)
+        leading.push("__esDecorate(null, " + cdesc + " = { value: " + class_this + " }, " + cdecos + ", { kind: \"class\", name: " + class_this + ".name, metadata: " + md + " }, null, " + cextra + ");")
+        leading.push(local + " = " + class_this + " = " + cdesc + ".value;")
+    tv = class_this
+    if tv == "":
+        tv = "this"
+    leading.push("if (" + md + ") Object.defineProperty(" + tv + ", Symbol.metadata, { enumerable: true, configurable: true, writable: true, value: " + md + " });")
+    trailing: [str] = []
+    for s in pend_static:
+        trailing.push(s + ";")
+    if class_dec:
+        need(&g, ED_RUN)
+        trailing.push("__runInitializers(" + class_this + ", " + cextra + ");")
+    if len(trailing) > 0 and not has_static_init:
+        for s in trailing:
+            leading.push(s)
+        trailing = []
+    if smode:
+        r = smode_class(&g, c, defs, leading, outs, synth, sstmts, trailing, local, class_this, heritage, set_name_of(c0, stmt, ctx, name_ctx), ctx, stmt)
+        ef = g.f
+        return r
+    if xmode:
+        r = xmode_class(&g, c, defs, leading, outs, synth, trailing, local, class_this, heritage, set_name_of(c0, stmt, ctx, name_ctx), ctx, stmt)
+        ef = g.f
+        return r
+    members: [str] = []
+    if class_this != "":
+        members.push("static { " + class_this + " = this; }")
+    # named evaluation: an anonymous class gets its name from where it's assigned
+    set_name = ""
+    if anon:
+        if stmt and ctx == 2:
+            set_name = "default"
+        elif name_ctx != "":
+            set_name = name_ctx
+        elif class_dec:
+            set_name = ""
+            need(&g, ED_SETNAME)
+            members.push("static { __setFunctionName(" + tv + ", \"\"); }")
+    if set_name != "":
+        need(&g, ED_SETNAME)
+        members.push("static { __setFunctionName(" + tv + ", \"" + set_name + "\"); }")
+    members.push("static {\n" + "\n".join(leading) + "\n}")
+    for o in outs:
+        if o != "":
+            members.push(o)
+    if synth != "":
+        members.push(synth)
+    if len(trailing) > 0:
+        members.push("static {\n" + "\n".join(trailing) + "\n}")
+    body = "{\n" + "\n".join(members) + "\n}"
+    if class_dec:
+        defs.push("var " + local + " = class" + heritage + " " + body + ";")
+        defs.push("return " + local + " = " + class_this + ";")
+    else:
+        nm2 = ""
+        if not anon:
+            nm2 = " " + c.name
+        defs.push("return class" + nm2 + heritage + " " + body + ";")
+    head: [str] = []
+    if len(g.temps) > 0:
+        head.push("var " + ", ".join(g.temps) + ";")
+    if g.outer_this != "":
+        head.push("let " + g.outer_this + " = this;")
+    for d in defs:
+        head.push(d)
+    iife = "(() => {\n" + "\n".join(head) + "\n})()"
+    ef = g.f
+    if not stmt:
+        return iife
+    if ctx == 2 and anon:
+        return "export default " + iife + ";"
+    r = "let " + c.name + " = " + iife + ";"
+    if ctx == 1:
+        r += "\nexport { " + c.name + " };"
+    elif ctx == 2:
+        r += "\nexport default " + c.name + ";"
+    return r
+
+fn anon_fn_like(e: str) bool:
+    t = e.trim()
+    while t.starts_with("(") and t.ends_with(")") and group_end(t, 0) == len(t) - 1:
+        t = t[1..len(t) - 1].trim()
+    if t.starts_with("class") and (len(t) == 5 or not is_id_byte(t.byte(5))):
+        r = t[5..].trim()
+        return r.starts_with("{") or r.starts_with("extends")
+    if t.starts_with("function") and (len(t) == 8 or not is_id_byte(t.byte(8))):
+        r = t[8..].trim()
+        if r.starts_with("*"):
+            r = r[1..].trim()
+        return r.starts_with("(")
+    if t.starts_with("async") and t.find("=>") > 0:
+        return true
+    if t.starts_with("(") and t.find("=>") > 0:
+        return true
+    return false
+
+fn method_out(m: DMember, st: str, name_out: str, params: str, body: str) str:
+    pre = st
+    if m.is_async:
+        pre += "async "
+    if m.kind == MK_GET:
+        pre += "get "
+    elif m.kind == MK_SET:
+        pre += "set "
+    if m.is_gen:
+        pre += "*"
+    return pre + name_out + params + " " + body
+
+# A field (tsc's visitPropertyDeclaration): its initializer through the decorators'
+# initializers, with the pending initializers of earlier members in front.
+fn field_out(g: mut DGen, m: DMember, st: str, name_out: str, initn: str, extran: str, class_this: str, csuper: str, pend_static: mut [str], pend_inst: mut [str], has_static_init: mut bool) str:
+    init = ""
+    if m.has_init:
+        init = esdec_frag(m.init, g.ids, &g.f, 3, field_eval_name(m))
+        if m.is_static and class_this != "":
+            init = sub_this_init(init, class_this, csuper)
+    if initn != "":
+        ta = "this"
+        if m.is_static and class_this != "":
+            ta = class_this
+        v = init
+        if v == "":
+            v = "void 0"
+        init = "__runInitializers(" + ta + ", " + initn + ", " + v + ")"
+    if m.is_static and init != "":
+        has_static_init = true
+    if m.is_static:
+        if len(pend_static) > 0:
+            xs = pend_static
+            if init != "":
+                xs.push(init)
+            init = comma(xs)
+            pend_static = []
+        if extran != "":
+            tv = class_this
+            if tv == "":
+                tv = "this"
+            pend_static.push("__runInitializers(" + tv + ", " + extran + ")")
+    else:
+        if len(pend_inst) > 0:
+            xs = pend_inst
+            if init != "":
+                xs.push(init)
+            init = comma(xs)
+            pend_inst = []
+        if extran != "":
+            pend_inst.push("__runInitializers(this, " + extran + ")")
+    g.last_init = init
+    acc = ""
+    if m.kind == MK_ACCESSOR:
+        acc = "accessor "
+    r = st + acc + name_out
+    if init != "":
+        r += " = " + init
+    return r + ";"
+
+# The constructor body with `text` after its directives and its `super(...)` call.
+fn ctor_inject(body: str, text: str) str:
+    p = new_p(body, false)
+    p.mute += 1
+    ed_next(&p)                                  # {
+    ed_next(&p)
+    at = p.ts
+    while p.tok == T_STR:
+        n = peek_tok(&p)
+        if not ((n.tok == T_OP and (n.op == 59 or n.op == 125)) or n.nlb):
+            break
+        ed_next(&p)
+        if p.tok == T_OP and p.op == 59:
+            ed_next(&p)
+        at = p.ts
+    # a top-level `super(...)` statement: after it
+    depth = 0
+    s = save(&p)
+    while p.tok != T_EOF:
+        if p.tok == T_OP and (p.op == 40 or p.op == 91 or p.op == 123):
+            skip_group(&p)
+            continue
+        if p.tok == T_OP and p.op == 125:
+            break
+        if p.tok == T_NAME and p.kw == K_SUPER:
+            n = peek_tok(&p)
+            if n.tok == T_OP and n.op == 40:
+                ed_next(&p)
+                skip_group(&p)
+                if p.tok == T_OP and p.op == 59:
+                    ed_next(&p)
+                at = p.pe
+                return body[..at] + " " + text + body[at..]
+        ed_next(&p)
+    restore(&p, s)
+    return body[..at] + text + " " + body[at..]
+
+fn has_this(s: str) bool:
+    k = s.find("this")
+    while k >= 0:
+        before = k == 0 or not is_id_byte(s.byte(k - 1))
+        after = k + 4 >= len(s) or not is_id_byte(s.byte(k + 4))
+        if before and after:
+            return true
+        k2 = s[k + 4..].find("this")
+        if k2 < 0:
+            return false
+        k = k + 4 + k2
+    return false
+
+# `this` (and `super.x`) in a static initializer or block of a decorated class: the class
+# through `_classThis` and `Reflect`. Temps the super rewrites need are added to `temps`.
+fn sub_this(text: str, class_this: str, csuper: str) str:
+    temps: [str] = []
+    return sub_this_t(text, class_this, csuper, &temps)
+
+# A static block's body with its temps declared at its start.
+fn sub_this_block(body: str, class_this: str, csuper: str) str:
+    temps: [str] = []
+    b = sub_this_t(body, class_this, csuper, &temps)
+    if len(temps) == 0:
+        return b
+    k = b.find("{")
+    return b[..k + 1] + " var " + ", ".join(temps) + ";" + b[k + 1..]
+
+# A static field's initializer: its temps in an arrow function around it.
+fn sub_this_init(init: str, class_this: str, csuper: str) str:
+    temps: [str] = []
+    t = sub_this_t(init, class_this, csuper, &temps)
+    if len(temps) == 0:
+        return t
+    return "(() => { var " + ", ".join(temps) + "; return " + t + "; })()"
+
+fn st_temp(temps: mut [str], text: str) str:
+    n = len(temps)
+    while true:
+        t = ""
+        if n < 26:
+            t = "_" + chr(97 + n)
+        else:
+            t = "_" + str(n - 26)
+        n += 1
+        if text.find(t) < 0:
+            temps.push(t)
+            return t
+    return ""
+
+fn sub_this_t(text: str, class_this: str, csuper: str, temps: mut [str]) str:
+    if not has_this(text) and (csuper == "" or text.find("super") < 0):
+        return text
+    p = new_p(text, false)
+    p.mute += 1
+    ed_next(&p)
+    out = ""
+    copied = 0
+    prev_end = 0                 # where the previous token ended (statement start test)
+    prev_stmt = true             # the previous token ends a statement (or there is none)
+    prev_inc = ""                # `++` / `--` just before
+    while p.tok != T_EOF:
+        if p.tok == T_NAME and (p.kw == K_FUNCTION or p.kw == K_CLASS):
+            # its own `this`: skip to the end of its body
+            ed_next(&p)
+            while p.tok != T_EOF and not (p.tok == T_OP and p.op == 123):
+                if p.tok == T_OP and (p.op == 40 or p.op == 91):
+                    skip_group(&p)
+                else:
+                    ed_next(&p)
+            skip_group(&p)
+            prev_stmt = false
+            prev_inc = ""
+            continue
+        if p.tok == T_OP and p.op == 40:
+            # an object literal's method `m() { }`: its own `this`
+            pe0 = p.pe
+            s = save(&p)
+            skip_group(&p)
+            if p.tok == T_OP and p.op == 123 and method_before(text, pe0):
+                skip_group(&p)
+                prev_stmt = false
+                prev_inc = ""
+                continue
+            restore(&p, s)
+            ed_next(&p)
+            prev_stmt = false
+            prev_inc = ""
+            continue
+        if p.tok == T_NAME and p.kw == K_THIS:
+            out += text[copied..p.ts] + class_this
+            copied = p.te
+        elif p.tok == T_NAME and p.kw == K_SUPER and csuper != "":
+            a = p.ts
+            if prev_inc != "":
+                a = a - 2
+                while a > 0 and text[a..a + 2] != prev_inc:
+                    a -= 1
+            stmt_start = prev_stmt and prev_inc == ""
+            ed_next(&p)
+            key = ""
+            if p.tok == T_OP and p.op == 46:
+                ed_next(&p)
+                key = "\"" + tok_text(&p) + "\""
+                ed_next(&p)
+            elif p.tok == T_OP and p.op == 91:
+                b = p.te
+                skip_group(&p)
+                key = sub_this_t(text[b..p.pe - 1].trim(), class_this, csuper, &temps)
+            else:
+                continue
+            get = "Reflect.get(" + csuper + ", " + key + ", " + class_this + ")"
+            simple = key.starts_with("\"") or key.starts_with("'") or (len(key) > 0 and key.byte(0) >= 48 and key.byte(0) <= 57)
+            if prev_inc != "":
+                k1 = key
+                k2 = key
+                if not simple:
+                    k2 = st_temp(&temps, text)
+                    k1 = k2 + " = " + key
+                v = st_temp(&temps, text)
+                out += text[copied..a] + "Reflect.set(" + csuper + ", " + k1 + ", (" + v + " = Reflect.get(" + csuper + ", " + k2 + ", " + class_this + "), " + prev_inc + v + "), " + class_this + ")"
+                copied = p.pe
+                prev_inc = ""
+                prev_stmt = false
+                continue
+            if p.tok == T_OP and p.op == 40:
+                out += text[copied..a] + get + ".call(" + class_this
+                ed_next(&p)
+                if not (p.tok == T_OP and p.op == 41):
+                    out += ", "
+                copied = p.ts
+                prev_stmt = false
+                continue
+            if p.tok == T_TPL or p.tok == T_TPL_HEAD:
+                out += text[copied..a] + get + ".bind(" + class_this + ") "
+                copied = p.ts
+                prev_stmt = false
+                continue
+            if p.tok == T_OP and (p.op == O_INC or p.op == O_DEC):
+                op = tok_text(&p)
+                ed_next(&p)
+                k1 = key
+                k2 = key
+                if not simple:
+                    k2 = st_temp(&temps, text)
+                    k1 = k2 + " = " + key
+                v = st_temp(&temps, text)
+                out += text[copied..a] + "Reflect.set(" + csuper + ", " + k1 + ", (" + v + " = Reflect.get(" + csuper + ", " + k2 + ", " + class_this + "), " + v + op + ", " + v + "), " + class_this + ")"
+                copied = p.pe
+                prev_stmt = false
+                continue
+            if p.tok == T_OP and (p.op == 61 or p.op == O_ASSIGN):
+                optext = tok_text(&p)
+                ed_next(&p)
+                vb = p.ts
+                ed_skip_expr(&p, false)
+                ve = p.pe
+                val = sub_this_t(text[vb..ve], class_this, csuper, &temps)
+                ends = p.tok == T_EOF or (p.tok == T_OP and (p.op == 59 or p.op == 125)) or p.nlb
+                k1 = key
+                if optext != "=":
+                    k2 = key
+                    if not simple:
+                        k2 = st_temp(&temps, text)
+                        k1 = k2 + " = " + key
+                    val = "Reflect.get(" + csuper + ", " + k2 + ", " + class_this + ") " + optext[..len(optext) - 1] + " " + val
+                if stmt_start and ends:
+                    out += text[copied..a] + "Reflect.set(" + csuper + ", " + k1 + ", " + val + ", " + class_this + ")"
+                else:
+                    t = st_temp(&temps, text)
+                    out += text[copied..a] + "(Reflect.set(" + csuper + ", " + k1 + ", " + t + " = " + val + ", " + class_this + "), " + t + ")"
+                copied = ve
+                prev_stmt = false
+                continue
+            if p.tok == T_OP and (p.op == 44 or p.op == 125 or p.op == 93) and in_pattern(text, a):
+                # a destructuring target: a setter object tsc makes for it
+                out += text[copied..a] + "({ set value(_a) { Reflect.set(" + csuper + ", " + key + ", _a, " + class_this + "); } }).value"
+                copied = p.pe
+                prev_stmt = false
+                continue
+            out += text[copied..a] + get
+            copied = p.pe
+            prev_stmt = false
+            continue
+        if p.tok == T_OP and (p.op == O_INC or p.op == O_DEC):
+            n = peek_tok(&p)
+            if n.tok == T_NAME and n.kw == K_SUPER and csuper != "":
+                prev_inc = tok_text(&p)
+                ed_next(&p)
+                continue
+        prev_stmt = p.tok == T_OP and (p.op == 59 or p.op == 123 or p.op == 125)
+        prev_inc = ""
+        ed_next(&p)
+    return out + text[copied..]
+
+# Is the `(` at `at` the parameter list of an object literal method (`{ m() {`, `, get x() {`)?
+fn method_before(s: str, at: int) bool:
+    k = at - 1
+    while k >= 0 and (s.byte(k) == 32 or s.byte(k) == 10 or s.byte(k) == 9 or s.byte(k) == 13):
+        k -= 1
+    if k < 0:
+        return false
+    e = k
+    if s.byte(k) == 93:
+        k = group_start(s, k) - 1
+    elif s.byte(k) == 34 or s.byte(k) == 39:
+        return false
+    else:
+        while k >= 0 and is_id_byte(s.byte(k)):
+            k -= 1
+        word = s[k + 1..e + 1]
+        if word == "if" or word == "for" or word == "while" or word == "switch" or word == "catch" or word == "with" or word == "function" or word == "" or word == "return":
+            return false
+    while k >= 0 and (s.byte(k) == 32 or s.byte(k) == 10 or s.byte(k) == 9 or s.byte(k) == 13 or s.byte(k) == 42):
+        k -= 1
+    if k < 0:
+        return false
+    c = s.byte(k)
+    if c == 123 or c == 44:
+        return true
+    # get / set / async before the name
+    e2 = k
+    while k >= 0 and is_id_byte(s.byte(k)):
+        k -= 1
+    w = s[k + 1..e2 + 1]
+    if w == "get" or w == "set" or w == "async" or w == "static":
+        while k >= 0 and (s.byte(k) == 32 or s.byte(k) == 10 or s.byte(k) == 9 or s.byte(k) == 13):
+            k -= 1
+        return k >= 0 and (s.byte(k) == 123 or s.byte(k) == 44)
+    return false
+
+# The identifiers of a source (tsc's generated names avoid all of them, types included).
+fn source_idents(src: str) {str: bool}:
+    ids: {str: bool} = {}
+    p = new_p(src, false)
+    p.mute += 1
+    next(&p)
+    while p.tok != T_EOF:
+        if p.tok == T_NAME:
+            ids[tok_text(&p)] = true
+        next(&p)
+    return ids
+
+# The helpers' definitions, in the order tsc writes them.
+fn esdec_helpers_text(hs: [str]) str:
+    t = ""
+    for h in hs:
+        if h == ED_RUN:
+            t += HELPER_RUN_INITIALIZERS + "\n"
+        elif h == ED_DECORATE:
+            t += HELPER_ES_DECORATE + "\n"
+    return t
+
+fn esdec_wants(hs: [str], h: str) bool:
+    for x in hs:
+        if x == h:
+            return true
+    return false
+
+# Did `a` come before `b`?
+fn esdec_first(hs: [str], a: str, b: str) bool:
+    for x in hs:
+        if x == a:
+            return true
+        if x == b:
+            return false
+    return false
+
+# An anonymous `export default class`: does tsc's TypeScript transform name it default_1 before
+# decorators run? Yes with a decorated member or an initialized static field.
+fn default_needs_name(c: DClass) bool:
+    for m in c.members:
+        if len(m.decos) > 0 or (m.is_static and m.kind == MK_FIELD and m.has_init):
+            return true
+    return false
+
+# What an anonymous class is named after (named evaluation), or "".
+fn set_name_of(c: DClass, stmt: bool, ctx: int, name_ctx: str) str:
+    if c.name != "":
+        return c.name
+    if stmt and ctx == 2:
+        return "default"
+    return name_ctx
+
+# A static field of a decorated declaration below ES2022, as a statement on the class.
+fn static_stmt(define: bool, ct: str, m: DMember, name_out: str, init: str) str:
+    key = ""
+    dot = ""
+    if m.nk == NK_IDENT:
+        key = "\"" + m.name + "\""
+        dot = "." + m.name
+    elif m.nk == NK_STR:
+        key = m.name
+        dot = "[" + m.name + "]"
+    elif m.nk == NK_NUM:
+        key = m.name
+        dot = "[" + m.name + "]"
+    else:
+        key = name_out[1..len(name_out) - 1]
+        dot = name_out
+    if define:
+        return "Object.defineProperty(" + ct + ", " + key + ", { enumerable: true, configurable: true, writable: true, value: " + init + " });"
+    return ct + dot + " = " + init + ";"
+
+# Does the class use #private names (a member, or one in its code)?
+fn class_uses_private(c: DClass) bool:
+    for m in c.members:
+        if m.nk == NK_PRIV or has_private_ref(m.body) or has_private_ref(m.init) or has_private_ref(m.params):
+            return true
+    return false
+
+# smode_class for a class with #private names: its statics stay in it, in tsc's order, and the
+# class-fields pass (class.tn, esdec_this) writes them as the statements after it.
+fn xmode_class(g: mut DGen, c: DClass, defs: [str], leading: [str], outs: [str], synth: str, trailing: [str], local: str, ct: str, heritage: str, set_name: str, ctx: int, stmt: bool) str:
+    need(&g, ED_SETNAME)
+    members: [str] = ["static { __setFunctionName(" + ct + ", \"" + set_name + "\"); }"]
+    members.push("static {\n" + "\n".join(leading) + "\n}")
+    for o in outs:
+        if o != "":
+            members.push(o)
+    if synth != "":
+        members.push(synth)
+    if len(trailing) > 0:
+        members.push("static {\n" + "\n".join(trailing) + "\n}")
+    ds = defs
+    ds.push("var " + local + " = " + ct + " = class" + heritage + " {\n" + "\n".join(members) + "\n};")
+    ds.push("return " + local + " = " + ct + ";")
+    head: [str] = []
+    if len(g.temps) > 0:
+        head.push("var " + ", ".join(g.temps) + ";")
+    if g.outer_this != "":
+        head.push("let " + g.outer_this + " = this;")
+    for d in ds:
+        head.push(d)
+    iife = "(() => {\n" + "\n".join(head) + "\n})()"
+    if not stmt:
+        return iife
+    if ctx == 2 and c.name == "":
+        return "export default " + iife + ";"
+    nm = c.name
+    if nm == "":
+        nm = local
+    r = "let " + nm + " = " + iife + ";"
+    if ctx == 1:
+        r += "\nexport { " + nm + " };"
+    elif ctx == 2:
+        r += "\nexport default " + nm + ";"
+    return r
+
+# A decorated class declaration below ES2022: `var C = _classThis = class { ... };` and its
+# statics as statements after it.
+fn smode_class(g: mut DGen, c: DClass, defs: [str], leading: [str], outs: [str], synth: str, sstmts: [str], trailing: [str], local: str, ct: str, heritage: str, set_name: str, ctx: int, stmt: bool) str:
+    members: [str] = []
+    for o in outs:
+        if o != "":
+            members.push(o)
+    if synth != "":
+        members.push(synth)
+    body = "{\n" + "\n".join(members) + "\n}"
+    ds = defs
+    ds.push("var " + local + " = " + ct + " = class" + heritage + " " + body + ";")
+    need(&g, ED_SETNAME)
+    ds.push("__setFunctionName(" + ct + ", \"" + set_name + "\");")
+    ds.push("(() => {\n" + "\n".join(leading) + "\n})();")
+    for s in sstmts:
+        ds.push(s)
+    if len(trailing) > 0:
+        ds.push("(() => {\n" + "\n".join(trailing) + "\n})();")
+    ds.push("return " + local + " = " + ct + ";")
+    head: [str] = []
+    if len(g.temps) > 0:
+        head.push("var " + ", ".join(g.temps) + ";")
+    if g.outer_this != "":
+        head.push("let " + g.outer_this + " = this;")
+    for d in ds:
+        head.push(d)
+    iife = "(() => {\n" + "\n".join(head) + "\n})()"
+    if not stmt:
+        return iife
+    if ctx == 2 and c.name == "":
+        return "export default " + iife + ";"
+    nm = c.name
+    if nm == "":
+        nm = local
+    r = "let " + nm + " = " + iife + ";"
+    if ctx == 1:
+        r += "\nexport { " + nm + " };"
+    elif ctx == 2:
+        r += "\nexport default " + nm + ";"
+    return r
+
+# The name an anonymous class expression at `at` gets by named evaluation (tsc's isNamedEvaluation):
+# `x = class`, `{ x: class }`, `[x = class] = o`, `#x = class`, `export default (class)`; else "".
+fn ed_context_name(src: str, at: int) str:
+    k = ed_back_space(src, at)
+    while k >= 0 and src.byte(k) == 40:          # (
+        k = ed_back_space(src, k)
+    if k < 0:
+        return ""
+    c = src.byte(k)
+    if c == 61:                                  # =, &&=, ||=, ??=
+        j = k
+        if k >= 2 and (src[k - 2..k + 1] == "&&=" or src[k - 2..k + 1] == "||=" or src[k - 2..k + 1] == "??="):
+            j = k - 2
+        elif k > 0:
+            d = src.byte(k - 1)
+            if d == 61 or d == 33 or d == 60 or d == 62 or d == 43 or d == 45 or d == 42 or d == 47 or d == 37 or d == 38 or d == 124 or d == 94 or d == 63:
+                return ""
+        e = ed_back_space(src, j)
+        if e < 0:
+            return ""
+        lit = key_before(src, e)
+        if lit != "":
+            return lit
+        name = ed_back_ident(src, e)
+        priv = false
+        if name != "" and e - len(name) >= 0 and src.byte(e - len(name)) == 35:
+            priv = true
+        if name == "":
+            return ""
+        before = ed_back_space(src, e - len(name) + 1 - (1 if priv else 0))
+        if before >= 0:
+            b = src.byte(before)
+            if b == 46 or b == 63:               # a.b = ..., a?.b
+                return ""
+        if priv:
+            return "#" + name
+        return name
+    if c == 58:                                  # `{ b: class` / `, b: class`
+        e = ed_back_space(src, k)
+        if e < 0:
+            return ""
+        name = ""
+        start = e
+        q = src.byte(e)
+        computed = q == 93
+        if q == 34 or q == 39 or q == 93 or (q >= 48 and q <= 57):
+            name = key_before(src, e)
+            if name == "":
+                return ""
+            start = key_start(src, e)
+        else:
+            name = ed_back_ident(src, e)
+            if name == "":
+                return ""
+            start = e - len(name) + 1
+        if name == "__proto__" and not computed:
+            return ""                            # (a __proto__ setter, not a property)
+        before = ed_back_space(src, start)
+        if before >= 0 and (src.byte(before) == 123 or src.byte(before) == 44):
+            return name
+        return ""
+    if c == 116 and k >= 6 and src[k - 6..k + 1] == "default" and at > k:
+        # `export default (class ...)`: only through parentheses (else it's a declaration)
+        e = ed_back_space(src, k - 6)
+        if e >= 5 and src[e - 5..e + 1] == "export" and src[k + 1..at].find("(") >= 0:
+            return "default"
+    return ""
+
+# The name a class assigned to field `m` gets (named evaluation), or "".
+fn field_eval_name(m: DMember) str:
+    if m.nk == NK_IDENT or m.nk == NK_PRIV or m.nk == NK_NUM:
+        return m.name
+    if m.nk == NK_STR:
+        return m.name[1..len(m.name) - 1]
+    k = m.key
+    if k.starts_with("\"") or k.starts_with("'"):
+        return k[1..len(k) - 1]
+    if is_literal_text(k):
+        return k
+    return ""
+
+# A literal key ending at `e`: "x" / 'x' / 0 / ["x"] / [0], as the name it gives ("" if not one).
+fn key_before(src: str, e: int) str:
+    q = src.byte(e)
+    if q == 93:
+        a = e - 1
+        depth = 1
+        while a >= 0 and depth > 0:
+            if src.byte(a) == 93:
+                depth += 1
+            elif src.byte(a) == 91:
+                depth -= 1
+            a -= 1
+        inner = src[a + 2..e].trim()
+        if inner.starts_with("\"") or inner.starts_with("'"):
+            return inner[1..len(inner) - 1]
+        if len(inner) > 0 and inner.byte(0) >= 48 and inner.byte(0) <= 57 and is_literal_text(inner):
+            return inner
+        return ""
+    if q == 34 or q == 39:
+        st = e - 1
+        while st >= 0 and src.byte(st) != q:
+            st -= 1
+        if st < 0:
+            return ""
+        return src[st + 1..e]
+    if q >= 48 and q <= 57:
+        st = e
+        while st >= 0 and (is_id_byte(src.byte(st)) or src.byte(st) == 46):
+            st -= 1
+        t = src[st + 1..e + 1]
+        if len(t) > 0 and t.byte(0) >= 48 and t.byte(0) <= 57:
+            return t
+    return ""
+
+fn key_start(src: str, e: int) int:
+    q = src.byte(e)
+    if q == 93:
+        a = e - 1
+        depth = 1
+        while a >= 0 and depth > 0:
+            if src.byte(a) == 93:
+                depth += 1
+            elif src.byte(a) == 91:
+                depth -= 1
+            a -= 1
+        return a + 1
+    if q == 34 or q == 39:
+        st = e - 1
+        while st >= 0 and src.byte(st) != q:
+            st -= 1
+        return st
+    st = e
+    while st >= 0 and (is_id_byte(src.byte(st)) or src.byte(st) == 46):
+        st -= 1
+    return st + 1
+
+# Is position `at` an element of a destructuring pattern (`({ x: HERE } = o)`, `[HERE] = a`)?
+fn in_pattern(s: str, at: int) bool:
+    k = at
+    for depth in 0..4:
+        o = group_start_open(s, k)
+        if o < 0:
+            return false
+        c = s.byte(o)
+        if c != 123 and c != 91:
+            return false
+        e = group_end(s, o)
+        if e < 0:
+            return false
+        j = e + 1
+        while j < len(s) and (s.byte(j) == 32 or s.byte(j) == 9 or s.byte(j) == 10 or s.byte(j) == 13):
+            j += 1
+        if j < len(s) and s.byte(j) == 61 and (j + 1 >= len(s) or (s.byte(j + 1) != 61 and s.byte(j + 1) != 62)):
+            return true
+        if j < len(s) and (s.byte(j) == 44 or s.byte(j) == 125 or s.byte(j) == 93):
+            k = o
+            continue
+        return false
+    return false
+
+# The unmatched opening bracket before `at`, or -1.
+fn group_start_open(s: str, at: int) int:
+    depth = 0
+    k = at - 1
+    while k >= 0:
+        c = s.byte(k)
+        if c == 41 or c == 93 or c == 125:
+            depth += 1
+        elif c == 40 or c == 91 or c == 123:
+            if depth == 0:
+                return k
+            depth -= 1
+        k -= 1
+    return -1
+
+# (The rewrite scans tokens itself rather than calling the parser's expression functions,
+# to keep those hot functions unchanged.)
+
+# Past a template literal at its head (`...${`).
+fn ed_skip_template(p: mut P):
+    ed_next(&p)
+    while p.tok != T_EOF:
+        if p.tok == T_OP and (p.op == 40 or p.op == 91 or p.op == 123):
+            skip_group(&p)
+        elif p.tok == T_OP and p.op == 125:
+            rescan_tpl(&p)
+            if p.tok == T_TPL:
+                ed_next(&p)
+                return
+            ed_next(&p)
+        elif p.tok == T_TPL_HEAD:
+            ed_skip_template(&p)
+        else:
+            ed_next(&p)
+
+# Past an `extends` expression, to the class body's "{".
+fn ed_skip_heritage(p: mut P):
+    while p.tok != T_EOF and not (p.tok == T_OP and p.op == 123):
+        if p.tok == T_OP and (p.op == 40 or p.op == 91):
+            skip_group(&p)
+        elif p.tok == T_NAME and p.kw == K_CLASS:
+            ed_next(&p)                          # extends class { }: past its body
+            while p.tok != T_EOF and not (p.tok == T_OP and p.op == 123):
+                if p.tok == T_OP and (p.op == 40 or p.op == 91):
+                    skip_group(&p)
+                else:
+                    ed_next(&p)
+            skip_group(&p)
+        elif p.tok == T_TPL_HEAD:
+            ed_skip_template(&p)
+        else:
+            ed_next(&p)
+
+# Past an expression: to a `;`, `,` (unless `commas`), ")" "]" "}" of the code around it, or
+# a line break where the expression can't go on (a class field's end by ASI).
+fn ed_skip_expr(p: mut P, commas: bool):
+    first = true
+    while p.tok != T_EOF:
+        if p.tok == T_OP:
+            o = p.op
+            if o == 59 or o == 41 or o == 93 or o == 125 or (o == 44 and not commas):
+                return
+            if not first and p.nlb and ed_ends_line(&p):
+                return
+            if o == 40 or o == 91 or o == 123:
+                skip_group(&p)
+                first = false
+                continue
+        elif not first and p.nlb and ed_ends_line(&p):
+            return
+        if p.tok == T_TPL_HEAD:
+            ed_skip_template(&p)
+            first = false
+            continue
+        if p.tok == T_NAME and (p.kw == K_CLASS or p.kw == K_FUNCTION):
+            ed_next(&p)
+            while p.tok != T_EOF and not (p.tok == T_OP and p.op == 123):
+                if p.tok == T_OP and (p.op == 40 or p.op == 91):
+                    skip_group(&p)
+                else:
+                    ed_next(&p)
+            skip_group(&p)
+            first = false
+            continue
+        ed_next(&p)
+        first = false
+
+# At a token after a line break: does it start something new (a class member), so the
+# expression before ended (ASI)?
+fn ed_ends_line(p: mut P) bool:
+    pk = p.src.byte(p.pe - 1)
+    # the line before ended in an operator: the expression goes on
+    if pk == 43 or pk == 45 or pk == 42 or pk == 47 or pk == 37 or pk == 61 or pk == 38 or pk == 124 or pk == 94 or pk == 33 or pk == 63 or pk == 58 or pk == 44 or pk == 60 or pk == 62 or pk == 126 or pk == 40 or pk == 91 or pk == 123 or pk == 46:
+        return false
+    if p.tok == T_NAME:
+        k = p.kw
+        return not (k == K_IN or k == K_INSTANCEOF or k == K_AS or k == K_SATISFIES)
+    if p.tok == T_PRIV or p.tok == T_STR or p.tok == T_NUM:
+        return true
+    return p.tok == T_OP and (p.op == 64 or p.op == 91 or p.op == 42)
+
+fn ed_back_space(src: str, at: int) int:
+    k = at - 1
+    while k >= 0:
+        c = src.byte(k)
+        if c != 32 and c != 9 and c != 10 and c != 13:
+            return k
+        k -= 1
+    return -1
+
+fn ed_back_ident(src: str, e: int) str:
+    if e < 0:
+        return ""
+    k = e
+    while k >= 0 and is_id_byte(src.byte(k)):
+        k -= 1
+    if k == e or (src.byte(k + 1) >= 48 and src.byte(k + 1) <= 57):
+        return ""
+    return src[k + 1..e + 1]

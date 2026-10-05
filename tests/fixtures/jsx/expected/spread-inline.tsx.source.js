@@ -1,0 +1,10 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.C = exports.B = exports.A = void 0;
+const jsx_runtime_1 = require("preact/jsx-runtime");
+const A = (a, b, c) => (0, jsx_runtime_1.jsx)("div", { className: "x", ...a, ...b, ...{ c } });
+exports.A = A;
+const B = (a) => (0, jsx_runtime_1.jsx)("div", { ...{ __proto__: null, dir: "rtl" }, ...a });
+exports.B = B;
+const C = (p) => (0, jsx_runtime_1.jsx)("div", { [p]: 1 });
+exports.C = C;

@@ -1,0 +1,1141 @@
+# JSX in .tsx files, as tsc emits it: react-jsx, react-jsxdev, classic (React.createElement) or preserve.
+# Expressions and component names go through the normal parser, so types are removed there too.
+
+const JSX_PRESERVE = 1
+const JSX_REACT = 2
+const JSX_AUTO = 3      # react-jsx
+const JSX_DEV = 4       # react-jsxdev
+
+struct JsxKid:
+    text: str           # the child as an expression, "" when it produces nothing
+    semantic: bool      # counts for jsx/jsxs (whitespace-only text with a newline doesn't)
+    spread: bool        # {...xs}
+    nl: bool            # starts on a new line in the source
+
+# At "<" where an expression starts, in a .tsx file.
+fn jsx_expr(p: mut P):
+    a = p.ts
+    emit_to(&p, a)
+    if not p.jsx_seen and (p.jsx == JSX_AUTO or p.jsx == JSX_DEV):
+        p.is_module = true              # tsc: a file with a JSX tag is a module (moduleDetection auto)
+    if not p.jsx_seen:
+        # tsc counts the factory's namespace (React) as used by any JSX unless the JSX runtime has types
+        p.jsx_seen = true
+        if not ((p.jsx == JSX_AUTO or p.jsx == JSX_DEV) and (p.file in p.project.jsx_typed)):
+            jsx_factory(&p)
+    if p.jsx == JSX_PRESERVE:
+        jsx_copy(&p, a)
+    else:
+        loc = p.pe
+        t = jsx_node(&p, a, loc)
+        end = p.jsx_end
+        skip_to(&p, end)
+        put(&p, t)
+    e = p.jsx_end
+    jsx_resume(&p, e)
+
+# Continue lexing after the JSX that ends at `end`.
+fn jsx_resume(p: mut P, end: int):
+    p.pos = end
+    p.te = end
+    next(&p)
+
+fn jsx_at(p: mut P, i: int) int:
+    if i < p.n:
+        return p.src.byte(i)
+    return 0
+
+# Skip whitespace and comments (between attributes).
+fn jsx_ws(p: mut P, i: int) int:
+    j = i
+    while j < p.n:
+        c = p.src.byte(j)
+        if c == 32 or c == 9 or c == 10 or c == 13:
+            j += 1
+        elif c == 47 and jsx_at(&p, j + 1) == 47:
+            while j < p.n and p.src.byte(j) != 10:
+                j += 1
+        elif c == 47 and jsx_at(&p, j + 1) == 42:
+            k = p.src.find_from("*/", j + 2)
+            if k < 0:
+                return p.n
+            j = k + 2
+        else:
+            return j
+    return j
+
+fn has_nl(s: str, a: int, b: int) bool:
+    for k in a..b:
+        if s.byte(k) == 10:
+            return true
+    return false
+
+# A JSX name: letters, digits, "-", with ":" (namespace, whitespace allowed around it) or "." (members).
+fn jsx_name_end(p: mut P, i: int) int:
+    j = i
+    while j < p.n:
+        c = p.src.byte(j)
+        if is_id(c) or c == 45 or c == 58 or c == 46:
+            j += 1
+        else:
+            break
+    if j > i and j < p.n and (p.src.byte(j) == 32 or p.src.byte(j) == 9 or p.src.byte(j) == 10 or p.src.byte(j) == 13):
+        k = jsx_ws(&p, j)
+        if not p.src[i..j].contains(":"):        # A . B . C (a member name, whitespace around dots)
+            if k < p.n and p.src.byte(k) == 46:
+                k2 = jsx_ws(&p, k + 1)
+                if k2 < p.n and is_id_start(p.src.byte(k2)):
+                    return jsx_name_end(&p, k2)
+            if p.src.byte(j - 1) == 46 and k < p.n and is_id_start(p.src.byte(k)):
+                return jsx_name_end(&p, k)
+        if k < p.n and p.src.byte(k) == 58 and not p.src[i..j].contains(":"):
+            k = jsx_ws(&p, k + 1)
+            if k < p.n and is_id_start(p.src.byte(k)):
+                return jsx_name_end(&p, k)
+    return j
+
+# The name at [a, b) as tsc writes it (without whitespace around a namespace's ":").
+fn jsx_name_text(p: mut P, a: int, b: int) str:
+    t = p.src[a..b]
+    if not (t.contains(" ") or t.contains("\t") or t.contains("\n") or t.contains("\r")):
+        return t
+    out = ""
+    for k in 0..len(t):
+        c = t.byte(k)
+        if not (c == 32 or c == 9 or c == 10 or c == 13):
+            out += t[k..k + 1]
+    return out
+
+# jsx: preserve: a name with whitespace in it, written without (as tsc does).
+fn jsx_copy_name(p: mut P, a: int, b: int):
+    t = jsx_name_text(&p, a, b)
+    if len(t) != b - a:
+        emit_to(&p, a)
+        put(&p, t)
+        skip_to(&p, b)
+
+# <tag attrs>children</tag>, <tag />, <>children</>. `loc` is where tsc's node starts (react-jsxdev reports it).
+fn jsx_node(p: mut P, a: int, loc: int) str:
+    i = jsx_ws(&p, a + 1)
+    if jsx_at(&p, i) == 62:                      # fragment
+        kids = jsx_children(&p, i + 1)
+        return jsx_fragment(&p, kids, loc)
+    e = jsx_name_end(&p, i)
+    name = jsx_name_text(&p, i, e)
+    tag = jsx_tag(&p, i, e)
+    j = jsx_ws(&p, e)
+    if jsx_at(&p, j) == 60:                      # <Comp<T> ...>: type arguments
+        jsx_resume(&p, j)
+        p.bad = false
+        p.mute += 1
+        skip_type_args(&p)
+        p.mute -= 1
+        j = p.ts
+    props: [str] = []
+    prop_nl: [bool] = []
+    all_props: [str] = []        # with the key where it was (createElement keeps it)
+    all_nl: [bool] = []
+    nattrs = 0
+    key = ""
+    has_key = false
+    key_after_spread = false
+    spread = false
+    self_close = false
+    auto = p.jsx == JSX_AUTO or p.jsx == JSX_DEV
+    events_base = len(p.jsx_events)
+    while p.err == "":
+        k = jsx_ws(&p, j)
+        nl = has_nl(p.src, j, k)
+        j = k
+        c = jsx_at(&p, j)
+        if c == 47:
+            j = jsx_ws(&p, j + 1)
+            if jsx_at(&p, j) != 62:
+                jsx_fail(&p, j, "expected '>' after '/' in JSX")
+                return ""
+            self_close = true
+            j += 1
+            break
+        if c == 62:
+            j += 1
+            break
+        if c == 123:                             # {...props}
+            v = jsx_brace(&p, j)
+            j = p.jsx_brace_end
+            nattrs += 1
+            if p.jsx_inline != "":
+                if p.jsx_inline != "{}":
+                    for item0 in top_split(p.jsx_inline, 44):   # (each member a prop: a spread
+                        item = item0.trim()                    # among them an Object.assign
+                        if item == "":                         # argument below ES2018)
+                            continue
+                        props.push(item)
+                        prop_nl.push(nl)
+                        all_props.push(item)
+                        all_nl.push(nl)
+                if p.jsx_inline.contains("..."):
+                    spread = true
+            else:
+                props.push("..." + v)
+                prop_nl.push(nl)
+                all_props.push("..." + v)
+                all_nl.push(nl)
+                spread = true
+            continue
+        if c == 0:
+            jsx_fail(&p, j, "unterminated JSX element")
+            return ""
+        ne = jsx_name_end(&p, j)
+        if ne == j:
+            jsx_fail(&p, j, f"unexpected '{chr(c)}' in a JSX element")
+            return ""
+        aname = jsx_name_text(&p, j, ne)
+        j = jsx_ws(&p, ne)
+        value = "true"
+        if jsx_at(&p, j) == 61:
+            eq = j
+            j = jsx_ws(&p, j + 1)
+            q = jsx_at(&p, j)
+            if q == 34 or q == 39:
+                close = p.src.find_from(chr(q), j + 1)
+                if close < 0:
+                    jsx_fail(&p, j, "unterminated string in JSX")
+                    return ""
+                value = js_string(jsx_decode(p.src[j + 1..close]))
+                j = close + 1
+            elif q == 123:
+                value = jsx_brace(&p, j)
+                j = p.jsx_brace_end
+                if value == "":
+                    value = "true"
+            elif q == 60:
+                value = jsx_node(&p, j, eq + 1)
+                j = p.jsx_end
+            else:
+                jsx_fail(&p, j, "expected a JSX attribute value")
+                return ""
+        all_props.push(jsx_prop_name(aname) + ": " + value)
+        all_nl.push(nl)
+        if auto and aname == "key" and not has_key:
+            has_key = true
+            key = value
+            key_after_spread = spread
+            continue
+        props.push(jsx_prop_name(aname) + ": " + value)
+        prop_nl.push(nl)
+        nattrs += 1
+    # tsc converts the children before the attributes: their runtime names come first
+    attr_events: [str] = []
+    for k in events_base..len(p.jsx_events):
+        attr_events.push(p.jsx_events[k])
+    while len(p.jsx_events) > events_base:
+        p.jsx_events.pop()
+    kids: [JsxKid] = []
+    has_kids = false
+    kids_base = len(p.jsx_events)
+    if not self_close:
+        kids = jsx_children(&p, j)
+        has_kids = len(kids) > 0
+        if not jsx_closing_ok(&p, name):
+            return ""
+    else:
+        p.jsx_end = j
+    end = p.jsx_end
+    if auto and has_key and key_after_spread:
+        # a key after {...props} needs createElement; tsc requests it after the attributes, before the children
+        kid_events: [str] = []
+        for k in kids_base..len(p.jsx_events):
+            kid_events.push(p.jsx_events[k])
+        while len(p.jsx_events) > kids_base:
+            p.jsx_events.pop()
+        for ev in attr_events:
+            p.jsx_events.push(ev)
+        callee = jsx_runtime_name(&p, "createElement")
+        for ev in kid_events:
+            p.jsx_events.push(ev)
+        t = jsx_classic_call(&p, callee, true, tag, all_props, all_nl, kids)
+        p.jsx_end = end
+        return t
+    if not auto:
+        t = jsx_classic_call(&p, jsx_factory(&p), false, tag, props, prop_nl, kids)
+        p.jsx_end = end
+        return t
+    for ev in attr_events:
+        p.jsx_events.push(ev)
+    children = ""
+    if has_kids:
+        children = jsx_children_prop(&p, kids)
+    obj = ""
+    if nattrs > 0:
+        if children != "":
+            props.push(children)
+            prop_nl.push(false)
+        obj = jsx_props(&p, props, prop_nl)
+    elif children != "":
+        obj = "{ " + children + " }"
+    else:
+        obj = "{}"
+    t = jsx_auto_call(&p, tag, obj, has_key, key, kids, loc)
+    p.jsx_end = end
+    return t
+
+fn jsx_fail(p: mut P, at: int, msg: str):
+    p.ts = at
+    fail(&p, msg)
+    p.jsx_end = p.n
+
+# At the "</" after the children: `</name>`.
+fn jsx_closing_ok(p: mut P, name: str) bool:
+    i = jsx_after_slash(&p)
+    e = jsx_name_end(&p, i)
+    if jsx_name_text(&p, i, e) != name:
+        jsx_fail(&p, i, f"expected '</{name}>' to close the JSX element")
+        return false
+    i = jsx_ws(&p, e)
+    if jsx_at(&p, i) != 62:
+        jsx_fail(&p, i, "expected '>' in a JSX closing tag")
+        return false
+    p.jsx_end = i + 1
+    return true
+
+# jsx_end is at the "<" of a closing tag: where its name starts.
+fn jsx_after_slash(p: mut P) int:
+    slash = jsx_ws(&p, p.jsx_end + 1)
+    return jsx_ws(&p, slash + 1)
+
+# The tag of an element: "div" for intrinsic names, else the expression (Foo, a.b).
+fn jsx_tag(p: mut P, a: int, b: int) str:
+    name = jsx_name_text(&p, a, b)
+    c = name.byte(0)
+    if (c >= 97 and c <= 122 and not name.contains(".")) or name.contains("-") or name.contains(":"):
+        return js_string(name)
+    jsx_resume(&p, a)
+    skip_to(&p, a)
+    saved = begin_capture(&p)
+    if at_kw(&p, K_THIS):
+        next(&p)
+    else:
+        ref(&p)
+    while at_op(&p, 46) and p.ts < b:
+        next(&p)
+        next(&p)
+    emit_to(&p, b)
+    return end_capture(&p, saved)
+
+# An attribute name: an identifier, or a quoted string ("data-x", "xlink:href").
+fn jsx_prop_name(name: str) str:
+    c = name.byte(0)
+    ok = (c >= 97 and c <= 122) or (c >= 65 and c <= 90) or c == 95
+    for k in 1..len(name):
+        d = name.byte(k)
+        if not ((d >= 97 and d <= 122) or (d >= 65 and d <= 90) or (d >= 48 and d <= 57) or d == 95):
+            ok = false
+    if ok:
+        return name
+    return js_string(name)
+
+# `{expr}` at `open`: its JS ("" for `{}` or a comment). Sets jsx_brace_end, jsx_spread, and jsx_inline for `{...{a: 1}}`.
+fn jsx_brace(p: mut P, open: int) str:
+    jsx_resume(&p, open + 1)
+    p.jsx_spread = false
+    p.jsx_inline = ""
+    if at_op(&p, 125):
+        p.jsx_brace_end = p.te
+        return ""
+    spread = false
+    inline = false
+    if at_op(&p, O_DOTS):
+        spread = true
+        next(&p)
+        inline = at_op(&p, 123) and object_spread_alone(&p)
+    here = p.ts
+    skip_to(&p, here)
+    saved = begin_capture(&p)
+    p.keep_spread = inline                       # {...{ ...a, b }}: its members are inlined
+    assign(&p, false)
+    p.keep_spread = false
+    emit_pe(&p)
+    t = trimmed_capture(&p, saved)
+    if not at_op(&p, 125):
+        fail(&p, "expected '}' in JSX")
+    p.jsx_brace_end = p.te
+    p.jsx_spread = spread
+    p.jsx_inline = ""
+    if inline:
+        p.jsx_inline = t[1..len(t) - 1].trim()
+        if p.jsx_inline == "":
+            p.jsx_inline = "{}"
+        elif sets_proto(p.jsx_inline):
+            p.jsx_inline = ""                    # (`__proto__: v` sets the prototype: kept whole)
+        elif p.jsx_inline.ends_with(","):
+            p.jsx_inline = p.jsx_inline[..len(p.jsx_inline) - 1]
+    return t
+
+# Does an object literal have a `__proto__: v` member (the prototype setter)?
+fn sets_proto(members: str) bool:
+    for m0 in top_split(members, 44):
+        m = m0.trim()
+        for k in ["__proto__", "\"__proto__\"", "'__proto__'"]:
+            if m.starts_with(k) and m[len(k)..].trim().starts_with(":"):
+                return true
+    return false
+
+# At "{" after "..." in a JSX attribute: is the object literal the whole expression?
+fn object_spread_alone(p: mut P) bool:
+    s = save(&p)
+    p.mute += 1
+    skip_group(&p)
+    r = at_op(&p, 125)
+    p.mute -= 1
+    restore(&p, s)
+    p.bad = false
+    return r
+
+# Children from `i` up to the "</" of the closing tag (left at jsx_end).
+fn jsx_children(p: mut P, i: int) [JsxKid]:
+    kids: [JsxKid] = []
+    j = i
+    while p.err == "":
+        k = j
+        while k < p.n and p.src.byte(k) != 60 and p.src.byte(k) != 123:
+            k += 1
+        if k > j:
+            raw = p.src[j..k]
+            text = jsx_text(raw)
+            lit = ""
+            if text != "" or not jsx_blank(raw):
+                lit = js_string(text)
+            kids.push(JsxKid(lit, not (jsx_blank(raw) and has_nl(raw, 0, len(raw))), false, has_nl(raw, 0, first_non_blank(raw))))
+        if k >= p.n:
+            jsx_fail(&p, k, "unterminated JSX element")
+            return kids
+        nl = kids_nl(&p, j, k)
+        if p.src.byte(k) == 123:
+            t = jsx_brace(&p, k)
+            kids.push(JsxKid(t, t != "", p.jsx_spread, nl))
+            j = p.jsx_brace_end
+            continue
+        n = jsx_ws(&p, k + 1)
+        if jsx_at(&p, n) == 47:
+            p.jsx_end = k
+            return kids
+        t = jsx_node(&p, k, k)
+        kids.push(JsxKid(t, true, false, nl))
+        j = p.jsx_end
+    return kids
+
+fn kids_nl(p: mut P, j: int, k: int) bool:
+    return has_nl(p.src, j, k)
+
+fn first_non_blank(s: str) int:
+    for k in 0..len(s):
+        c = s.byte(k)
+        if c != 32 and c != 9 and c != 10 and c != 13:
+            return k
+    return len(s)
+
+fn jsx_blank(s: str) bool:
+    return first_non_blank(s) == len(s)
+
+# JSX text as tsc reads it: each line trimmed (the first keeps its start, the last its
+# end), blank lines dropped, the rest joined with spaces; entities decoded.
+fn jsx_text(s: str) str:
+    acc = ""
+    have = false
+    first = 0
+    last = -1
+    for i in 0..len(s):
+        c = s.byte(i)
+        if c == 10 or c == 13:
+            if first != -1 and last != -1:
+                acc = jsx_add_line(acc, have, s[first..last + 1])
+                have = true
+            first = -1
+        elif c != 32 and c != 9:
+            last = i
+            if first == -1:
+                first = i
+    if first != -1:
+        acc = jsx_add_line(acc, have, s[first..])
+    return acc
+
+fn jsx_add_line(acc: str, have: bool, line: str) str:
+    d = jsx_decode(line)
+    if have:
+        return acc + " " + d
+    return d
+
+# &amp; &#123; &#x1F600; -> the characters (unknown names stay as written).
+fn jsx_decode(s: str) str:
+    if s.find("&") < 0:
+        return s
+    out = ""
+    i = 0
+    while i < len(s):
+        c = s.byte(i)
+        if c == 38:
+            semi = i + 1
+            while semi < len(s) and (is_id(s.byte(semi)) or s.byte(semi) == 35) and s.byte(semi) != 36:
+                semi += 1
+            if semi < len(s) and s.byte(semi) == 59 and semi > i + 1:
+                cp = entity_code(s[i + 1..semi])
+                if cp >= 0:
+                    out += utf8_of(cp)
+                    i = semi + 1
+                    continue
+        out += s[i]
+        i += 1
+    return out
+
+fn entity_code(name: str) int:
+    if name.byte(0) == 35:
+        if len(name) > 1 and (name.byte(1) == 120) and len(name) > 2:
+            return entity_hex(name[2..])
+        return dec_value(name[1..])
+    k = JSX_ENTITIES.find("," + name + ":")
+    if k < 0:
+        return -1
+    return dec_value_prefix(JSX_ENTITIES, k + len(name) + 2)
+
+fn dec_value(s: str) int:
+    if len(s) == 0:
+        return -1
+    v = 0
+    for k in 0..len(s):
+        c = s.byte(k)
+        if not is_digit(c):
+            return -1
+        v = v * 10 + c - 48
+        if v > 0x10ffff:
+            return -1
+    return v
+
+fn dec_value_prefix(s: str, at: int) int:
+    v = 0
+    k = at
+    while k < len(s) and is_digit(s.byte(k)):
+        v = v * 10 + s.byte(k) - 48
+        k += 1
+    return v
+
+fn entity_hex(s: str) int:
+    if len(s) == 0:
+        return -1
+    v = 0
+    for k in 0..len(s):
+        c = s.byte(k) | 32
+        if is_digit(c):
+            v = v * 16 + c - 48
+        elif c >= 97 and c <= 102:
+            v = v * 16 + c - 87
+        else:
+            return -1
+        if v > 0x10ffff:
+            return -1
+    return v
+
+# A code point as UTF-8 (a lone surrogate as a \u escape, which is what the value is in JS).
+fn utf8_of(cp: int) str:
+    if cp < 0x80:
+        return chr(cp)
+    if cp < 0x800:
+        return chr(0xc0 | (cp >> 6)) + chr(0x80 | (cp & 63))
+    if cp >= 0xd800 and cp <= 0xdfff:
+        return "\\u" + hex4(cp)
+    if cp < 0x10000:
+        return chr(0xe0 | (cp >> 12)) + chr(0x80 | ((cp >> 6) & 63)) + chr(0x80 | (cp & 63))
+    return chr(0xf0 | (cp >> 18)) + chr(0x80 | ((cp >> 12) & 63)) + chr(0x80 | ((cp >> 6) & 63)) + chr(0x80 | (cp & 63))
+
+fn hex4(v: int) str:
+    digits = "0123456789ABCDEF"
+    return digits[(v >> 12) & 15] + digits[(v >> 8) & 15] + digits[(v >> 4) & 15] + digits[v & 15]
+
+# A double-quoted JS string with this value (backslashes starting a \u escape from utf8_of are kept).
+fn js_string(s: str) str:
+    out = "\""
+    i = 0
+    while i < len(s):
+        c = s.byte(i)
+        if c == 34:
+            out += "\\\""
+        elif c == 92:
+            if i + 5 < len(s) + 0 and s.byte(i + 1) == 117 and is_surrogate_escape(s, i):
+                out += s[i..i + 6]
+                i += 6
+                continue
+            out += "\\\\"
+        elif c == 10:
+            out += "\\n"
+        elif c == 13:
+            out += "\\r"
+        elif c == 0xe2 and uni_space(s, i) < 0:
+            out += "\\u" + hex4(0x2028 + s.byte(i + 2) - 0xa8)
+            i += 3
+            continue
+        else:
+            out += s[i]
+        i += 1
+    return out + "\""
+
+fn is_surrogate_escape(s: str, i: int) bool:
+    if i + 6 > len(s):
+        return false
+    return (s.byte(i + 2) == 68 or s.byte(i + 2) == 100) and (s.byte(i + 3) | 32) >= 56 and (s.byte(i + 3) | 32) <= 102
+
+# ---------------------------------------------------------------- automatic runtime
+
+# The name for a runtime function in the output: `(0, jsx_runtime_1.jsx)` / `_jsx`.
+fn jsx_runtime_name(p: mut P, name: str) str:
+    p.jsx_events.push(name)
+    src = p.jsx_source + "/jsx-runtime"
+    if p.jsx == JSX_DEV:
+        src = p.jsx_source + "/jsx-dev-runtime"
+    if name == "createElement":
+        src = p.jsx_source
+        if not p.jsx_ce and not p.esm:
+            # its `react_1` comes before the file's own imports: parse again knowing it
+            p.retry = true
+            p.want_ce = true
+    if p.esm:
+        return jsx_local(&p, name)
+    v = module_base(js_string(src)) + "_1"
+    return v + "." + name
+
+fn jsx_local(p: mut P, name: str) str:
+    base = "_" + name
+    if file_ident(&p, base):
+        return unique_ident(p.src, base)
+    return base
+
+fn jsx_callee(p: mut P, name: str) str:
+    r = jsx_runtime_name(&p, name)
+    if p.esm:
+        return r
+    return "(0, " + r + ")"
+
+fn jsx_children_prop(p: mut P, kids: [JsxKid]) str:
+    sem = 0
+    only = -1
+    for i in 0..len(kids):
+        if kids[i].semantic:
+            sem += 1
+            only = i
+    if sem == 1 and not kids[only].spread:
+        if kids[only].text == "":
+            return ""
+        return "children: " + kids[only].text
+    parts: [str] = []
+    for k in kids:
+        if k.text != "":
+            if k.spread:
+                parts.push(jsx_nl(k.nl) + "..." + k.text)
+            else:
+                parts.push(jsx_nl(k.nl) + k.text)
+    if len(parts) == 0:
+        return ""
+    return "children: [" + ", ".join(parts) + "]"
+
+fn jsx_nl(nl: bool) str:
+    if nl:
+        return "\n"
+    return ""
+
+fn jsx_static(kids: [JsxKid]) bool:
+    sem = 0
+    for k in kids:
+        if k.semantic:
+            sem += 1
+            if k.spread:
+                return true
+    return sem > 1
+
+# The props object; with a spread below ES2018, Object.assign({}, props, { x: "1" }) as tsc writes it.
+fn jsx_props(p: mut P, props: [str], nls: [bool]) str:
+    if p.target >= 2018:
+        return jsx_object(props, nls)
+    any = false
+    for q in props:
+        if q.starts_with("..."):
+            any = true
+    if not any:
+        return jsx_object(props, nls)
+    args: [str] = []
+    group: [str] = []
+    gnl: [bool] = []
+    for i in 0..len(props):
+        if props[i].starts_with("..."):
+            if len(group) > 0:
+                args.push(jsx_object(group, gnl))
+            elif len(args) == 0 and not props[i][3..].trim().starts_with("{"):
+                args.push("{}")                  # (an object literal first is the target itself)
+            group = []
+            gnl = []
+            args.push(props[i][3..])
+        else:
+            group.push(props[i])
+            gnl.push(nls[i])
+    if len(group) > 0:
+        args.push(jsx_object(group, gnl))
+    return "Object.assign(" + ", ".join(args) + ")"
+
+fn jsx_object(props: [str], nls: [bool]) str:
+    parts: [str] = []
+    for i in 0..len(props):
+        parts.push(jsx_nl(nls[i]) + props[i])
+    return "{ " + ", ".join(parts) + " }"
+
+fn jsx_auto_call(p: mut P, tag: str, obj: str, has_key: bool, key: str, kids: [JsxKid], at: int) str:
+    is_static = jsx_static(kids)
+    args = tag + ", " + obj
+    if has_key:
+        args += ", " + key
+    if p.jsx == JSX_DEV:
+        if not has_key:
+            args += ", void 0"
+        args += ", " + bool_text(is_static) + ", { fileName: " + jsx_file_name(&p) + ", lineNumber: " + str(jsx_line(p.src, at)) + ", columnNumber: " + str(column_of(p.src, at)) + " }, this"
+        return jsx_callee(&p, "jsxDEV") + "(" + args + ")"
+    fname = "jsx"
+    if is_static:
+        fname = "jsxs"
+    return jsx_callee(&p, fname) + "(" + args + ")"
+
+fn jsx_fragment(p: mut P, kids: [JsxKid], at: int) str:
+    if p.err != "":
+        return ""
+    i = jsx_after_slash(&p)
+    if jsx_at(&p, i) != 62:
+        jsx_fail(&p, i, "expected '</>' to close the JSX fragment")
+        return ""
+    end = i + 1
+    if p.jsx == JSX_REACT:
+        t = jsx_classic_call(&p, jsx_factory(&p), false, jsx_frag_factory(&p), [], [], kids)
+        p.jsx_end = end
+        return t
+    obj = "{}"
+    if len(kids) > 0:
+        c = jsx_children_prop(&p, kids)
+        if c != "":
+            obj = "{ " + c + " }"
+    frag = jsx_runtime_name(&p, "Fragment")
+    t = jsx_auto_call(&p, frag, obj, false, "", kids, at)
+    p.jsx_end = end
+    return t
+
+# const _jsxFileName = "..." (react-jsxdev).
+fn jsx_file_name(p: mut P) str:
+    p.jsx_uses_file = true
+    if file_ident(&p, "_jsxFileName"):
+        return unique_ident(p.src, "_jsxFileName")
+    return "_jsxFileName"
+
+fn jsx_line(s: str, at: int) int:
+    line = 1
+    for k in 0..at:
+        if s.byte(k) == 10:
+            line += 1
+    return line
+
+fn column_of(s: str, at: int) int:
+    k = at
+    while k > 0 and s.byte(k - 1) != 10:
+        k -= 1
+    return at - k + 1
+
+# ---------------------------------------------------------------- classic runtime
+
+# `wrap`: the callee is an imported function, called as `(0, react_1.createElement)(...)`.
+fn jsx_classic_call(p: mut P, callee: str, wrap: bool, tag: str, props: [str], nls: [bool], kids: [JsxKid]) str:
+    obj = "null"
+    if len(props) > 0:
+        obj = jsx_props(&p, props, nls)
+    args = tag + ", " + obj
+    for k in kids:
+        if k.text != "":
+            if k.spread:
+                args += "," + jsx_nl(k.nl) + " ..." + k.text
+            else:
+                args += "," + jsx_nl(k.nl) + " " + k.text
+    if wrap and not p.esm:
+        return "(0, " + callee + ")(" + args + ")"
+    return callee + "(" + args + ")"
+
+# React.createElement or the jsxFactory / @jsx pragma, its first name rewritten like any reference.
+fn jsx_factory(p: mut P) str:
+    f = p.jsx_factory
+    return jsx_entity(&p, f)
+
+fn jsx_frag_factory(p: mut P) str:
+    f = p.jsx_frag
+    return jsx_entity(&p, f)
+
+fn jsx_entity(p: mut P, name: str) str:
+    dot = name.find(".")
+    root = name
+    rest = ""
+    if dot >= 0:
+        root = name[..dot]
+        rest = name[dot..]
+    k = find_bind_name(&p, root)
+    if k >= 0:
+        here = p.ts
+        r = use_bind(&p, k, here)
+        if r != "":
+            return r + rest
+    else:
+        seen_mark(&p, hash_of(root))             # (an import of it below: parse again knowing it)
+    return name
+
+# ---------------------------------------------------------------- preserve
+
+# jsx: preserve: the JSX is copied, its expressions and component names parsed (types removed, names rewritten).
+fn jsx_copy(p: mut P, a: int):
+    i = jsx_ws(&p, a + 1)
+    if jsx_at(&p, i) == 62:
+        jsx_copy_children(&p, i + 1)
+        if p.err == "":
+            i = jsx_after_slash(&p)
+            p.jsx_end = i + 1
+            emit_to(&p, i + 1)
+        return
+    e = jsx_name_end(&p, i)
+    name = jsx_name_text(&p, i, e)
+    c = name.byte(0)
+    if not ((c >= 97 and c <= 122 and not name.contains(".")) or name.contains("-") or name.contains(":")):
+        emit_to(&p, i)
+        t = jsx_tag(&p, i, e)
+        put(&p, t)
+        skip_to(&p, e)
+    else:
+        jsx_copy_name(&p, i, e)
+    j = e
+    k = jsx_ws(&p, e)
+    if jsx_at(&p, k) == 60:                      # <Comp<T> ...>: the type arguments go
+        emit_to(&p, k)
+        jsx_resume(&p, k)
+        p.mute += 1
+        skip_type_args(&p)
+        p.mute -= 1
+        p.bad = false
+        j = p.pe
+        skip_to(&p, j)
+    while p.err == "":
+        j = jsx_ws(&p, j)
+        c2 = jsx_at(&p, j)
+        if c2 == 47:
+            j = jsx_ws(&p, j + 1) + 1
+            p.jsx_end = j
+            emit_to(&p, j)
+            return
+        if c2 == 62:
+            j += 1
+            break
+        if c2 == 123:
+            jsx_copy_brace(&p, j)
+            j = p.jsx_brace_end
+            continue
+        if c2 == 0:
+            jsx_fail(&p, j, "unterminated JSX element")
+            return
+        ne = jsx_name_end(&p, j)
+        if ne == j:
+            jsx_fail(&p, j, "unexpected character in a JSX element")
+            return
+        jsx_copy_name(&p, j, ne)
+        j = jsx_ws(&p, ne)
+        if jsx_at(&p, j) == 61:
+            j = jsx_ws(&p, j + 1)
+            q = jsx_at(&p, j)
+            if q == 34 or q == 39:
+                j = p.src.find_from(chr(q), j + 1) + 1
+            elif q == 123:
+                jsx_copy_brace(&p, j)
+                j = p.jsx_brace_end
+            elif q == 60:
+                emit_to(&p, j)
+                jsx_copy(&p, j)
+                j = p.jsx_end
+    emit_to(&p, j)
+    jsx_copy_children(&p, j)
+    if p.err == "":
+        k = jsx_after_slash(&p)
+        ke = jsx_name_end(&p, k)
+        jsx_copy_name(&p, k, ke)
+        k = jsx_ws(&p, ke)
+        p.jsx_end = k + 1
+        emit_to(&p, k + 1)
+
+fn jsx_copy_brace(p: mut P, open: int):
+    emit_to(&p, open)
+    jsx_resume(&p, open + 1)
+    if at_op(&p, O_DOTS):
+        next(&p)
+    if not at_op(&p, 125):
+        assign(&p, false)
+    if not at_op(&p, 125):
+        fail(&p, "expected '}' in JSX")
+    end = p.te
+    p.jsx_brace_end = end
+    emit_to(&p, end)
+
+fn jsx_copy_children(p: mut P, i: int):
+    j = i
+    while p.err == "":
+        k = j
+        while k < p.n and p.src.byte(k) != 60 and p.src.byte(k) != 123:
+            k += 1
+        if k >= p.n:
+            jsx_fail(&p, k, "unterminated JSX element")
+            return
+        if p.src.byte(k) == 123:
+            jsx_copy_brace(&p, k)
+            j = p.jsx_brace_end
+            continue
+        n = jsx_ws(&p, k + 1)
+        if jsx_at(&p, n) == 47:
+            p.jsx_end = k
+            return
+        emit_to(&p, k)
+        jsx_copy(&p, k)
+        j = p.jsx_end
+
+# ---------------------------------------------------------------- the runtime import
+
+fn jsx_runtime_source(p: mut P) str:
+    if p.jsx == JSX_DEV:
+        return p.jsx_source + "/jsx-dev-runtime"
+    return p.jsx_source + "/jsx-runtime"
+
+# What tsc puts first: the runtime imports used (the last one used first), then _jsxFileName.
+fn jsx_prologue(p: mut P) str:
+    names: [str] = []
+    ce = false
+    runtime_first = true
+    for ev in p.jsx_events:
+        if ev == "createElement":
+            if not ce and len(names) == 0:
+                runtime_first = false
+            ce = true
+        elif not (ev in names):
+            names.push(ev)
+    src = p.jsx_source + "/jsx-runtime"
+    if p.jsx == JSX_DEV:
+        src = p.jsx_source + "/jsx-dev-runtime"
+    rt = ""
+    if len(names) > 0:
+        rt = jsx_import_line(&p, names, src)
+    cel = ""
+    if ce:
+        base = p.jsx_source
+        cel = jsx_import_line(&p, ["createElement"], base)
+    text = rt + cel
+    if runtime_first:
+        text = cel + rt
+    if p.jsx_uses_file:
+        text += "const " + jsx_file_name(&p) + " = " + js_string(p.jsx_file) + ";\n"
+    return text
+
+fn jsx_import_line(p: mut P, names: [str], src: str) str:
+    if p.esm:
+        specs: [str] = []
+        for n in names:
+            specs.push(n + " as " + jsx_local(&p, n))
+        return "import { " + ", ".join(specs) + " } from " + js_string(src) + ";\n"
+    return "const " + module_base(js_string(src)) + "_1 = require(" + js_string(src) + ");\n"
+
+# Pragmas in the file's comments: @jsx, @jsxFrag, @jsxImportSource, @jsxRuntime.
+fn jsx_pragmas(p: mut P):
+    if p.src.find("@jsx") < 0:
+        return
+    lead = leading_block_comments(p.src)         # (tsc: only /* */ comments before the first token)
+    if lead.find("@jsx") < 0:
+        return
+    v = pragma_value(lead, "@jsxImportSource", true)   # (the last one, as tsc; @jsx: the first)
+    if v != "":
+        p.jsx_source = v
+        if p.jsx == JSX_REACT:
+            p.jsx = JSX_AUTO
+    v = pragma_value(lead, "@jsxRuntime", true)
+    if v == "classic" and p.jsx != JSX_PRESERVE:   # (preserve stays preserve)
+        p.jsx = JSX_REACT
+    elif v == "automatic" and p.jsx == JSX_REACT:
+        p.jsx = JSX_AUTO
+    v = pragma_value(lead, "@jsx", false)
+    if v != "":
+        p.jsx_factory = v
+    v = pragma_value(lead, "@jsxFrag", false)
+    if v != "":
+        p.jsx_frag = v
+
+# The /* */ comments before the file's first token, joined (where tsc reads JSX pragmas).
+fn leading_block_comments(src: str) str:
+    out = ""
+    i = 0
+    n = len(src)
+    while i < n:
+        c = src.byte(i)
+        if c == 32 or c == 9 or c == 10 or c == 13:
+            i += 1
+        elif c == 47 and i + 1 < n and src.byte(i + 1) == 47:
+            while i < n and src.byte(i) != 10:
+                i += 1
+        elif c == 47 and i + 1 < n and src.byte(i + 1) == 42:
+            e = src.find_from("*/", i + 2)
+            if e < 0:
+                e = n
+            out += src[i..e] + "\n"
+            i = e + 2
+        elif c == 35 and i == 0 and i + 1 < n and src.byte(1) == 33:   # #!
+            while i < n and src.byte(i) != 10:
+                i += 1
+        else:
+            break
+    return out
+
+# An entity name (a, a.b.c): what jsxFactory / jsxFragmentFactory must be.
+fn jsx_entity_name(t: str) bool:
+    if t == "":
+        return false
+    for part in t.split("."):
+        if part == "" or not is_id_start(part.byte(0)):
+            return false
+        for k in 1..len(part):
+            if not is_id(part.byte(k)):
+                return false
+    return true
+
+# The word after `name ` in a comment ("" if absent): the first, or with `last` the last.
+fn pragma_value(src: str, name: str, last: bool) str:
+    found = ""
+    k = src.find(name)
+    while k >= 0:
+        e = k + len(name)
+        if e < len(src) and (src.byte(e) == 32 or src.byte(e) == 9):
+            j = e
+            while j < len(src) and (src.byte(j) == 32 or src.byte(j) == 9):
+                j += 1
+            s = j
+            while j < len(src) and (is_id(src.byte(j)) or src.byte(j) == 46 or src.byte(j) == 47 or src.byte(j) == 45 or src.byte(j) == 64):
+                j += 1
+            if j > s:
+                found = src[s..j]
+                if not last:
+                    return found
+        k = src.find_from(name, k + 1)
+    return found
+
+# ---------------------------------------------------------------- skipping
+
+# In a token scan (skip_group) at "<": does JSX start here? It does where an operand
+# can: after ( , = : ? [ { } ; ! & | > or `return`, and before a name, ">" (a fragment).
+fn jsx_starts(p: mut P) bool:
+    if not p.tsx or not at_op(&p, 60):
+        return false
+    te = p.te
+    c = jsx_at(&p, te)
+    if not (is_id_start(c) or c == 62):
+        return false
+    k = p.ts - 1
+    while k >= 0 and (p.src.byte(k) == 32 or p.src.byte(k) == 9 or p.src.byte(k) == 10 or p.src.byte(k) == 13):
+        k -= 1
+    if k < 0:
+        return true
+    b = p.src.byte(k)
+    if b == 40 or b == 44 or b == 61 or b == 58 or b == 63 or b == 91 or b == 123 or b == 125 or b == 59 or b == 33 or b == 38 or b == 124 or b == 62:
+        return true
+    return k >= 5 and p.src[k - 5..k + 1] == "return" and (k < 6 or not is_id(p.src.byte(k - 6)))
+
+# The end of the JSX element at `i` ("<"), found by bytes: tags, strings, {…} nesting.
+fn jsx_skip(p: mut P, i: int) int:
+    depth = 0
+    j = i
+    while j < p.n:
+        k = jsx_ws(&p, j + 1)
+        closing = jsx_at(&p, k) == 47
+        j = k
+        self_close = false
+        while j < p.n:
+            c = p.src.byte(j)
+            if c == 34 or c == 39:
+                e = p.src.find_from(chr(c), j + 1)
+                if e < 0:
+                    return p.n
+                j = e + 1
+            elif c == 123:
+                j = jsx_skip_brace(&p, j)
+            elif c == 47 and jsx_at(&p, j + 1) == 62:
+                self_close = true
+                j += 2
+                break
+            elif c == 62:
+                j += 1
+                break
+            else:
+                j += 1
+        if closing:
+            depth -= 1
+        elif not self_close:
+            depth += 1
+        if depth <= 0:
+            return j
+        # children, up to the next tag
+        while j < p.n and p.src.byte(j) != 60:
+            if p.src.byte(j) == 123:
+                j = jsx_skip_brace(&p, j)
+            else:
+                j += 1
+    return p.n
+
+# From "{" past its "}", skipping strings, templates, comments and nested JSX.
+fn jsx_skip_brace(p: mut P, i: int) int:
+    depth = 0
+    j = i
+    while j < p.n:
+        c = p.src.byte(j)
+        if c == 123:
+            depth += 1
+            j += 1
+        elif c == 125:
+            depth -= 1
+            j += 1
+            if depth == 0:
+                return j
+        elif c == 34 or c == 39:
+            j = skip_string(p.src, j + 1, c)
+        elif c == 96:
+            j = jsx_skip_template(&p, j + 1)
+        elif c == 47 and jsx_at(&p, j + 1) == 47:
+            while j < p.n and p.src.byte(j) != 10:
+                j += 1
+        elif c == 47 and jsx_at(&p, j + 1) == 42:
+            k = p.src.find_from("*/", j + 2)
+            if k < 0:
+                return p.n
+            j = k + 2
+        elif c == 60 and (is_id_start(jsx_at(&p, j + 1)) or jsx_at(&p, j + 1) == 62) and jsx_operand_before(&p, j):
+            j = jsx_skip(&p, j)
+        else:
+            j += 1
+    return p.n
+
+fn jsx_skip_template(p: mut P, i: int) int:
+    j = i
+    while j < p.n:
+        c = p.src.byte(j)
+        if c == 96:
+            return j + 1
+        if c == 92:
+            j += 2
+        elif c == 36 and jsx_at(&p, j + 1) == 123:
+            j = jsx_skip_brace(&p, j + 1)
+        else:
+            j += 1
+    return p.n
+
+fn jsx_operand_before(p: mut P, at: int) bool:
+    k = at - 1
+    while k >= 0 and (p.src.byte(k) == 32 or p.src.byte(k) == 9 or p.src.byte(k) == 10 or p.src.byte(k) == 13):
+        k -= 1
+    if k < 0:
+        return true
+    b = p.src.byte(k)
+    return b == 40 or b == 44 or b == 61 or b == 58 or b == 63 or b == 91 or b == 123 or b == 38 or b == 124 or b == 62 or b == 33 or (b == 110 and k >= 5 and p.src[k - 5..k + 1] == "return")

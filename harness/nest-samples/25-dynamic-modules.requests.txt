@@ -1,0 +1,4 @@
+POST /users {"name":"a"}
+GET /users
+POST /orders {"id":1}
+GET /orders

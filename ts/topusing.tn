@@ -1,0 +1,339 @@
+# Lowers `using` at a module's top level as tsc does: the statements from the first `using` on
+# run in one try block that disposes the resources, with declarations hoisted out of it.
+
+struct TopUsing:
+    src: str
+    block: int          # where the synthetic block's "{" is in src, or -1 (nothing to do)
+    err: str
+    pro: [str]          # hoisted names when their `var` is the first statement (tsc's module transform: the prologue)
+    hoisted: [str]      # every name it hoists (top-level vars, for `export { }` lists)
+    anon: int           # where an unnamed default class was named default_1, or -1
+
+fn no_top_using() TopUsing:
+    return TopUsing("", -1, "", [], [], -1)
+
+struct TopStmt:
+    a: int
+    b: int
+
+# The rewritten module, or block -1 when it has no `using` at its top level.
+fn top_using_rewrite(src: str, tsx: bool, legacy: bool) TopUsing:
+    stmts = top_statements(src, tsx)
+    first = -1
+    for i in 0..len(stmts):
+        if stmt_is_using(src, tsx, stmts[i].a):
+            first = i
+            break
+    if first < 0:
+        return no_top_using()
+    keep = ""                                    # the statements before the first `using`
+    if first > 0:
+        keep = src[..stmts[first].a]
+    else:
+        keep = src[..stmts[0].a]
+    top: [str] = []                              # hoisted as they are
+    body: [str] = []
+    xbind: [str] = []                            # export { ... } specifiers
+    hvars: [str] = []                            # var ...
+    xvars: [str] = []                            # export let ...
+    after: [str] = []                            # after the block (export = _default)
+    anon: [int] = []                             # (hoist_decorated: an unnamed class, in the block)
+    for i in first..len(stmts):
+        r = top_stmt(src, tsx, legacy, stmts[i].a, stmts[i].b, &top, &body, &xbind, &hvars, &xvars, &after, &anon)
+        if r != "":
+            return TopUsing("", -1, r, [], [], -1)
+    out = keep
+    for t in top:
+        out += t + "\n"
+    if len(xbind) > 0:
+        out += "export { " + ", ".join(xbind) + " };\n"
+    pro: [str] = []
+    if len(hvars) > 0:
+        if out.trim() == "" or only_directives(src, tsx, out):
+            pro = hvars                          # (the first statement: a custom prologue)
+        else:
+            out += "var " + ", ".join(hvars) + ";\n"
+    if len(xvars) > 0:
+        out += "export let " + ", ".join(xvars) + ";\n"
+    block = len(out)
+    out += "{\n"
+    anon_at = -1
+    for t0 in body:
+        t = t0
+        k = t.find("class \x01")
+        if k >= 0:                               # (the unnamed class: named, and where)
+            anon_at = len(out) + k + 6
+            t = t[..k + 6] + "default_1" + t[k + 7..]
+        out += t + "\n"
+    out += "}\n"
+    for t in after:
+        out += t + "\n"
+    return TopUsing(out, block, "", pro, hvars, anon_at)
+
+# Where each top-level statement starts and ends.
+fn top_statements(src: str, tsx: bool) [TopStmt]:
+    p = new_p(src, false)
+    p.tsx = tsx
+    p.mute += 1
+    p.has_using = true
+    out: [TopStmt] = []
+    next(&p)
+    while p.tok != T_EOF and p.err == "":
+        a = p.ts
+        statement(&p, true)
+        if p.ts == a:                            # (no progress: give up on the rest)
+            break
+        out.push(TopStmt(a, p.pe))
+    return out
+
+fn stmt_is_using(src: str, tsx: bool, at: int) bool:
+    p = new_p(src, false)
+    p.tsx = tsx
+    p.pos = at
+    next(&p)
+    return at_using_decl(&p, false)
+
+# One statement from the first `using` on, into top (as is) or body (rewritten). "" or why it can't be lowered.
+fn top_stmt(src: str, tsx: bool, legacy: bool, a: int, b: int, top: mut [str], body: mut [str], xbind: mut [str], hvars: mut [str], xvars: mut [str], after: mut [str], anon: mut [int]) str:
+    text = src[a..b]
+    p = new_p(src, false)
+    p.tsx = tsx
+    p.mute += 1
+    p.pos = a
+    next(&p)
+    k = p.kw
+    if p.tok == T_OP and p.op == 64:
+        if not legacy:
+            return "`using` at the top level, followed by a TC39-decorated class, isn't supported yet"
+        return hoist_decorated(&p, a, b, &body, &xbind, &hvars)
+    if k == K_IMPORT or k == K_FUNCTION or k == K_INTERFACE or k == K_DECLARE or (k == K_TYPE and peek_tok(&p).tok == T_NAME):
+        top.push(text)
+        return ""
+    if k == K_ASYNC and peek_tok(&p).kw == K_FUNCTION:
+        top.push(text)
+        return ""
+    if k == K_USING or (k == K_AWAIT and at_using_decl(&p, false)):
+        for name in var_names_ahead_after(&p):
+            hvars.push(name)
+        body.push(text)
+        return ""
+    if k == K_VAR or k == K_LET or k == K_CONST:
+        n = peek_tok(&p)
+        if k == K_CONST and n.kw == K_ENUM:
+            body.push(text)
+            return ""
+        return hoist_vars(&p, b, false, &body, &hvars, &xvars)
+    if k == K_CLASS or k == K_ABSTRACT:
+        return hoist_class(&p, b, false, false, &body, &xbind, &hvars)
+    if k == K_EXPORT:
+        next(&p)
+        k2 = p.kw
+        if p.tok == T_OP and (p.op == 123 or p.op == 42):           # export { } / export *
+            top.push(text)
+            return ""
+        if k2 == K_FUNCTION or k2 == K_INTERFACE or k2 == K_DECLARE or k2 == K_TYPE or k2 == K_IMPORT or (k2 == K_ASYNC and peek_tok(&p).kw == K_FUNCTION):
+            top.push(text)
+            return ""
+        if k2 == K_VAR or k2 == K_LET or k2 == K_CONST:
+            if k2 == K_CONST and peek_tok(&p).kw == K_ENUM:
+                body.push(text)
+                return ""
+            return hoist_vars(&p, b, true, &body, &hvars, &xvars)
+        if k2 == K_CLASS or k2 == K_ABSTRACT:
+            return hoist_class(&p, b, true, false, &body, &xbind, &hvars)
+        if k2 == K_DEFAULT:
+            next(&p)
+            if p.kw == K_FUNCTION or (p.kw == K_ASYNC and peek_tok(&p).kw == K_FUNCTION) or p.kw == K_INTERFACE:
+                top.push(text)
+                return ""
+            if p.kw == K_CLASS or p.kw == K_ABSTRACT:
+                return hoist_class(&p, b, true, true, &body, &xbind, &hvars)
+            e = p.ts
+            if default_anon_fn(src[e..b].trim().strip_suffix(";")):
+                return "`using` at the top level, followed by `export default` of an unnamed function, isn't supported yet"
+            hvars.push("_default")
+            xbind.push("_default as default")
+            body.push("_default = " + src[e..b].trim().strip_suffix(";").trim() + ";")
+            return ""
+        if at_op(&p, 61):                        # export = e: _default = e; export = _default; after
+            next(&p)
+            e = p.ts
+            hvars.push("_default")
+            body.push("_default = " + src[e..b].trim().strip_suffix(";").trim() + ";")
+            after.push("export = _default;")
+            return ""
+        body.push(text)
+        return ""
+    body.push(text)
+    return ""
+
+# `export default` of an unnamed function or arrow, which would take its name from the var it moves into.
+fn default_anon_fn(e: str) bool:
+    t = e.trim()
+    while t.starts_with("(") and t.ends_with(")") and group_end(t, 0) == len(t) - 1:
+        t = t[1..len(t) - 1].trim()
+    if t.starts_with("async") and (len(t) == 5 or not is_id_byte(t.byte(5))):
+        return true
+    if t.starts_with("function") and (len(t) == 8 or not is_id_byte(t.byte(8))):
+        return true
+    if t.starts_with("("):
+        g = group_end(t, 0)
+        if g < 0:
+            return true
+        r = t[g + 1..].trim()
+        return r.starts_with("=>") or r.starts_with(":")
+    k = 0
+    while k < len(t) and is_id_byte(t.byte(k)):
+        k += 1
+    return k > 0 and t[k..].trim().starts_with("=>")
+
+# The names a `[await] using` statement declares (at its first token).
+fn var_names_ahead_after(p: mut P) [str]:
+    if at_kw(&p, K_AWAIT):
+        next(&p)
+    out: [str] = []
+    for n in var_names_ahead(&p, false).split(","):
+        if n != "":
+            out.push(n)
+    return out
+
+# let/const/var (`export let` when exported): the initialized declarators become one assignment.
+fn hoist_vars(p: mut P, b: int, exported: bool, body: mut [str], hvars: mut [str], xvars: mut [str]) str:
+    for n in var_names_ahead(&p, false).split(","):
+        if n != "":
+            if exported:
+                xvars.push(n)
+            else:
+                hvars.push(n)
+    next(&p)                                     # the keyword
+    parts: [str] = []
+    while p.tok == T_NAME or at_op(&p, 123) or at_op(&p, 91):
+        ta = p.ts
+        if p.tok == T_NAME:
+            next(&p)
+        else:
+            skip_group(&p)
+        target = p.src[ta..p.pe]
+        if at_op(&p, 33):
+            next(&p)
+        if at_op(&p, 58):
+            next(&p)
+            p.bad = false
+            parse_type(&p)
+        if at_op(&p, 61):
+            next(&p)
+            ia = p.ts
+            assign(&p, false)
+            parts.push(target + " = " + p.src[ia..p.pe])
+        if not eat_op(&p, 44):
+            break
+    if len(parts) > 0:
+        s = ", ".join(parts)
+        if s.starts_with("{"):
+            s = "(" + s + ")"
+        body.push(s + ";")
+    return ""
+
+# class C { } (at `class`/`abstract`, or after `export` / `export default`): C = class C { }.
+fn hoist_class(p: mut P, b: int, exported: bool, is_default: bool, body: mut [str], xbind: mut [str], hvars: mut [str]) str:
+    if at_kw(&p, K_ABSTRACT):
+        next(&p)
+    ca = p.ts
+    n = peek_tok(&p)
+    if not (n.tok == T_NAME and n.kw != K_EXTENDS and n.kw != K_IMPLEMENTS):
+        return "`using` at the top level, followed by an unnamed default class, isn't supported yet"
+    next(&p)
+    name = tok_text(&p)
+    hvars.push(name)
+    if exported and not is_default:
+        xbind.push(name)
+    lhs = name + " = "
+    if is_default:
+        hvars.push("_default")
+        xbind.push("_default as default")
+        lhs = "_default = " + lhs
+    body.push(lhs + p.src[ca..b].trim().strip_suffix(";") + ";")
+    return ""
+
+# Whether text (the start of the module) holds only directive prologues ("use strict";).
+fn only_directives(src: str, tsx: bool, text: str) bool:
+    p = new_p(text, false)
+    p.tsx = tsx
+    next(&p)
+    while p.tok == T_STR:
+        next(&p)
+        eat_op(&p, 59)
+    return p.tok == T_EOF
+
+# The module's statements when topusing.tn rewrote it: its block is lowered by top_using_block.
+fn module_statements_using(p: mut P):
+    while p.tok != T_EOF and not at_op(&p, 125) and p.err == "":
+        if at_op(&p, 123) and p.ts == p.top_block and p.mute == 0:
+            top_using_block(&p)
+        else:
+            statement(&p, true)
+
+# @dec [export [default]] class C { } (legacy decorators): stays in the block without its
+# `export`, where the parser writes `C = class C { }; C = __decorate([...], C);`.
+fn hoist_decorated(p: mut P, a: int, b: int, body: mut [str], xbind: mut [str], hvars: mut [str]) str:
+    cuts: [int] = []                             # the `export` / `default` tokens: start, end
+    exported = false
+    is_default = false
+    while p.tok != T_EOF and p.ts < b:
+        if at_op(&p, 64):
+            next(&p)
+            if p.tok == T_NAME:
+                next(&p)
+            while at_op(&p, 46) or at_op(&p, 40):
+                if at_op(&p, 46):
+                    next(&p)
+                    next(&p)
+                else:
+                    skip_group(&p)
+            continue
+        if at_kw(&p, K_EXPORT):
+            exported = true
+            cuts.push(p.ts)
+            cuts.push(p.te)
+            next(&p)
+            continue
+        if at_kw(&p, K_DEFAULT):
+            is_default = true
+            cuts.push(p.ts)
+            cuts.push(p.te)
+            next(&p)
+            continue
+        break
+    if at_kw(&p, K_ABSTRACT):
+        next(&p)
+    if not at_kw(&p, K_CLASS):
+        return "`using` at the top level, followed by a decorated declaration that isn't a class, isn't supported yet"
+    n = peek_tok(&p)
+    name = ""
+    cls_end = p.te
+    if n.tok == T_NAME and n.kw != K_EXTENDS and n.kw != K_IMPLEMENTS:
+        name = p.src[n.ts..n.te]
+    elif is_default:
+        name = "default_1"                       # (tsc: default_1 = class { })
+    else:
+        return "`using` at the top level, followed by an unnamed decorated class, isn't supported yet"
+    text = ""
+    at = a
+    k = 0
+    while k < len(cuts):
+        text += p.src[at..cuts[k]]
+        at = cuts[k + 1]
+        k += 2
+    if name == "default_1" and not (n.tok == T_NAME and n.kw != K_EXTENDS and n.kw != K_IMPLEMENTS):
+        text += p.src[at..cls_end] + " \x01" + p.src[cls_end..b]          # (top_using_rewrite names it)
+    else:
+        text += p.src[at..b]
+    hvars.push(name)
+    body.push(text)
+    if is_default:
+        hvars.push("_default")
+        xbind.push("_default as default")
+        body.push("_default = " + name + ";")
+    elif exported:
+        xbind.push(name)
+    return ""

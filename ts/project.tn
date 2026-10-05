@@ -1,0 +1,1038 @@
+# Project mode: which exported names of each file are types, so imports of types are dropped
+# as a full `tsc` build drops them (a kept type import fails at load in ES module output).
+
+struct ReExport:
+    names: [str]        # exported names ("*" for export *)
+    remotes: [str]      # their names in the other module
+    spec: str           # the module, unquoted
+
+struct Exports:
+    types: {str: bool}      # exported name -> true for a type, false for a value
+    reexports: [ReExport]
+    imports: [str]          # the packages it imports from ("express", "@nestjs/common")
+    # for decorator metadata the way a whole-program tsc writes it (scan_meta):
+    meta: {str: Ser}        # top-level declarations: class, interface, enum (and "E.M" members), type alias (its type)
+    imp: {str: str}         # imported names: local -> spec "\x01" remote ("default", "*")
+    xlocal: {str: str}      # exported name -> local name (export { a as b }, export default a)
+    xfrom: {str: str}       # re-exported name -> spec "\x01" remote (export [type] { a as b } from)
+
+struct Project:
+    files: {str: Exports}   # path without extension ("src/a/b") -> its exports
+    pkgs: {str: str}        # package specifier -> the files key of its .d.ts entry
+    jsx_typed: {str: bool}  # files whose jsx-runtime has types: automatic-mode JSX then doesn't use React
+    paths: [str]            # tsconfig paths: "pattern \x01 target \x02 ..." (targets absolute)
+    abs: {str: str}         # absolute path without extension -> files key (for paths)
+
+fn empty_project() Project:
+    return Project({}, {}, {}, [], {})
+
+fn no_exports() Exports:
+    return Exports({}, [], [], {}, {}, {}, {})
+
+# The top-level exports of a file, from its tokens.
+fn scan_exports(src: str) Exports:
+    return scan_exports_in(src, false)
+
+# `tsx`: the source may contain JSX (a .tsx file).
+fn scan_exports_in(src: str, tsx: bool) Exports:
+    p = new_p(src, false)
+    p.tsx = tsx
+    ex = no_exports()
+    local_types: {str: bool} = {}
+    local_values: {str: bool} = {}
+    lists: [ReExport] = []                   # export { ... } without `from`
+    export_eq = ""                           # `export = e` (.d.ts): e's namespace members are the exports
+    ns_members: {str: {str: bool}} = {}
+    seen_pkg: {str: bool} = {}
+    next(&p)
+    while p.tok != T_EOF:
+        if p.tok == T_NAME and (p.kw == K_FROM or p.kw == K_IMPORT or p.kw == K_REQUIRE):
+            n = peek_tok(&p)
+            if n.tok == T_STR or (n.tok == T_OP and n.op == 40 and p.kw == K_REQUIRE):
+                s = save(&p)
+                next(&p)
+                if at_op(&p, 40):
+                    next(&p)
+                if p.tok == T_STR:
+                    spec = tok_text(&p)[1..len(tok_text(&p)) - 1]
+                    if spec != "" and not spec.starts_with(".") and not spec.starts_with("/") and not (spec in seen_pkg):
+                        seen_pkg[spec] = true
+                        ex.imports.push(spec)
+                restore(&p, s)
+        if p.tok == T_NAME and (p.kw == K_NAMESPACE or p.kw == K_MODULE):
+            n = peek_tok(&p)
+            if n.tok == T_NAME and not n.nlb:
+                next(&p)
+                name = tok_text(&p)
+                next(&p)
+                while at_op(&p, 46):
+                    next(&p)
+                    next(&p)
+                if at_op(&p, 123):
+                    ns_members[name] = namespace_members(&p)
+                continue
+        if at_op(&p, 123) or at_op(&p, 40) or at_op(&p, 91):
+            p.mute += 1
+            skip_group(&p)
+            p.mute -= 1
+            continue
+        if p.tok == T_OP and (p.op == 47 or (p.op == O_ASSIGN and p.src.byte(p.ts) == 47)) and regex_ok_prev(&p):
+            rescan_regex(&p)                     # a regex (its quotes aren't strings)
+            next(&p)
+            continue
+        if p.tok == T_TPL_HEAD:
+            template(&p)
+            continue
+        if tsx and jsx_starts(&p):
+            here = p.ts
+            e = jsx_skip(&p, here)
+            jsx_resume(&p, e)
+            continue
+        if p.tok == T_NAME and (p.kw == K_INTERFACE or p.kw == K_TYPE) and peek_tok(&p).tok == T_NAME and not peek_tok(&p).nlb:
+            next(&p)
+            local_types[tok_text(&p)] = true
+            next(&p)
+            continue
+        if p.tok == T_NAME and (p.kw == K_CONST or p.kw == K_LET or p.kw == K_VAR or p.kw == K_CLASS or p.kw == K_FUNCTION or p.kw == K_ENUM):
+            n = peek_tok(&p)
+            if n.tok == T_NAME and not n.nlb and n.kw != K_ENUM:
+                next(&p)
+                local_values[tok_text(&p)] = true    # a value too, even with a type of that name
+                next(&p)
+                continue
+        if not at_kw(&p, K_EXPORT):
+            next(&p)
+            continue
+        next(&p)
+        if at_op(&p, 61):                        # export = e
+            next(&p)
+            if p.tok == T_NAME:
+                export_eq = tok_text(&p)
+            continue
+        if at_kw(&p, K_DECLARE):
+            n = peek_tok(&p)
+            if n.kw == K_INTERFACE or n.kw == K_TYPE:
+                next(&p)                         # export declare interface / type: a type
+        if at_kw(&p, K_DEFAULT):
+            next(&p)
+            ex.types["default"] = at_kw(&p, K_INTERFACE)
+            continue
+        if at_kw(&p, K_INTERFACE) or (at_kw(&p, K_TYPE) and peek_tok(&p).tok == T_NAME):
+            next(&p)
+            type_only(&ex, tok_text(&p))
+            next(&p)
+            continue
+        if at_kw(&p, K_TYPE) and peek_tok(&p).tok == T_OP:
+            next(&p)                             # export type { ... } [from]: types
+            if at_op(&p, 123):
+                next(&p)
+                while not at_op(&p, 125) and p.tok != T_EOF:
+                    local = tok_text(&p)
+                    next(&p)
+                    name = local
+                    if at_kw(&p, K_AS):
+                        next(&p)
+                        name = tok_text(&p)
+                        next(&p)
+                    type_only(&ex, name)
+                    if not eat_op(&p, 44):
+                        break
+            continue
+        if at_op(&p, 42):                        # export * [as ns] from "x"
+            next(&p)
+            if at_kw(&p, K_AS):
+                next(&p)
+                ex.types[tok_text(&p)] = false
+                next(&p)
+                next(&p)
+                next(&p)
+                continue
+            next(&p)                             # from
+            if p.tok == T_STR:
+                t = tok_text(&p)
+                ex.reexports.push(ReExport(["*"], ["*"], t[1..len(t) - 1]))
+            next(&p)
+            continue
+        if at_op(&p, 123):
+            next(&p)
+            r = ReExport([], [], "")
+            while not at_op(&p, 125) and p.tok != T_EOF:
+                is_type = false
+                if at_kw(&p, K_TYPE) and peek_tok(&p).tok == T_NAME and peek_tok(&p).kw != K_AS:
+                    is_type = true
+                    next(&p)
+                local = tok_text(&p)
+                next(&p)
+                name = local
+                if at_kw(&p, K_AS):
+                    next(&p)
+                    name = tok_text(&p)
+                    next(&p)
+                if is_type:
+                    type_only(&ex, name)
+                else:
+                    r.names.push(name)
+                    r.remotes.push(local)
+                if not eat_op(&p, 44):
+                    break
+            next(&p)
+            if at_kw(&p, K_FROM):
+                next(&p)
+                if p.tok == T_STR:
+                    t = tok_text(&p)
+                    r.spec = t[1..len(t) - 1]
+                    ex.reexports.push(r)
+                next(&p)
+            else:
+                lists.push(r)
+            continue
+        # export class/function/const/enum/namespace/declare/import...: values
+        while p.tok == T_NAME and (p.kw == K_DECLARE or p.kw == K_ABSTRACT or p.kw == K_ASYNC or p.kw == K_CONST or p.kw == K_LET or p.kw == K_VAR or p.kw == K_CLASS or p.kw == K_FUNCTION or p.kw == K_ENUM or p.kw == K_NAMESPACE or p.kw == K_MODULE or p.kw == K_IMPORT):
+            next(&p)
+            eat_op(&p, 42)
+        if p.tok == T_NAME:
+            ex.types[tok_text(&p)] = false
+            next(&p)
+            # const a = 1, b = 2: the rest are skipped; enough for imports of classes and types
+    for r in lists:
+        for i in 0..len(r.names):
+            ex.types[r.names[i]] = (r.remotes[i] in local_types) and not (r.remotes[i] in local_values)
+    if export_eq != "" and (export_eq in ns_members):
+        m = ns_members[export_eq]
+        for k in m.keys():
+            if not (k in ex.types):
+                ex.types[k] = m[k]
+    return ex
+
+# At the "{" of a namespace body: its members, true for a type (interface, type alias).
+fn namespace_members(p: mut P) {str: bool}:
+    m: {str: bool} = {}
+    next(&p)
+    while not at_op(&p, 125) and p.tok != T_EOF:
+        if at_op(&p, 123) or at_op(&p, 40) or at_op(&p, 91):
+            p.mute += 1
+            skip_group(&p)
+            p.mute -= 1
+            continue
+        if p.tok == T_TPL_HEAD:
+            template(&p)
+            continue
+        if at_kw(&p, K_EXPORT) and peek_tok(&p).kw == K_TYPE:
+            next(&p)
+            if peek_tok(&p).tok == T_OP and peek_tok(&p).op == 123:
+                next(&p)
+                next(&p)                          # export type { a, b as c }: types
+                while not at_op(&p, 125) and p.tok != T_EOF:
+                    name = tok_text(&p)
+                    next(&p)
+                    if at_kw(&p, K_AS):
+                        next(&p)
+                        name = tok_text(&p)
+                        next(&p)
+                    m[name] = true
+                    if not eat_op(&p, 44):
+                        break
+                next(&p)
+                continue
+            continue
+        if at_kw(&p, K_EXPORT) or at_kw(&p, K_DECLARE):
+            next(&p)
+            continue
+        k = p.kw
+        if p.tok == T_NAME and (k == K_INTERFACE or k == K_TYPE or k == K_CLASS or k == K_FUNCTION or k == K_CONST or k == K_LET or k == K_VAR or k == K_ENUM or k == K_NAMESPACE):
+            n = peek_tok(&p)
+            if n.tok == T_NAME and not n.nlb:
+                next(&p)
+                name = tok_text(&p)
+                is_type = k == K_INTERFACE or k == K_TYPE
+                if not (name in m) or not is_type:
+                    m[name] = is_type
+                next(&p)
+                continue
+        next(&p)
+    next(&p)
+    return m
+
+# "./a.js" from "src/b/c" -> "src/b/a"; "" when it isn't a relative path.
+fn resolve_spec(from_file: str, spec: str) str:
+    if not (spec.starts_with("./") or spec.starts_with("../")):
+        return ""
+    k = len(from_file) - 1
+    while k >= 0 and from_file.byte(k) != 47:
+        k -= 1
+    dir = ""
+    if k >= 0:
+        dir = from_file[..k]
+    path = spec
+    if path.ends_with(".js") or path.ends_with(".ts") or path.ends_with(".mjs"):
+        d = len(path) - 1
+        while path.byte(d) != 46:
+            d -= 1
+        path = path[..d]
+    parts: [str] = []
+    if dir != "":
+        parts = dir.split("/")
+    for seg in path.split("/"):
+        if seg == "..":
+            if len(parts) > 0:
+                parts.pop()
+        elif seg != "." and seg != "":
+            parts.push(seg)
+    return "/".join(parts)
+
+# Is `name`, exported by the module `spec` imported from `file`, a type? 0 unknown, 1 type, 2 value.
+fn export_kind(pr: Project, file: str, spec: str, name: str, depth: int) int:
+    if depth > 8:
+        return 0
+    target = resolve_spec(file, spec)
+    if target == "" and len(pr.paths) > 0:
+        target = paths_target(pr, spec)
+    if target == "":
+        if not (spec in pr.pkgs):
+            return 0
+        target = pr.pkgs[spec]
+    if not (target in pr.files):
+        if (target + "/index" in pr.files):
+            target = target + "/index"
+        else:
+            return 0
+    ex = pr.files[target]
+    if (name in ex.types):
+        if ex.types[name]:
+            return 1
+        return 2
+    for r in ex.reexports:
+        for i in 0..len(r.names):
+            if r.names[i] == name or r.names[i] == "*":
+                remote = name
+                if r.names[i] != "*":
+                    remote = r.remotes[i]
+                k = export_kind(pr, target, r.spec, remote, depth + 1)
+                if k != 0:
+                    return k
+    return 0
+
+# `name` is exported as a type. A name that is also a value (declaration merging) stays a value:
+# an import of it is used at runtime.
+fn type_only(ex: mut Exports, name: str):
+    if not (name in ex.types):
+        ex.types[name] = true
+
+# ---- decorator metadata with the whole program's types (project mode)
+# A per-file tsc guards imported names in decorator metadata; a whole-program tsc writes a class
+# itself, or String / Number / Boolean / Array / Function / Object / void 0 by the type's kind.
+
+const SER_CLASS = 20        # a class (a value with construct signatures)
+const SER_ENUM = 21         # an enum: text "N" (numbers), "S" (strings), "O" (mixed)
+const SER_NULLISH = 22      # null / undefined (assignable to anything without strictNullChecks)
+const M_UNKNOWN = 0
+
+struct Decl:
+    file: str               # the files key it was found in ("" when not found)
+    ser: Ser
+
+fn scan_meta(src: str, tsx: bool, ex: mut Exports):
+    p = new_p(src, false)
+    p.tsx = tsx
+    p.mute += 1
+    next(&p)
+    while p.tok != T_EOF:
+        if at_op(&p, 123) or at_op(&p, 40) or at_op(&p, 91):
+            skip_group(&p)
+            continue
+        if p.tok == T_TPL_HEAD:
+            template(&p)
+            continue
+        if p.tok == T_OP and (p.op == 47 or (p.op == O_ASSIGN and p.src.byte(p.ts) == 47)) and regex_ok_prev(&p):
+            rescan_regex(&p)                     # /['"]/: a regex, not a division and strings
+            next(&p)
+            continue
+        if p.tok != T_NAME:
+            next(&p)
+            continue
+        k = p.kw
+        if k == K_EXPORT:
+            next(&p)
+            if at_kw(&p, K_DEFAULT):
+                next(&p)
+                if p.tok == T_NAME and (p.kw == 0 or p.kw > K_WITH) and p.kw != K_ABSTRACT and p.kw != K_ASYNC:
+                    n = peek_tok(&p)
+                    if (n.tok == T_OP and n.op == 59) or n.nlb or n.tok == T_EOF:
+                        ex.xlocal["default"] = tok_text(&p)
+                        next(&p)
+                        continue
+                if at_kw(&p, K_ABSTRACT):
+                    next(&p)
+                if at_kw(&p, K_CLASS):
+                    ex.meta["default"] = Ser(SER_CLASS, "", [], false)
+                    n = peek_tok(&p)
+                    if n.tok == T_NAME and n.kw != K_EXTENDS and n.kw != K_IMPLEMENTS:
+                        next(&p)
+                        ex.xlocal["default"] = tok_text(&p)
+                elif at_kw(&p, K_INTERFACE):
+                    ex.meta["default"] = ser(SER_OBJECT)
+                continue
+            if at_kw(&p, K_TYPE) and peek_tok(&p).tok == T_OP and peek_tok(&p).op == 123:
+                next(&p)
+            if at_op(&p, 123):
+                meta_export_list(&p, &ex)
+            continue
+        if k == K_IMPORT:
+            meta_import(&p, &ex)
+            continue
+        if k == K_DECLARE or k == K_ABSTRACT:
+            next(&p)
+            continue
+        if k == K_CLASS:
+            n = peek_tok(&p)
+            if n.tok == T_NAME and n.kw != K_EXTENDS and n.kw != K_IMPLEMENTS:
+                next(&p)
+                ex.meta[tok_text(&p)] = Ser(SER_CLASS, "", [], false)
+            next(&p)
+            continue
+        if k == K_INTERFACE:
+            n = peek_tok(&p)
+            if n.tok == T_NAME and not n.nlb:
+                next(&p)
+                name = tok_text(&p)
+                while p.tok != T_EOF and not at_op(&p, 123):
+                    if at_op(&p, 60):
+                        skip_type_params(&p)             # <T> (skip_group doesn't know <>)
+                    elif at_op(&p, 40) or at_op(&p, 91):
+                        skip_group(&p)
+                    else:
+                        next(&p)
+                s0 = save(&p)
+                callable = interface_callable(&p)
+                restore(&p, s0)
+                skip_group(&p)
+                if not (name in ex.meta) or ex.meta[name].kind == SER_OBJECT:
+                    if callable:
+                        ex.meta[name] = ser(SER_FUNCTION)
+                    else:
+                        ex.meta[name] = ser(SER_OBJECT)
+                continue
+            next(&p)
+            continue
+        if k == K_ENUM or (k == K_CONST and peek_tok(&p).kw == K_ENUM):
+            if k == K_CONST:
+                next(&p)
+            n = peek_tok(&p)
+            if n.tok == T_NAME and not n.nlb:
+                next(&p)
+                name = tok_text(&p)
+                next(&p)
+                if at_op(&p, 123):
+                    meta_enum(&p, &ex, name)
+                continue
+            next(&p)
+            continue
+        if k == K_TYPE:
+            n = peek_tok(&p)
+            if n.tok == T_NAME and not n.nlb:
+                next(&p)
+                name = tok_text(&p)
+                next(&p)
+                if at_op(&p, 60):
+                    skip_type_params(&p)
+                if eat_op(&p, O_ASSIGN) or eat_op(&p, 61):
+                    p.bad = false
+                    t = parse_type(&p)
+                    if not p.bad and not (name in ex.meta):
+                        ex.meta[name] = t
+                    p.bad = false
+                continue
+            next(&p)
+            continue
+        if k == K_NAMESPACE or k == K_MODULE:
+            n = peek_tok(&p)
+            if n.tok == T_NAME and not n.nlb:
+                next(&p)
+                next(&p)
+                while at_op(&p, 46):                 # namespace a.b.c
+                    next(&p)
+                    next(&p)
+                if at_op(&p, 123):
+                    next(&p)                         # into the body: its declarations count
+                continue
+            next(&p)
+            continue
+        if k == K_FUNCTION:
+            n = peek_tok(&p)
+            if n.tok == T_NAME and not n.nlb:
+                next(&p)
+                ex.meta["value:" + tok_text(&p)] = ser(SER_FUNCTION)
+            next(&p)
+            continue
+        if k == K_CONST or k == K_LET or k == K_VAR:
+            n = peek_tok(&p)
+            if n.tok == T_NAME and not n.nlb:
+                next(&p)
+                name = tok_text(&p)
+                next(&p)
+                if at_op(&p, 58):                    # a declared type: typeof is that type
+                    next(&p)
+                    p.bad = false
+                    t = parse_type(&p)
+                    if not p.bad:
+                        ex.meta["value:" + name] = t
+                    p.bad = false
+                    continue
+                if eat_op(&p, O_ASSIGN) or eat_op(&p, 61):
+                    v = M_UNKNOWN
+                    if p.tok == T_STR or p.tok == T_TPL or p.tok == T_TPL_HEAD:
+                        v = SER_STRING
+                    elif p.tok == T_NUM:
+                        v = SER_NUMBER
+                    elif at_op(&p, 123):
+                        ex.meta["value:" + name] = Ser(SER_OBJECT, "obj", [object_values(&p)], false)
+                        continue
+                    elif at_kw(&p, K_NEW):
+                        v = SER_OBJECT
+                    elif p.tok == T_NAME and (p.kw == 0 or p.kw > K_WITH):
+                        # const A = B (or B as const): typeof A is typeof B
+                        other = tok_text(&p)
+                        n2 = peek_tok(&p)
+                        if (n2.tok == T_OP and n2.op == 59) or n2.nlb or n2.tok == T_EOF or (n2.tok == T_NAME and n2.kw == K_AS):
+                            ex.meta["value:" + name] = Ser(SER_OBJECT, "alias", [Ser(SER_REF, other, [], false)], false)
+                        next(&p)
+                        continue
+                    elif at_op(&p, 91):
+                        v = SER_ARRAY
+                        ex.meta["value:" + name] = array_elems(&p)
+                        continue
+                    elif at_kw(&p, K_FUNCTION) or at_kw(&p, K_CLASS) and false:
+                        v = SER_FUNCTION
+                    if v != M_UNKNOWN:
+                        ex.meta["value:" + name] = ser(v)
+                continue
+            next(&p)
+            continue
+        next(&p)
+
+# import X, { a as b }, * as ns from "spec"; import x = require("spec")
+fn meta_import(p: mut P, ex: mut Exports):
+    next(&p)
+    if at_kw(&p, K_TYPE) and (peek_tok(&p).tok == T_NAME or (peek_tok(&p).tok == T_OP and (peek_tok(&p).op == 123 or peek_tok(&p).op == 42))):
+        if not (peek_tok(&p).tok == T_NAME and peek_tok(&p).kw == K_FROM):
+            next(&p)
+    names: [str] = []
+    remotes: [str] = []
+    if p.tok == T_NAME and p.kw != K_FROM:
+        local = tok_text(&p)
+        next(&p)
+        if at_op(&p, 61) or at_op(&p, O_ASSIGN):          # import x = require("m")
+            next(&p)
+            if p.tok == T_NAME and p.kw == K_REQUIRE:
+                next(&p)
+                if eat_op(&p, 40) and p.tok == T_STR:
+                    t = tok_text(&p)
+                    ex.imp[local] = t[1..len(t) - 1] + "\x01*"
+            return
+        names.push(local)
+        remotes.push("default")
+        eat_op(&p, 44)
+    if at_op(&p, 42):
+        next(&p)
+        if at_kw(&p, K_AS):
+            next(&p)
+            names.push(tok_text(&p))
+            remotes.push("*")
+            next(&p)
+    elif at_op(&p, 123):
+        next(&p)
+        while not at_op(&p, 125) and p.tok != T_EOF:
+            if at_kw(&p, K_TYPE) and peek_tok(&p).tok == T_NAME and peek_tok(&p).kw != K_AS:
+                next(&p)
+            remote = tok_text(&p)
+            next(&p)
+            local = remote
+            if at_kw(&p, K_AS):
+                next(&p)
+                local = tok_text(&p)
+                next(&p)
+            names.push(local)
+            remotes.push(remote)
+            if not eat_op(&p, 44):
+                break
+        eat_op(&p, 125)
+    if at_kw(&p, K_FROM):
+        next(&p)
+        if p.tok == T_STR:
+            t = tok_text(&p)
+            spec = t[1..len(t) - 1]
+            for i in 0..len(names):
+                ex.imp[names[i]] = spec + "\x01" + remotes[i]
+
+# export { a as b, c } (without `from`: with it, it's a re-export, in ex.reexports)
+fn meta_export_list(p: mut P, ex: mut Exports):
+    s0 = save(&p)
+    next(&p)
+    locals: [str] = []
+    outs: [str] = []
+    while not at_op(&p, 125) and p.tok != T_EOF:
+        if at_kw(&p, K_TYPE) and peek_tok(&p).tok == T_NAME and peek_tok(&p).kw != K_AS:
+            next(&p)
+        local = tok_text(&p)
+        next(&p)
+        out = local
+        if at_kw(&p, K_AS):
+            next(&p)
+            out = tok_text(&p)
+            next(&p)
+        locals.push(local)
+        outs.push(out)
+        if not eat_op(&p, 44):
+            break
+    eat_op(&p, 125)
+    if at_kw(&p, K_FROM):
+        next(&p)
+        if p.tok == T_STR:
+            t = tok_text(&p)
+            for i in 0..len(outs):
+                ex.xfrom[outs[i]] = t[1..len(t) - 1] + "\x01" + locals[i]
+        return
+    for i in 0..len(outs):
+        if outs[i] != locals[i]:
+            ex.xlocal[outs[i]] = locals[i]
+        if (locals[i] in ex.imp):
+            v = ex.imp[locals[i]]
+            cut = v.find("\x01")
+            if v[cut + 1..] != "*":
+                ex.reexports.push(ReExport([outs[i]], [v[cut + 1..]], v[..cut]))
+
+# At an enum's "{": its kind (numbers, strings, or mixed) and each member's.
+fn meta_enum(p: mut P, ex: mut Exports, name: str):
+    next(&p)
+    nums = false
+    strs = false
+    while not at_op(&p, 125) and p.tok != T_EOF:
+        member = tok_text(&p)
+        if p.tok == T_STR:
+            member = member[1..len(member) - 1]
+        next(&p)
+        kind = SER_NUMBER
+        if eat_op(&p, O_ASSIGN) or eat_op(&p, 61):
+            if p.tok == T_STR or p.tok == T_TPL or p.tok == T_TPL_HEAD:
+                kind = SER_STRING
+            depth = 0
+            while p.tok != T_EOF and not (depth == 0 and (at_op(&p, 44) or at_op(&p, 125))):
+                if at_op(&p, 40) or at_op(&p, 91) or at_op(&p, 123):
+                    skip_group(&p)
+                    continue
+                if p.tok == T_TPL_HEAD:
+                    template(&p)
+                    continue
+                next(&p)
+        ex.meta[name + "." + member] = ser(kind)
+        if kind == SER_STRING:
+            strs = true
+        else:
+            nums = true
+        if not eat_op(&p, 44):
+            break
+    eat_op(&p, 125)
+    t = "O"
+    if nums and not strs:
+        t = "N"
+    elif strs and not nums:
+        t = "S"
+    elif not nums and not strs:
+        t = "N"
+    ex.meta[name] = Ser(SER_ENUM, t, [], false)
+
+# The files key a module specifier names from `file`, or "".
+fn target_of(pr: Project, file: str, spec: str) str:
+    target = resolve_spec(file, spec)
+    if target == "" and len(pr.paths) > 0 and not spec.starts_with("."):
+        target = paths_target(pr, spec)
+        if target != "":
+            return target
+    if target == "":
+        if not (spec in pr.pkgs):
+            return ""
+        target = pr.pkgs[spec]
+    if (target in pr.files):
+        return target
+    if (target + "/index" in pr.files):
+        return target + "/index"
+    return ""
+
+# The declaration `name` stands for in the file `key` (declared there, imported, re-exported).
+fn find_decl(pr: Project, key: str, name: str, depth: int) Decl:
+    none = Decl("", ser(SER_OBJECT))
+    if depth > 12 or not (key in pr.files):
+        return none
+    ex = pr.files[key]
+    local = ex.xlocal.get(name, name)
+    if (local in ex.meta):
+        return Decl(key, ex.meta[local])
+    if (local in ex.imp) or (name in ex.xfrom):
+        v = ""
+        if (name in ex.xfrom):
+            v = ex.xfrom[name]
+        else:
+            v = ex.imp[local]
+        cut = v.find("\x01")
+        spec = v[..cut]
+        remote = v[cut + 1..]
+        t = target_of(pr, key, spec)
+        if t == "" or remote == "*":
+            return none
+        return find_decl(pr, t, remote, depth + 1)
+    for r in ex.reexports:
+        for i in 0..len(r.names):
+            if r.names[i] == name or r.names[i] == "*":
+                remote = name
+                if r.names[i] != "*":
+                    remote = r.remotes[i]
+                t = target_of(pr, key, r.spec)
+                if t != "":
+                    d = find_decl(pr, t, remote, depth + 1)
+                    if d.file != "":
+                        return d
+    return none
+
+# A dotted name (E.Member, ns.Type) or a plain one, as seen from the file `key`.
+fn find_ref(pr: Project, key: str, name: str, depth: int) Decl:
+    d = name.find(".")
+    if d < 0:
+        return find_decl(pr, key, name, depth)
+    first = name[..d]
+    rest = name[d + 1..]
+    if (key in pr.files):
+        ex = pr.files[key]
+        if (first in ex.imp):
+            v = ex.imp[first]
+            cut = v.find("\x01")
+            if v[cut + 1..] == "*":               # import * as ns: ns.X is X over there
+                t = target_of(pr, key, v[..cut])
+                if t != "" and rest.find(".") < 0:
+                    return find_decl(pr, t, rest, depth + 1)
+                return Decl("", ser(SER_OBJECT))
+    e = find_decl(pr, key, first, depth)
+    if e.file != "" and e.ser.kind == SER_ENUM and rest.find(".") < 0:
+        ex2 = pr.files[e.file]
+        full = ""
+        for k2 in ex2.meta.keys():
+            if k2.ends_with("." + rest) and ex2.meta[k2].kind != SER_ENUM:
+                full = k2
+                break
+        if full != "":
+            return Decl(e.file, ex2.meta[full])
+    return Decl("", ser(SER_OBJECT))
+
+# Global ES and Node classes: a whole-program tsc writes a reference to one as the class.
+fn global_class(name: str) bool:
+    return name == "Promise" or name == "Date" or name == "Map" or name == "Set" or name == "WeakMap" or name == "WeakSet" or name == "WeakRef" or name == "RegExp" or name == "Error" or name == "TypeError" or name == "RangeError" or name == "SyntaxError" or name == "ReferenceError" or name == "EvalError" or name == "URIError" or name == "AggregateError" or name == "ArrayBuffer" or name == "SharedArrayBuffer" or name == "DataView" or name == "Int8Array" or name == "Uint8Array" or name == "Uint8ClampedArray" or name == "Int16Array" or name == "Uint16Array" or name == "Int32Array" or name == "Uint32Array" or name == "Float32Array" or name == "Float64Array" or name == "BigInt64Array" or name == "BigUint64Array" or name == "Buffer" or name == "URL" or name == "URLSearchParams"
+
+# Global types a declaration may name that aren't in the project.
+fn global_kind(name: str) int:
+    if name == "Array" or name == "ReadonlyArray":
+        return SER_ARRAY
+    if name == "Function":
+        return SER_FUNCTION
+    if global_class(name) or name == "Record" or name == "Partial" or name == "Required" or name == "Pick" or name == "Omit" or name == "Readonly" or name == "Object" or name == "String" or name == "Number" or name == "Boolean" or name == "PromiseLike" or name == "Iterable" or name == "AsyncIterable" or name == "ArrayLike" or name == "ReadonlyMap" or name == "ReadonlySet" or name == "Iterator" or name == "IterableIterator":
+        return SER_OBJECT
+    if name == "Uppercase" or name == "Lowercase" or name == "Capitalize" or name == "Uncapitalize":
+        return SER_OBJECT                 # tsc doesn't evaluate intrinsic types for metadata
+    return M_UNKNOWN
+
+# The kind of type `s` (a declaration's type, in the file `key`) is, the way tsc's
+# getTypeReferenceSerializationKind sees it: SER_STRING .. SER_OBJECT, SER_VOID, or M_UNKNOWN.
+fn type_kind(pr: Project, key: str, s: Ser, strict: bool, depth: int) int:
+    if depth > 12:
+        return M_UNKNOWN
+    k = s.kind
+    if k == SER_STRING or k == SER_NUMBER or k == SER_BOOLEAN or k == SER_BIGINT or k == SER_SYMBOL or k == SER_ARRAY or k == SER_FUNCTION:
+        return k
+    if k == SER_ANY:
+        return SER_OBJECT
+    if k == SER_VOID:
+        if s.text == "null":
+            return SER_NULLISH
+        return SER_VOID
+    if k == SER_OBJECT:
+        if s.text == "typeof" and len(s.parts) == 1 and s.parts[0].text != "":
+            d = find_value(pr, key, s.parts[0].text, depth + 1)
+            if d.file == "":
+                return M_UNKNOWN
+            if d.ser.kind == SER_CLASS:
+                return SER_OBJECT                 # a constructor's type: no call signatures
+            return type_kind(pr, d.file, d.ser, strict, depth + 1)
+        if s.text == "index" and len(s.parts) == 2 and s.parts[1].kind == SER_NUMBER and s.parts[0].kind == SER_OBJECT and s.parts[0].text == "typeof" and len(s.parts[0].parts) == 1:
+            # (typeof VALUES)[number] of an array of strings (or numbers): their kind
+            d = find_value(pr, key, s.parts[0].parts[0].text, depth + 1)
+            if d.file != "" and d.ser.kind == SER_ARRAY:
+                return elem_kind(pr, d.file, d.ser, depth + 1)
+            return M_UNKNOWN
+        if s.text == "index" and len(s.parts) == 2 and is_typeof(s.parts[0]) and s.parts[1].text == "keyof" and len(s.parts[1].parts) == 1 and is_typeof(s.parts[1].parts[0]) and s.parts[1].parts[0].parts[0].text == s.parts[0].parts[0].text:
+            # (typeof O)[keyof typeof O] of an object literal of strings (or numbers): their kind
+            d = find_value(pr, key, s.parts[0].parts[0].text, depth + 1)
+            if d.file != "" and d.ser.kind == SER_OBJECT and d.ser.text == "obj":
+                return elem_kind(pr, d.file, d.ser.parts[0], depth + 1)
+            return M_UNKNOWN
+        if s.text == "index" or s.text == "keyof" or s.text == "typeof" or s.text == "infer" or s.text == "import":
+            return M_UNKNOWN
+        return SER_OBJECT
+    if k == SER_CLASS:
+        return SER_OBJECT                 # the instance type
+    if k == SER_ENUM:
+        if s.text == "N":
+            return SER_NUMBER
+        if s.text == "S":
+            return SER_STRING
+        return SER_OBJECT
+    if k == SER_REF:
+        d = find_ref(pr, key, s.text, depth + 1)
+        if d.file == "":
+            if s.text.find(".") < 0:
+                return global_kind(s.text)
+            return M_UNKNOWN
+        return type_kind(pr, d.file, d.ser, strict, depth + 1)
+    if k == SER_UNION:
+        if s.text == "cond":
+            return M_UNKNOWN
+        kinds: [int] = []
+        for part in s.parts:
+            pk = type_kind(pr, key, part, strict, depth + 1)
+            if pk == M_UNKNOWN:
+                return M_UNKNOWN
+            kinds.push(pk)
+        if s.inter:
+            for pk in kinds:
+                if pk == SER_STRING or pk == SER_NUMBER or pk == SER_BOOLEAN or pk == SER_BIGINT:
+                    return pk
+            return SER_OBJECT
+        # every part must be of the kind; null/undefined match any kind, or void with strictNullChecks
+        all_void = true
+        for pk in kinds:
+            if pk != SER_VOID and pk != SER_NULLISH:
+                all_void = false
+        if all_void:
+            return SER_VOID
+        result = M_UNKNOWN
+        for pk in kinds:
+            if pk == SER_NULLISH and not strict:
+                continue
+            if pk == SER_NULLISH or pk == SER_VOID:
+                return SER_OBJECT
+            if pk == SER_ARRAY or pk == SER_FUNCTION or pk == SER_OBJECT:
+                return SER_OBJECT
+            if result == M_UNKNOWN:
+                result = pk
+            elif result != pk:
+                return SER_OBJECT
+        if result == M_UNKNOWN:
+            return SER_OBJECT
+        return result
+    return M_UNKNOWN
+
+# Decorator metadata for the imported `remote` of `spec` (from `file`), then `.rest`, with the
+# whole program's types: SER_CLASS (the name itself), SER_STRING .. SER_VOID, or M_UNKNOWN (guarded).
+fn meta_of(pr: Project, file: str, spec: str, remote: str, rest: str, strict: bool) int:
+    if len(pr.files) == 0:
+        return M_UNKNOWN
+    t = target_of(pr, file, spec)
+    if t == "":
+        return M_UNKNOWN
+    name = remote
+    if remote == "*":
+        if rest == "" or rest.find(".") >= 0:
+            return M_UNKNOWN
+        name = rest
+    elif rest != "":
+        name = remote + "." + rest
+    d = find_ref(pr, t, name, 0)
+    if d.file == "":
+        return M_UNKNOWN
+    if d.ser.kind == SER_CLASS:
+        if name.find(".") >= 0:
+            return M_UNKNOWN
+        return SER_CLASS
+    return type_kind(pr, d.file, d.ser, strict, 0)
+
+# The value `name` stands for in the file `key` (for `typeof name`): its declared type, the
+# kind of its initializer, or a class.
+fn find_value(pr: Project, key: str, name: str, depth: int) Decl:
+    none = Decl("", ser(SER_OBJECT))
+    if depth > 12 or not (key in pr.files) or name.find(".") >= 0:
+        return none
+    ex = pr.files[key]
+    local = ex.xlocal.get(name, name)
+    if ("value:" + local in ex.meta):
+        v0 = ex.meta["value:" + local]
+        if v0.kind == SER_OBJECT and v0.text == "alias":
+            return find_value(pr, key, v0.parts[0].text, depth + 1)
+        return Decl(key, v0)
+    if (local in ex.meta) and ex.meta[local].kind == SER_CLASS:
+        return Decl(key, ex.meta[local])
+    if (local in ex.imp) or (name in ex.xfrom):
+        v = ""
+        if (name in ex.xfrom):
+            v = ex.xfrom[name]
+        else:
+            v = ex.imp[local]
+        cut = v.find("\x01")
+        t = target_of(pr, key, v[..cut])
+        if t == "" or v[cut + 1..] == "*":
+            return none
+        return find_value(pr, t, v[cut + 1..], depth + 1)
+    for r in ex.reexports:
+        for i in 0..len(r.names):
+            if r.names[i] == name or r.names[i] == "*":
+                remote = name
+                if r.names[i] != "*":
+                    remote = r.remotes[i]
+                t = target_of(pr, key, r.spec)
+                if t != "":
+                    d = find_value(pr, t, remote, depth + 1)
+                    if d.file != "":
+                        return d
+    return none
+
+# A bare specifier through tsconfig paths ("@app/shared/*": ["src/shared/*"]), or "".
+fn paths_target(pr: Project, spec: str) str:
+    for entry in pr.paths:
+        cut = entry.find("\x01")
+        pat = entry[..cut]
+        rest = ""
+        star = pat.find("*")
+        if star < 0:
+            if spec != pat:
+                continue
+        else:
+            pre = pat[..star]
+            post = pat[star + 1..]
+            if not (spec.starts_with(pre) and spec.ends_with(post) and len(spec) >= len(pre) + len(post)):
+                continue
+            rest = spec[len(pre)..len(spec) - len(post)]
+        for t in entry[cut + 1..].split("\x02"):
+            path = t.replace("*", rest)
+            for ext in [".ts", ".tsx", ".d.ts", ".js", ".mts", ".cts"]:
+                if path.ends_with(ext):
+                    path = path[..len(path) - len(ext)]
+                    break
+            if (path in pr.abs):
+                return pr.abs[path]
+            if (path + "/index" in pr.abs):
+                return pr.abs[path + "/index"]
+    return ""
+
+# At an array literal's "[": its elements for (typeof xs)[number]. text: its literals' kinds
+# ("s" / "n" / "sn", "?" unknown); parts: the names and spreads it holds. Skips the literal.
+fn array_elems(p: mut P) Ser:
+    s0 = save(&p)
+    next(&p)
+    flags = ""
+    parts: [Ser] = []
+    while not at_op(&p, 93) and p.tok != T_EOF:
+        if p.tok == T_STR or p.tok == T_TPL:
+            if not flags.contains("s"):
+                flags += "s"
+            next(&p)
+        elif p.tok == T_NUM:
+            if not flags.contains("n"):
+                flags += "n"
+            next(&p)
+        elif at_op(&p, O_DOTS):
+            next(&p)
+            if p.tok != T_NAME:
+                flags = "?"
+                break
+            parts.push(Ser(SER_REF, tok_text(&p), [], true))
+            next(&p)
+        elif p.tok == T_NAME and (p.kw == 0 or p.kw > K_WITH):
+            parts.push(Ser(SER_REF, tok_text(&p), [], false))
+            next(&p)
+        else:
+            flags = "?"
+            break
+        if not at_op(&p, 44) and not at_op(&p, 93):
+            flags = "?"                          # an expression, not just a name or literal
+            break
+        eat_op(&p, 44)
+    restore(&p, s0)
+    skip_group(&p)
+    return Ser(SER_ARRAY, flags, parts, false)
+
+fn is_typeof(s: Ser) bool:
+    return s.kind == SER_OBJECT and s.text == "typeof" and len(s.parts) == 1 and s.parts[0].text != ""
+
+# At an object literal's "{": its property values, as array_elems sees elements; methods, spreads,
+# computed keys and other expressions make it unknown (text "?"). Skips the literal.
+fn object_values(p: mut P) Ser:
+    s0 = save(&p)
+    next(&p)
+    flags = ""
+    parts: [Ser] = []
+    while not at_op(&p, 125) and p.tok != T_EOF:
+        if not (p.tok == T_NAME or p.tok == T_STR or p.tok == T_NUM):
+            flags = "?"
+            break
+        next(&p)
+        if not eat_op(&p, 58):
+            flags = "?"
+            break
+        if p.tok == T_STR or p.tok == T_TPL:
+            if not flags.contains("s"):
+                flags += "s"
+            next(&p)
+        elif p.tok == T_NUM:
+            if not flags.contains("n"):
+                flags += "n"
+            next(&p)
+        elif p.tok == T_NAME and (p.kw == 0 or p.kw > K_WITH):
+            parts.push(Ser(SER_REF, tok_text(&p), [], false))
+            next(&p)
+        else:
+            flags = "?"
+            break
+        if at_kw(&p, K_AS):
+            next(&p)
+            if not at_kw(&p, K_CONST):
+                flags = "?"
+                break
+            next(&p)
+        if not at_op(&p, 44) and not at_op(&p, 125):
+            flags = "?"
+            break
+        eat_op(&p, 44)
+    restore(&p, s0)
+    skip_group(&p)
+    return Ser(SER_ARRAY, flags, parts, false)
+
+# The kind of an array literal's elements (see array_elems): SER_STRING, SER_NUMBER,
+# SER_OBJECT (both), or M_UNKNOWN.
+fn elem_kind(pr: Project, key: str, a: Ser, depth: int) int:
+    if depth > 12 or a.text.contains("?"):
+        return M_UNKNOWN
+    strs = a.text.contains("s")
+    nums = a.text.contains("n")
+    for part in a.parts:
+        d = find_value(pr, key, part.text, depth + 1)
+        if d.file == "":
+            return M_UNKNOWN
+        k = M_UNKNOWN
+        if part.inter:
+            if d.ser.kind != SER_ARRAY:
+                return M_UNKNOWN
+            k = elem_kind(pr, d.file, d.ser, depth + 1)
+        else:
+            k = d.ser.kind
+        if k == SER_STRING:
+            strs = true
+        elif k == SER_NUMBER:
+            nums = true
+        elif k == SER_OBJECT:
+            strs = true
+            nums = true
+        else:
+            return M_UNKNOWN
+    if strs and nums:
+        return SER_OBJECT
+    if strs:
+        return SER_STRING
+    if nums:
+        return SER_NUMBER
+    return M_UNKNOWN

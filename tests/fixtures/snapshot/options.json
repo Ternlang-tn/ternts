@@ -1,0 +1,8 @@
+{
+  "about": "ternts-only flags tsc has no equivalent for: expected output is a reviewed ternts snapshot (refresh with --update and read the diff).",
+  "expect": "snapshot",
+  "sets": {
+    "importmeta": { "module": "commonjs", "useDefineForClassFields": false, "ternts": { "importMetaCjs": true }, "files": ["importmeta.ts"] },
+    "jesthoist":  { "module": "commonjs", "useDefineForClassFields": false, "ternts": { "jestHoist": true }, "files": ["jesthoist.ts"] }
+  }
+}

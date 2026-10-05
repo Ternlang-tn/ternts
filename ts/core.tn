@@ -1,0 +1,680 @@
+# Parser state, the output primitives, and the name bindings that rewrite
+# identifiers (imports, exported variables, namespace members).
+
+# output segments, joined at the end once import usage and types are known
+const S_TEXT = 0
+const S_IMPORT = 1      # imports[idx]: its require, or nothing if unused
+const S_DECORATE = 2    # classes[idx]: its __decorate calls (types resolve at the end)
+const S_SLOT = 3        # after a top-level declaration: `exports.x = x` for `export { x }`
+
+# binding kinds
+const B_IMPORT = 1      # named or default import: `mod_1.name`, called as `(0, mod_1.name)()`
+const B_NSIMPORT = 2    # `import * as ns` / `import x = require()`: kept, but marks the import used
+const B_EXPORT = 3      # `export const x`: `exports.x`
+const B_NSEXPORT = 4    # an exported namespace member: `NS.x`
+const B_SELF = 5        # a decorated class's own name inside it: `C_1`
+const B_ENUM = 6        # an enum member inside the enum's initializers: `E.x`
+const B_SELFPRIV = 7    # a class whose #private instance members refer to it: `C` in its members is `_a`
+const B_WATCH = 9       # a class's own name inside it: only notes where it is used
+const B_XDECL = 10      # an exported class or function: `C = x` also sets exports.C
+const B_XLIST = 11      # a top-level let/var in an `export { }` list: the same for assignments
+const B_ESMIMPORT = 8   # an import kept as an import (ESM output): unchanged, marks its specifier used
+const H_FORVAR = 17     # a hint: a top-level `for (var x ...)` variable an export list exports
+const H_XALIAS = 16     # a hint: `export let x` also in `export { x as y }`: assignments set exports.y too
+
+const BIND_SLOTS = 256
+const SEEN_WORDS = 256
+
+struct Seg:
+    kind: int
+    text: str
+    idx: int
+
+struct Bind:
+    name: str
+    h: int
+    kind: int
+    repl: str
+    imp: int            # index into imports, or -1
+    dbase: int          # local declarations from this index on can shadow it
+    active: bool
+    last_ref: int       # position of the last rewritten reference
+    sub: int            # ESM: which specifier of the import (-2 default, -3 namespace)
+
+struct Import:
+    spec: str           # the module name, quoted
+    var: str            # `common_1`, or the namespace/require name
+    ns: str             # `* as ns` name next to named bindings, else ""
+    named: bool         # has default or named bindings
+    used: bool
+    side: bool          # `import "x"`: always kept
+    kind: int           # 0 import declaration, 1 `import x = require()`, 2 `import x = A.B`
+    after: str          # re-export getters emitted right after the require
+    exported: bool      # `export import`
+    ns_used: bool       # the `* as ns` name next to named bindings is used
+    named_used: bool
+    names: [str]        # local names, in order (re-export getters follow it)
+    esm: bool           # printed back as an import (ESM output)
+    def: str            # ESM: default import name
+    specs: [str]        # ESM: named specifiers as written ("a", "b as c")
+    spec_used: [bool]
+    def_used: bool
+    top: bool           # top-level `import x = A.B` of a value or an unknown name: kept in a script
+    defer: bool         # `import defer * as ns`
+
+# something found by pass 1 that pass 2 must know from the start
+struct Hint:
+    pos: int            # scope start (for a shadowing local) or namespace body start
+    name: str
+    kind: int           # 0: a local declared in the scope at pos; else a binding kind
+    repl: str
+    imp: int
+    sub: int            # which name of the import (see Bind.sub)
+
+struct P:
+    src: str
+    n: int
+    pos, tok, op, ts, te, pe: int
+    nlb: bool
+    kw, h: int
+    kwh: [int]
+    kwid: [int]
+    kwname: [str]
+    cs: [int]
+    ce: [int]
+    ci: int
+    out: str
+    cp: int
+    mute: int
+    segs: [Seg]
+    use_define: bool
+    define_low: bool        # useDefineForClassFields below ES2022: fields become Object.defineProperty
+    err: str
+    retry: bool
+    hints: [Hint]
+    new_hints: [Hint]
+    # names
+    bh: [int]
+    binds: [Bind]
+    seen: [int]
+    dh: [int]           # local declarations that shadow a binding: hash, start, length
+    da: [int]
+    dl: [int]
+    sc_start: [int]     # scopes: start position, function scope?, declaration stack base
+    sc_fn: [bool]
+    sc_base: [int]
+    ns_start: int       # body start of the namespace being emitted (0: module level)
+    # module
+    is_module: bool
+    imports: [Import]
+    modnames: {str: int}
+    exported: [str]           # names for the `exports.x = void 0` list, in order
+    fn_exports: [str]         # `exports.f = f;` lines hoisted to the top
+    export_alias: {str: [str]}     # local name -> exported names, from `export { x as y }`
+    has_slot_alias: bool
+    helpers: int
+    temps: int
+    aliases: [str]            # `var C_1;` for decorated classes that refer to themselves
+    under: [str]              # identifiers like `_a` in the file, which temps must avoid
+    classes: [ClassInfo]
+    locals: {str: int}        # top-level (and nested) declarations for metadata: kind
+    enum_kind: {str: int}
+    alias_ser: {str: Ser}
+    star_names: [str]
+    use_strict: bool
+    bad: bool
+    no_cond: int
+    tparams: [str]
+    ns_name: str
+    markers: bool
+    has_export_list: bool
+    export_equals: bool
+    export_eq: str      # the `module.exports = x` statement, emitted last
+    export_items: [ExportItem]
+    last_asi: bool
+    in_gen: int
+    in_async: int
+    enum_vals: {str: EV}
+    ns_decl: {str: bool}
+    temp_seq: int
+    temp_names: [str]
+    no_wrap: bool
+    name_base: [str]
+    name_imp: [int]
+    name_got: [str]
+    forced: [str]
+    has_at: bool
+    fn_stack: [int]
+    fn_alias: [[str]]
+    fn_temps: [[str]]
+    in_static: int
+    self_static: bool
+    cur_fn: int
+    class_statics: bool
+    self_bind: int
+    alias_count: {str: int}
+    want_slots: bool
+    early_used: {int: bool}
+    nslots: int
+    plain: bool
+    assert_end: int
+    assert_lhs: bool
+    const_vals: {str: EV}
+    static_priv: bool
+    has_hash: bool      # the source has "#" (private members)
+    spriv_bind: int     # the B_SELFPRIV binding of the class being parsed, or -1
+    cf_temps: [str]     # temps of tsc's class fields transform (see field_temp)
+    fn_cf_temps: [[str]]
+    early_subs: {str: bool}  # "imp:sub" of the names of imports used before the import
+    star_at: int        # where __importStar was first needed (-1: not yet)
+    xstar_at: int       # where __exportStar was first needed
+    import_at: [int]    # where each import is
+    tsx: bool           # a .tsx file: "<" starts JSX, not a type assertion
+    jsx: int            # JSX_AUTO, JSX_DEV, JSX_REACT or JSX_PRESERVE (jsx.tn)
+    jsx_source: str     # jsxImportSource ("react")
+    jsx_factory: str    # jsxFactory ("React.createElement")
+    jsx_frag: str       # jsxFragmentFactory ("React.Fragment")
+    jsx_file: str       # the file name react-jsxdev reports
+    jsx_end: int
+    jsx_brace_end: int
+    jsx_spread: bool
+    jsx_inline: str
+    jsx_events: [str]   # runtime functions used, in the order tsc asks for them
+    jsx_uses_file: bool
+    jsx_seen: bool
+    jsx_ce: bool        # the implicit `createElement` import is numbered first (pass 2)
+    want_ce: bool
+    numbered: {str: bool}   # identifiers ending in a digit, seen by the lexer
+    reserved: {str: int}    # module variable bases already numbered by the runtime imports
+    ns_folded: {str: bool}  # top-level enums/namespaces whose export is folded into their IIFE (`X || (exports.X = X = {})`)
+    ns_xdecl: {str: bool}   # top-level enums/namespaces declared with `export`
+    node_module: bool       # module node16..nodenext: CommonJS output keeps import() (Node has it)
+    preserve: bool          # module preserve (see Opts)
+    es2015_module: bool     # module es2015 (see Opts)
+    native_accessor: bool   # target ESNext: `accessor x` stays (tsc lowers it below)
+    ns_blocks: {int: str}   # namespace bodies and their paths (ns_scan), for merged declarations
+    ns_xmap: {str: [str]}   # what each namespace path's blocks export (ns_scan)
+    ns_scanned: bool        # ns_scan has run (at the first namespace declaration)
+    top_vars: {str: bool}   # top-level let/var names (export lists make them B_XLIST)
+    list_default: bool  # `export { x as default }`: "default" is in the `= void 0` list
+    assigned: {str: bool}   # plain names assigned to somewhere (so far)
+    xlist_names: [str]  # exported by a list, not (yet) seen assigned
+    xlist_chains: [str]
+    ns_path: [str]          # the enclosing namespaces' names (enum values are known by path too)
+    sup_name: str           # a lowered async method's _super / _superIndex (lower.tn super_names_of)
+    sup_index_name: str
+    for_vars: [str]         # top-level for-head `var` names (an export list naming one: H_FORVAR)
+    u_hoist: bool           # the next using block is a switch of the module's top-level using block
+    u_hoisted: [int]        # such blocks: their env_N is the module's `var` (assigned, not const)
+    top_var_stmt: str       # topusing.tn's `var a, b;` before the block ("" when it's top_pro)
+    spl: bool               # the class being parsed lowers only its static #private members (TC39-decorated, ES2022)
+    priv_low: bool          # #private access is lowered where recorded (below ES2022, or spl_file)
+    class_outer: int        # the start of the outermost class being parsed (-1: none)
+    spl_file: bool          # the file has such a class: #private access is lowered where recorded
+    alias_deps: str         # `import f = foo.M`: "f_idx foo_idx flags;" (foo is used if f is)
+    has_xalias: bool        # an H_XALIAS hint: B_EXPORT references check for it (export_alias_ref)
+    metadata: bool      # emitDecoratorMetadata
+    legacy_decorators: bool
+    no_emit_helpers: bool   # noEmitHelpers
+    esdec_helpers: [str]    # helpers the TC39 decorators' rewrite uses (esdecorators.tn)
+    pending_deco: str       # TC39 decorators taken from after `export`, for the class to write
+    st_named: bool          # the class being lowered names itself (a named-evaluation block)
+    verbatim: bool      # verbatimModuleSyntax
+    import_meta_cjs: bool  # CommonJS output: import.meta.url etc. become their require-time forms
+    always_strict: bool # alwaysStrict: a file that isn't a module gets "use strict"
+    jest_hoist: bool    # CommonJS output: top-level jest.mock(...) calls move above the requires
+    hoisted: str        # ... their output, put at the top of the body by finish()
+    import_src: {str: str}  # project mode: an imported local name -> spec "\x01" remote (for metadata)
+    has_use_strict: bool  # the source's own directive prologue has "use strict"
+    directives: str     # the source's directive prologue, moved to the top
+    class_ref: str      # `_a = C;` for the exported class just parsed, to follow its export
+    tparam_cons: {str: Ser}
+    esm: bool
+    esm_kept: bool
+    nested_markers: bool
+    esm_lists: [EsmList]
+    project: Project
+    file: str           # this file's path without extension (project mode)
+    interop: bool       # esModuleInterop
+    strict: bool        # strictNullChecks (null/undefined count in metadata unions)
+    has_using: bool     # blocks get `using` markers (see using.tn)
+    top_block: int      # where the block after a top-level `using` starts (topusing.tn), or -1
+    top_u: int          # its u_blocks id while it's parsed (its `using`s assign), or -1
+    top_pro: [str]      # names it hoists into the prologue's `var` (TopUsing.pro)
+    want_top_using: bool  # found `using` at the top level: parse again rewritten (topusing.tn)
+    embedded: bool      # the next statement is the body of an if/else/loop/with (stmt.tn)
+    embed_var: bool     # an enum/namespace there: declared with var, in a block
+    ppat: bool          # in a destructuring assignment with #private targets (private.tn)
+    ppat_pre: [str]     # ... its receivers' temps, assigned before it
+    fa_label: str       # the label of the for await being lowered (moved onto its loop)
+    for_inc: bool       # parsing a for loop's increment expression
+    empty_stmt: bool    # an empty statement was parsed (in the namespace body being parsed)
+    rb: [LexState]      # a lookahead's tokens (lex.tn rb_lex), replayed by next() while rb_n > 0
+    rb_from: [int]      # where each was lexed from
+    rb_on: bool
+    rb_len: int
+    rb_cur: int
+    rb_n: int
+    keep_pprops: bool   # parameter properties stay as written (api.tn transpile_esdec's first pass)
+    ir: [Nd]            # expression trees being lowered (ir.tn), a stack of roots
+    ir_kids: [int]      # their lists' children
+    ir_strs: [str]      # their generated texts
+    ir_need: bool       # the root being parsed needs lowering
+    ir_base: int        # where its nodes start in p.ir
+    ir_root_n: int      # the root being lowered, and whether its value is unused
+    ir_root_unused: bool
+    ir_mode: bool       # roots go through them
+    ir_low: bool        # (for ?. ?? ||= **: all of them; for #private names, those in their classes)
+    ir_skip: bool       # the next assign() is the old parser's (a form the trees leave as text)
+    ir_asserted: int    # the node a type assertion (as, !, <T>) last applied to
+    esdec_pass: bool    # this source is the TC39 decorators' rewrite (esdecorators.tn)
+    ct_alias: str       # a class's statics alias given (priv_class): its _classThis
+    top_anon: int       # topusing.tn named the unnamed default class here: its name isn't written
+    pk_at: int          # the token peek_tok lexed from this position (pk): next() reuses it
+    pk: LexState
+    expr_stmt: int      # where the latest expression statement starts (its value is unused)
+    cond_at: int        # where the first branch of the conditional being parsed starts
+    rest_seq: int       # how many async generator helpers were wanted before __rest
+    want_dn: bool       # a member needs its unnamed class's name (class.tn: default_1)
+    keep_spread: bool   # the next object literal keeps its spreads (a JSX {...{ }} to inline)
+    want_using: bool    # a `using` declaration was found: parse again with has_using
+    u_stack: [int]
+    u_blocks: [UBlock]
+    u_reqs: [UReq]
+    u_seq: int
+    u_fn: [int]
+    u_fns: int
+    u_pre_var: int
+    u_pre_name: str
+    u_pre_async: bool
+    target: int         # the ES year output is lowered to (9999: ESNext, nothing lowered)
+    # below ES2022, static fields and blocks move out of the class (lower.tn)
+    st_on: bool         # in a static initializer or block: `this` is the class
+    st_super: str       # below ES2022: the temp holding the base of a class whose statics use `super`, or ""
+    st_start: int       # where the class whose statics are being parsed starts (its hints' key)
+    st_kind: int        # ST_DECL, ST_EXPR, ST_DECORATED
+    st_tmp: str         # the class's temp: `_a = C` (a declaration) or `(_a = class ...)`
+    st_fn: int          # the function the class is in (where its temp is declared), or -1
+    st_list: [str]      # the moved initializers and blocks, "\x02" standing for the class
+    oc_ref: str         # how the last lowered chain refers to its object (the name or its temp)
+    lt_mod: [[str]]     # temps of the lowering transforms at the top level, by year - 2015
+    fn_lt: [[[str]]]    # ... in each function (as fn_temps)
+    fn_pre: [str]       # statements a function's body starts with: its moved parameter defaults
+    pre_fn: int         # the function opened for the parameters just parsed (its body takes it)
+    init_fn: int        # below ES2022: the constructor's variable lists, where field initializers move, or -1
+    ctor_fn: int        # ... and the explicit constructor's own, once parsed
+    actx: [ACtx]        # below ES2017: the async functions being lowered (lower.tn)
+    aw: [int]           # ... the innermost last (-1: a plain function, which hides them)
+    sctx: [ACtx]        # below ES2017: non-async methods where an async arrow's `super.x` goes (in aw as -2 - index)
+    async_at: int       # where the `async` keyword of the function being parsed is, or -1
+    uniq: {str: int}    # x_1-style names made so far, by base
+    enum_strs: {str: bool}  # (enum.tn) members with string values (E.A: no reverse mapping)
+    enum_cur: str           # (enum.tn) the enum being declared, its body's start, its member
+    enum_body_at: LexState  # being written, and the members it declares later (found lazily)
+    enum_member: str
+    enum_seen: [str]        # the members of this enum block declared so far
+    enum_later: [str]
+    enum_later_done: bool
+    loop_body: bool         # the statement parsed next is a loop's body
+    loop_at: [int]          # loop body blocks open: where their `let` of #private names goes,
+    loop_lets: [[str]]      # the names,
+    loop_sc: [int]          # and their scope depth
+    ts_syntax: int          # TypeScript syntax stripped so far (annotations, modifiers, as, !)
+    esm_default_at: int     # (module.tn esm_class) the class of an ES module `export default class C`
+    id_built: bool          # (using.tn file_ident) the file's identifiers, found once
+    id_set: {str: bool}
+    u_parent: [int]         # (using.tn) each function's enclosing function, by u_fn number - 1
+    gen_names: {str: bool}  # names made by scoped_name (parameter copies): unique_name avoids them
+    ns_dot_top: bool        # (enum.tn) the dotted namespace being written is at the top level
+    cr_name: str            # module node16+ ES module output: the createRequire function's name (once used)
+    vd_built: bool          # (module.tn value_declared) the file's top-level value names, found once
+    vd_names: {str: bool}
+    ns_params: {str: str}   # renamed namespace IIFE parameters, by the block's position and name
+    made: [str]         # names generated for the function being lowered (x_1, args_2)
+    privs: [PrivClass]  # below ES2022: the classes whose #private members are lowered (private.tn)
+    priv_cur: int       # ... the one being parsed, or -1
+    priv_rec: [str]     # first pass: each class's private members, as recorded
+    priv_init: str      # the class's `_a = C, _C_x = new WeakMap(), ...` (statics_text)
+    priv_order: [int]   # the private-member helpers, in the order first used
+    pq: [[int]]         # ... requested in each class being parsed (bucket * 1000000 + helper)
+    priv_bucket: int    # 0 the constructor body, 1 a field initializer, 2 anything else, 3 statics
+    pq_member: [int]    # (with pq) the member being parsed, by index, in each recording class
+    pq_ctor: [int]      # ... and its constructor's index (-1: none so far)
+    fn_name: str        # the name of the function about to be parsed (an async generator's inner one)
+    agen_order: [int]   # asyncgen.tn's helpers, in the order asked for
+    loop_depth: int     # loops around (in this function): a lowered for await resets its error
+    in_pattern: bool    # parsing an assignment pattern (below ES2018: its rest isn't a spread)
+    defer_st: bool      # a top-level class statement whose export-list slot comes first: its statics wait (flush_class_ref)
+    this_depth: int     # functions and classes around (an arrow at the top level has no `this`)
+
+const H_DECORATE = 1
+const H_METADATA = 2
+const H_PARAM = 4
+const H_CREATE_BINDING = 8
+const H_EXPORT_STAR = 16
+const H_REST = 32
+const H_IMPORT_DEFAULT = 64
+const H_IMPORT_STAR = 128       # needs __createBinding and __setModuleDefault too
+
+fn new_p(src: str, use_define: bool) P:
+    p = P(src=src, n=len(src), pos=0, tok=0, op=0, ts=0, te=0, pe=0, nlb=false, kw=0, h=0,
+        kwh=[], kwid=[], kwname=[], cs=[], ce=[], ci=0, out="", cp=0, mute=0, segs=[],
+        use_define=use_define, define_low=false, err="", retry=false, hints=[], new_hints=[],
+        bh=[-1] * BIND_SLOTS, binds=[], seen=[0] * SEEN_WORDS, dh=[], da=[], dl=[],
+        sc_start=[], sc_fn=[], sc_base=[], ns_start=0,
+        is_module=false, imports=[], modnames={}, exported=[], fn_exports=[], export_alias={},
+        has_slot_alias=false, helpers=0, temps=0, aliases=[], under=[], classes=[], locals={},
+        enum_kind={}, alias_ser={}, star_names=[], use_strict=false, bad=false, no_cond=0, tparams=[],
+        ns_name="", markers=false, has_export_list=false, export_equals=false, export_eq="", export_items=[],
+        last_asi=false, in_gen=0, in_async=0, enum_vals={}, ns_decl={}, temp_seq=0, temp_names=[], no_wrap=false,
+        name_base=[], name_imp=[], name_got=[], forced=[], has_at=false, fn_stack=[], fn_alias=[], fn_temps=[],
+        in_static=0, self_static=false, cur_fn=-1, class_statics=false, self_bind=-1, alias_count={}, want_slots=false, early_used={}, nslots=0, plain=false, assert_end=-1, assert_lhs=false, const_vals={}, static_priv=false, has_hash=false, spriv_bind=-1, class_ref="", directives="", import_meta_cjs=false, jest_hoist=false, hoisted="", import_src={}, always_strict=false, has_use_strict=false, metadata=true, legacy_decorators=true, pending_deco="", st_named=false, no_emit_helpers=false, esdec_helpers=[], verbatim=false, xlist_names=[], xlist_chains=[], has_xalias=false, alias_deps="", spl=false, spl_file=false, priv_low=false, class_outer=-1, u_hoist=false, u_hoisted=[], top_var_stmt="", for_vars=[], sup_name="", sup_index_name="", ns_path=[], assigned={}, list_default=false, top_vars={}, numbered={}, reserved={}, ns_folded={}, ns_xdecl={}, node_module=false, preserve=false, es2015_module=false, native_accessor=false, ns_blocks={}, ns_xmap={}, ns_scanned=false, tsx=false, jsx=0, jsx_source="react", jsx_factory="React.createElement", jsx_frag="React.Fragment", jsx_file="", jsx_end=0, jsx_brace_end=0, jsx_spread=false, jsx_inline="", jsx_events=[], jsx_uses_file=false, jsx_seen=false, jsx_ce=false, want_ce=false, star_at=-1, xstar_at=-1, import_at=[], early_subs={}, cf_temps=[], fn_cf_temps=[], tparam_cons={}, esm=false, esm_kept=false, nested_markers=false, esm_lists=[], project=empty_project(), file="", interop=false, strict=false,
+        has_using=false, top_block=-1, top_u=-1, top_pro=[], top_anon=-1, want_top_using=false, embedded=false, embed_var=false, ppat=false, ppat_pre=[], fa_label="", for_inc=false, empty_stmt=false, rb=[], rb_from=[], rb_on=false, rb_len=0, rb_cur=0, rb_n=0, keep_pprops=false, ir=[], ir_kids=[], ir_strs=[], ir_need=false, ir_base=0, ir_root_n=-1, ir_root_unused=false, ir_mode=false, ir_low=false, ir_skip=false, ir_asserted=-1, esdec_pass=false, ct_alias="", pk_at=-1, pk=LexState(0, 0, 0, 0, 0, 0, false, 0, 0, 0), cond_at=-1, expr_stmt=-1, rest_seq=0, want_dn=false, keep_spread=false, want_using=false, u_stack=[], u_blocks=[], u_reqs=[], u_seq=0, u_fn=[], u_fns=0, u_pre_var=-1, u_pre_name="", u_pre_async=false, target=9999, st_on=false, st_super="", st_start=-1, st_kind=0, st_tmp="", st_fn=-1, st_list=[], oc_ref="", lt_mod=[], fn_lt=[], fn_pre=[], pre_fn=-1, init_fn=-1, ctor_fn=-1, actx=[], aw=[], sctx=[], async_at=-1, uniq={}, ns_params={}, enum_strs={}, enum_cur="", enum_body_at=LexState(0, 0, 0, 0, 0, 0, false, 0, 0, 0), enum_member="", enum_seen=[], enum_later=[], enum_later_done=true, loop_body=false, loop_at=[], loop_lets=[], loop_sc=[], ts_syntax=0, esm_default_at=-1, id_built=false, id_set={}, u_parent=[], gen_names={}, ns_dot_top=false, cr_name="", vd_built=false, vd_names={}, this_depth=0, made=[], defer_st=false, privs=[], priv_cur=-1, priv_rec=[], priv_init="", priv_order=[], pq=[], priv_bucket=2, pq_member=[], pq_ctor=[], fn_name="", agen_order=[], loop_depth=0, in_pattern=false)
+    return p
+
+fn fail(p: mut P, msg: str):
+    if p.err == "":
+        line = 1
+        for k in 0..min(p.ts, p.n):
+            if p.src.byte(k) == 10:
+                line += 1
+        p.err = f"{line}: {msg}"
+
+# ---------------------------------------------------------------- output
+
+# Copy the source up to `to`, leaving out comments.
+fn emit_to(p: mut P, to: int):
+    if to <= p.cp or p.mute > 0:
+        return
+    o = p.out
+    p.out = ""
+    while p.ci < len(p.cs) and p.cs[p.ci] < to:
+        a = p.cs[p.ci]
+        if a > p.cp:
+            o += p.src[p.cp..a]
+        if p.ce[p.ci] > p.cp:
+            p.cp = p.ce[p.ci]
+        p.ci += 1
+    if to > p.cp:
+        o += p.src[p.cp..to]
+        p.cp = to
+    p.out = o
+
+# Drop the source up to `to`.
+fn skip_to(p: mut P, to: int):
+    if p.mute > 0:
+        return
+    if to > p.cp:
+        p.cp = to
+    while p.ci < len(p.cs) and p.cs[p.ci] < p.cp:
+        p.ci += 1
+
+fn emit_ts(p: mut P):
+    t = p.ts
+    emit_to(&p, t)
+
+fn emit_te(p: mut P):
+    t = p.te
+    emit_to(&p, t)
+
+fn emit_pe(p: mut P):
+    t = p.pe
+    emit_to(&p, t)
+
+fn emit_all(p: mut P):
+    t = p.n
+    emit_to(&p, t)
+
+fn skip_ts(p: mut P):
+    t = p.ts
+    skip_to(&p, t)
+
+fn skip_te(p: mut P):
+    t = p.te
+    skip_to(&p, t)
+
+fn skip_pe(p: mut P):
+    t = p.pe
+    skip_to(&p, t)
+
+fn push_scope_here(p: mut P, is_fn: bool):
+    t = p.ts
+    push_scope(&p, t, is_fn)
+
+fn declare_tok(p: mut P, hoist: bool):
+    a = p.ts
+    b = p.te
+    h = p.h
+    declare(&p, a, b, h, hoist)
+
+fn put(p: mut P, s: str):
+    if p.mute == 0:
+        o = p.out
+        p.out = ""
+        o += s
+        p.out = o
+
+# Start a separate output buffer; `end_capture` returns what was written to it.
+fn begin_capture(p: mut P) str:
+    saved = p.out
+    p.out = ""
+    return saved
+
+fn end_capture(p: mut P, saved: take str) str:
+    text = p.out
+    p.out = saved
+    return text
+
+fn seg(p: mut P, kind: int, idx: int):
+    p.segs.push(Seg(S_TEXT, p.out, 0))
+    p.out = ""
+    p.segs.push(Seg(kind, "", idx))
+
+fn tok_text(p: mut P) str:
+    return p.src[p.ts..p.te]
+
+fn at_op(p: mut P, op: int) bool:
+    return p.tok == T_OP and p.op == op
+
+fn at_kw(p: mut P, kw: int) bool:
+    return p.tok == T_NAME and p.kw == kw
+
+fn expect_op(p: mut P, op: int):
+    if p.tok == T_OP and p.op == op:
+        next(&p)
+    else:
+        fail(&p, f"expected '{chr(op)}' but found '{tok_text(&p)}'")
+        next(&p)
+
+fn eat_op(p: mut P, op: int) bool:
+    if p.tok == T_OP and p.op == op:
+        next(&p)
+        return true
+    return false
+
+# The next token, without consuming the current one.
+fn peek_tok(p: mut P) LexState:
+    if p.pos == p.pk_at:
+        return p.pk                              # (lexed already)
+    s = save(&p)
+    next(&p)
+    r = save(&p)
+    if len(p.cs) == s.nc:                        # (no comments read: next() may reuse it)
+        p.pk_at = s.pos
+        p.pk = r
+        p.rb_n = 0                               # (a replay stops here)
+    restore(&p, s)
+    return r
+
+# ---------------------------------------------------------------- names
+
+fn seen_mark(p: mut P, h: int):
+    p.seen[(h >> 6) & (SEEN_WORDS - 1)] = p.seen[(h >> 6) & (SEEN_WORDS - 1)] | (1 << (h & 63))
+
+fn seen_has(p: mut P, h: int) bool:
+    return (p.seen[(h >> 6) & (SEEN_WORDS - 1)] & (1 << (h & 63))) != 0
+
+# The active binding for the name at [a, b), innermost first, or -1.
+fn find_bind(p: mut P, a: int, b: int, h: int) int:
+    slot = h & (len(p.bh) - 1)
+    found = -1
+    while p.bh[slot] != -1:
+        k = p.bh[slot]
+        if p.binds[k].h == h and p.binds[k].active and same_text(p.src, a, b - a, p.binds[k].name):
+            found = k
+        slot = (slot + 1) & (len(p.bh) - 1)
+    return found
+
+fn find_bind_name(p: mut P, name: str) int:
+    h = hash_of(name)
+    slot = h & (len(p.bh) - 1)
+    found = -1
+    while p.bh[slot] != -1:
+        k = p.bh[slot]
+        if p.binds[k].h == h and p.binds[k].active and p.binds[k].name == name:
+            found = k
+        slot = (slot + 1) & (len(p.bh) - 1)
+    return found
+
+fn add_bind(p: mut P, name: str, kind: int, repl: str, imp: int) int:
+    return add_bind_sub(&p, name, kind, repl, imp, -1)
+
+fn add_bind_sub(p: mut P, name: str, kind: int, repl: str, imp: int, sub: int) int:
+    h = hash_of(name)
+    late = kind == B_IMPORT or kind == B_NSIMPORT or kind == B_EXPORT or kind == B_NSEXPORT or kind == B_ESMIMPORT or kind == B_XLIST
+    if late and seen_has(&p, h) and not has_hint(&p, name, kind):
+        # the name was used before this binding existed: parse again knowing it
+        p.retry = true
+        p.new_hints.push(Hint(p.ns_start, name, kind, repl, imp, sub))
+    dbase = len(p.dh)
+    if late and len(p.hints) > 0 and len(p.sc_start) == 0 and top_shadow_hinted(&p, name):
+        dbase = 0                                # (shadowed by a top-level declaration from the start)
+    p.binds.push(Bind(name, h, kind, repl, imp, dbase, true, -1, sub))
+    slot_bind(&p, len(p.binds) - 1)
+    return len(p.binds) - 1
+
+fn top_shadow_hinted(p: mut P, name: str) bool:
+    for x in p.hints:
+        if x.kind == 0 and x.pos == 0 and x.name == name:
+            return true
+    return false
+
+# Put binds[k] in the hash table, growing it (with only the active bindings) when half full.
+fn slot_bind(p: mut P, k: int):
+    p.nslots += 1
+    if p.nslots * 2 > len(p.bh):
+        size = len(p.bh)
+        live = 0
+        for b in p.binds:
+            if b.active:
+                live += 1
+        while live * 4 > size:
+            size *= 2
+        p.bh = [-1] * size
+        p.nslots = 0
+        for i in 0..len(p.binds):
+            if p.binds[i].active:
+                p.nslots += 1
+                put_slot(&p, i)
+        return
+    put_slot(&p, k)
+
+fn put_slot(p: mut P, k: int):
+    slot = p.binds[k].h & (len(p.bh) - 1)
+    while p.bh[slot] != -1:
+        slot = (slot + 1) & (len(p.bh) - 1)
+    p.bh[slot] = k
+
+fn has_hint(p: mut P, name: str, kind: int) bool:
+    for x in p.hints:
+        if x.kind == kind and x.name == name:
+            return true
+    return false
+
+# Bindings pass 1 found late, for the scope starting at `pos`.
+fn apply_hints(p: mut P, pos: int):
+    for k in 0..len(p.hints):
+        if p.hints[k].pos == pos and p.hints[k].kind != 0:
+            x = p.hints[k]
+            if find_bind_name(&p, x.name) < 0 or p.binds[find_bind_name(&p, x.name)].kind != x.kind:
+                h = hash_of(x.name)
+                p.binds.push(Bind(x.name, h, x.kind, x.repl, x.imp, len(p.dh), true, -1, x.sub))
+                slot_bind(&p, len(p.binds) - 1)
+
+fn deactivate_from(p: mut P, first: int):
+    for k in first..len(p.binds):
+        p.binds[k].active = false
+
+# ---------------------------------------------------------------- scopes
+
+fn push_scope(p: mut P, start: int, is_fn: bool):
+    p.sc_start.push(start)
+    p.sc_fn.push(is_fn)
+    p.sc_base.push(len(p.dh))
+    for i in 0..len(p.hints):
+        if p.hints[i].kind == 0 and p.hints[i].pos == start:
+            name = p.hints[i].name
+            push_decl_name(&p, name)
+
+fn pop_scope(p: mut P):
+    base = p.sc_base.pop()
+    p.sc_start.pop()
+    p.sc_fn.pop()
+    while len(p.dh) > base:
+        p.dh.pop()
+        p.da.pop()
+        p.dl.pop()
+
+# A declared name that doesn't come from the source (a hint) is kept in star_names.
+fn push_decl_name(p: mut P, name: str):
+    p.dh.push(hash_of(name))
+    p.da.push(-1 - len(p.star_names))
+    p.dl.push(len(name))
+    p.star_names.push(name)
+
+fn decl_matches(p: mut P, k: int, a: int, b: int) bool:
+    if p.da[k] >= 0:
+        return p.dl[k] == b - a and same_prefix(p.src, p.da[k], a, b - a)
+    return same_text(p.src, a, b - a, p.star_names[-1 - p.da[k]])
+
+fn same_prefix(s: str, x: int, y: int, n: int) bool:
+    for k in 0..n:
+        if s.byte(x + k) != s.byte(y + k):
+            return false
+    return true
+
+# A local declaration of the name at [a, b) in the current scope (or the
+# enclosing function scope, for `var` and functions).
+fn declare(p: mut P, a: int, b: int, h: int, hoist: bool):
+    seen_mark(&p, h)
+    k = find_bind(&p, a, b, h)
+    if k < 0:
+        return
+    depth = len(p.sc_start) - 1
+    if p.binds[k].kind == B_XLIST and (depth < 0 or (hoist and not in_fn_scope(&p))):
+        return                                   # the declaration of the exported variable itself
+    if hoist:
+        while depth > 0 and not p.sc_fn[depth]:
+            depth -= 1
+    start = 0
+    if depth >= 0:
+        start = p.sc_start[depth]
+    if p.binds[k].last_ref >= start or (hoist and depth != len(p.sc_start) - 1):
+        # used (and rewritten) before this declaration, or hoisted out of a block
+        p.retry = true
+        p.new_hints.push(Hint(start, p.src[a..b], 0, "", -1, -1))
+    p.dh.push(h)
+    p.da.push(a)
+    p.dl.push(b - a)
+
+fn is_shadowed(p: mut P, a: int, b: int, h: int, dbase: int) bool:
+    k = len(p.dh) - 1
+    while k >= dbase:
+        if p.dh[k] == h and decl_matches(&p, k, a, b):
+            return true
+        k -= 1
+    return false
+
+fn trimmed_capture(p: mut P, saved: take str) str:
+    t = end_capture(&p, saved)
+    return t.trim()

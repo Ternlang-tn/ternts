@@ -1,0 +1,1071 @@
+# Statements, including the TypeScript-only ones that are removed or rewritten.
+
+fn statements(p: mut P, top: bool):
+    while p.tok != T_EOF and not at_op(&p, 125) and p.err == "":
+        statement(&p, top)
+
+# Remove a whole statement (an interface, a type alias, `declare ...`) at `start`, keeping ASI the same.
+fn drop_from(p: mut P, start: int):
+    emit_to(&p, start)
+    if p.last_asi and continues(&p):
+        put(&p, ";")
+    p.last_asi = false
+    skip_pe(&p)
+
+# The statement after a removed one could continue the one before it without a `;` between
+# (`a = b` then `(c)` reads as `b(c)`): it starts with ( [ ` + - / (or < in TSX).
+fn continues(p: mut P) bool:
+    if p.tok == T_TPL or p.tok == T_TPL_HEAD:
+        return true
+    if p.tok != T_OP:
+        return false
+    o = p.op
+    return o == 40 or o == 91 or o == 43 or o == 45 or o == 47 or o == O_ASSIGN and p.src.byte(p.ts) == 47 or (o == 60 and p.tsx)
+
+# Inside a function (or a namespace body), not at the module's own level?
+fn in_fn_scope(p: mut P) bool:
+    for f in p.sc_fn:
+        if f:
+            return true
+    return false
+
+fn end_stmt(p: mut P):
+    if at_op(&p, 59):
+        next(&p)
+    p.last_asi = p.pe > 0 and p.src.byte(p.pe - 1) != 59 and p.src.byte(p.pe - 1) != 125
+
+fn next_on_line(p: mut P) LexState:
+    return peek_tok(&p)
+
+fn statement(p: mut P, top: bool):
+    start = p.ts
+    emb = false
+    if p.embedded:                               # the body of an if/else/loop/with (not a block)
+        emb = true
+        p.embedded = false
+    if p.tok == T_OP:
+        if p.op == 123:
+            lb = p.loop_body and p.target < 2022 and p.mute == 0
+            p.loop_body = false
+            push_scope_here(&p, false)
+            next(&p)
+            if lb:                               # a loop's body: #private names of classes in it
+                emit_pe(&p)                      # are its own (let), one set per iteration
+                p.loop_at.push(len(p.out))
+                p.loop_lets.push([])
+                p.loop_sc.push(len(p.sc_start))
+            if p.has_using:
+                emit_pe(&p)
+                id = u_open(&p)
+                statements(&p, false)
+                emit_ts(&p)
+                u_close(&p, id)
+            else:
+                statements(&p, false)
+            if lb:
+                names = p.loop_lets.pop()
+                at = p.loop_at.pop()
+                p.loop_sc.pop()
+                if len(names) > 0:
+                    o = p.out
+                    p.out = o[..at] + " let " + ", ".join(names) + ";" + o[at..]
+            expect_op(&p, 125)
+            pop_scope(&p)
+            p.last_asi = false
+            return
+        if p.op == 59:
+            next(&p)
+            p.last_asi = false
+            p.empty_stmt = true                  # (a namespace with one is instantiated, enum.tn)
+            return
+        if p.op == 64:
+            decos = decorators(&p)
+            if at_kw(&p, K_EXPORT):
+                export_decl(&p, top, decos)
+                return
+            if at_kw(&p, K_ABSTRACT):
+                emit_ts(&p)
+                skip_to(&p, peek_tok(&p).ts)
+                next(&p)
+            name = peek_tok(&p)
+            p.defer_st = top
+            idx = class_decl(&p, decos, "", "")
+            if top:
+                slot_marker(&p, p.src[name.ts..name.te])
+            flush_class_ref(&p)
+            if idx >= 0:
+                marker(&p, "D", str(idx))
+            return
+    if p.tok == T_NAME:
+        k = p.kw
+        if k == K_VAR or k == K_CONST or k == K_LET:
+            n = peek_tok(&p)
+            if k == K_CONST and n.kw == K_ENUM:
+                emb_open(&p, emb, start)
+                emit_ts(&p)
+                skip_to(&p, n.ts)
+                next(&p)
+                enum_decl(&p, "")
+                emb_close(&p, emb)
+                return
+            if k != K_LET or n.tok == T_NAME or (n.tok == T_OP and (n.op == 91 or n.op == 123)):
+                vtop = top or (k == K_VAR and p.ns_name == "" and not in_fn_scope(&p))   # (a var in a block)
+                if vtop and k != K_CONST and p.ns_name == "" and not p.esm:
+                    for name in var_names_ahead(&p, false).split(","):
+                        if name != "":
+                            p.top_vars[name] = true
+                if vtop and p.has_export_list:
+                    names = var_names_ahead(&p, true)
+                    var_stmt(&p)
+                    end_stmt(&p)
+                    expr_end_asi(&p)
+                    emit_pe(&p)
+                    slot_marker(&p, names)
+                else:
+                    var_stmt(&p)
+                    end_stmt(&p)
+                    expr_end_asi(&p)
+                return
+        elif k == K_FUNCTION:
+            function_decl(&p, false, "", start)
+            return
+        elif (k == K_USING or k == K_AWAIT) and at_using_decl(&p, false):
+            using_decl(&p)
+            return
+        elif k == K_ASYNC:
+            n = peek_tok(&p)
+            if n.kw == K_FUNCTION and not n.nlb:
+                next(&p)
+                function_decl(&p, true, "", start)
+                return
+        elif k == K_CLASS:
+            name = peek_tok(&p)
+            p.defer_st = top
+            idx = class_decl(&p, [], "", "")
+            if top:
+                slot_marker(&p, p.src[name.ts..name.te])
+            flush_class_ref(&p)
+            if idx >= 0:
+                marker(&p, "D", str(idx))
+            return
+        elif k == K_IF:
+            next(&p)
+            paren_expr(&p)
+            p.embedded = true
+            statement(&p, false)
+            if at_kw(&p, K_ELSE):
+                next(&p)
+                p.embedded = true
+                statement(&p, false)
+            return
+        elif k == K_FOR:
+            for_stmt(&p)
+            return
+        elif k == K_WHILE:
+            next(&p)
+            paren_expr(&p)
+            p.loop_depth += 1
+            p.embedded = true
+            p.loop_body = true
+            statement(&p, false)
+            p.loop_depth -= 1
+            return
+        elif k == K_DO:
+            next(&p)
+            p.loop_depth += 1
+            p.embedded = true
+            p.loop_body = true
+            statement(&p, false)
+            p.loop_depth -= 1
+            if at_kw(&p, K_WHILE):
+                next(&p)
+                paren_expr(&p)
+            end_stmt(&p)
+            p.last_asi = false
+            return
+        elif k == K_RETURN and p.mute == 0 and p.in_gen > 0 and len(p.aw) > 0 and in_agen(&p):
+            agen_return(&p)                      # below ES2018 (asyncgen.tn)
+            return
+        elif k == K_RETURN or k == K_THROW:
+            next(&p)
+            if not p.nlb and not at_op(&p, 59) and not at_op(&p, 125) and p.tok != T_EOF:
+                parse_expr(&p)
+            end_stmt(&p)
+            return
+        elif k == K_BREAK or k == K_CONTINUE:
+            next(&p)
+            if p.tok == T_NAME and not p.nlb and p.kw != K_CASE and p.kw != K_DEFAULT:
+                next(&p)
+            end_stmt(&p)
+            return
+        elif k == K_TRY:
+            try_stmt(&p)
+            return
+        elif k == K_SWITCH:
+            if emb and p.has_using and p.mute == 0:
+                emit_to(&p, start)               # if (c) switch (x) { using ... }: lowered, it's
+                mark = len(p.out)                # several statements, in a block (as tsc)
+                nb = len(p.u_blocks)
+                switch_stmt(&p)
+                used = false
+                for bi in nb..len(p.u_blocks):
+                    if p.u_blocks[bi].used:
+                        used = true
+                if used:
+                    emit_pe(&p)
+                    p.out = p.out[..mark] + "{ " + p.out[mark..] + " }"
+                return
+            if top and p.top_u >= 0 and p.mute == 0 and len(p.sc_start) == 0:
+                p.u_hoist = true                 # (a statement of the top-level using block: tsc
+            switch_stmt(&p)                      # hoists its env as the module's other names)
+            return
+        elif k == K_DEBUGGER:
+            next(&p)
+            end_stmt(&p)
+            return
+        elif k == K_WITH:
+            next(&p)
+            paren_expr(&p)
+            p.embedded = true
+            statement(&p, false)
+            return
+        elif k == K_IMPORT:
+            n = peek_tok(&p)
+            if not (n.tok == T_OP and (n.op == 40 or n.op == 46)):
+                if top and p.jest_hoist and not p.esm and imports_jest_globals(&p, start):
+                    hoist_start(&p, start)
+                    mark = len(p.out)
+                    import_decl(&p, false)
+                    hoist_end(&p, mark)
+                    return
+                import_decl(&p, false)
+                return
+        elif k == K_EXPORT:
+            export_decl(&p, top, [])
+            return
+        elif k == K_INTERFACE or k == K_TYPE:
+            n = peek_tok(&p)
+            if n.tok == T_NAME and not n.nlb:
+                type_decl(&p)
+                drop_from(&p, start)
+                return
+        elif k == K_ENUM:
+            n = peek_tok(&p)
+            if n.tok == T_NAME and not n.nlb:
+                emb_open(&p, emb, start)
+                enum_decl(&p, "")
+                emb_close(&p, emb)
+                return
+        elif k == K_NAMESPACE or k == K_MODULE:
+            n = peek_tok(&p)
+            if (n.tok == T_NAME or n.tok == T_STR) and not n.nlb:
+                emb_open(&p, emb, start)
+                namespace_decl(&p, "")
+                emb_close(&p, emb)
+                return
+        elif k == K_DECLARE:
+            n = peek_tok(&p)
+            if (n.tok == T_NAME) and not n.nlb and n.kw != K_INSTANCEOF and n.kw != K_IN:   # (declare instanceof C: an expression)
+                declare_stmt(&p)
+                drop_from(&p, start)
+                return
+        elif k == K_ABSTRACT:
+            n = peek_tok(&p)
+            if n.kw == K_CLASS and not n.nlb:
+                emit_ts(&p)
+                skip_to(&p, n.ts)
+                next(&p)
+                name = peek_tok(&p)
+                p.defer_st = top
+                idx = class_decl(&p, [], "", "")
+                if top:
+                    slot_marker(&p, p.src[name.ts..name.te])
+                flush_class_ref(&p)
+                if idx >= 0:
+                    marker(&p, "D", str(idx))
+                return
+        elif k == K_GLOBAL:
+            n = peek_tok(&p)
+            if n.tok == T_OP and n.op == 123 and not n.nlb:
+                p.mute += 1
+                next(&p)
+                skip_group(&p)
+                p.mute -= 1
+                drop_from(&p, start)
+                return
+        if k == 0 or k > K_WITH:
+            n = peek_tok(&p)
+            if n.tok == T_OP and n.op == 58:           # label:
+                if p.target < 2018 and p.mute == 0 and label_for_await(&p):
+                    lname = tok_text(&p)             # (lowered: the label goes on the loop
+                    emit_to(&p, start)               # inside the try, as tsc puts it)
+                    next(&p)
+                    next(&p)
+                    at0 = p.ts
+                    skip_to(&p, at0)
+                    p.fa_label = lname
+                    statement(&p, false)
+                    return
+                next(&p)
+                next(&p)
+                p.embedded = true
+                statement(&p, false)
+                return
+    if top and p.jest_hoist and not p.esm and at_jest_mock(&p):
+        hoist_start(&p, start)
+        mark = len(p.out)
+        parse_expr(&p)
+        end_stmt(&p)
+        hoist_end(&p, mark)
+        return
+    # a lowered statement starting with "(" or "[" after a line without ";" gets one, or it would continue that line
+    asi = p.last_asi and p.mute == 0 and not text_continues(p.src[p.ts..p.te])
+    smark = -1
+    if asi:
+        emit_ts(&p)
+        smark = len(p.out)
+    p.expr_stmt = p.ts
+    parse_expr(&p)
+    if asi:
+        emit_pe(&p)
+        if text_continues(p.out[smark..]):
+            p.out = p.out[..smark] + ";" + p.out[smark..]
+    end_stmt(&p)
+    expr_end_asi(&p)
+
+# After an expression or variable statement: a final `}` is an expression's (x = { a }), so a
+# line without ";" ended it (the next statement, lowered to start with "(", needs one).
+fn expr_end_asi(p: mut P):
+    p.last_asi = p.pe > 0 and p.src.byte(p.pe - 1) != 59
+
+fn paren_expr(p: mut P):
+    expect_op(&p, 40)
+    parse_expr(&p)
+    expect_op(&p, 41)
+
+fn var_stmt(p: mut P):
+    hoist = p.kw == K_VAR
+    is_const = p.kw == K_CONST
+    next(&p)
+    if is_const and len(p.fn_stack) == 0:
+        record_consts(&p)
+    var_decls(&p, hoist, false)
+
+# `const A = "x", B = 1`: constants an enum initializer may use.
+fn record_consts(p: mut P):
+    s = save(&p)
+    p.mute += 1
+    while p.tok == T_NAME:
+        name = tok_text(&p)
+        next(&p)
+        if at_op(&p, 58):
+            next(&p)
+            p.bad = false
+            parse_type(&p)
+        if not eat_op(&p, 61):
+            break
+        v = eval_const(&p, "")
+        if v.kind != 0 and (at_op(&p, 44) or at_op(&p, 59) or p.nlb or p.tok == T_EOF):
+            p.const_vals[name] = v
+        else:
+            break
+        if not eat_op(&p, 44):
+            break
+    p.mute -= 1
+    restore(&p, s)
+
+fn var_decls(p: mut P, hoist: bool, no_in: bool):
+    while true:
+        if p.target < 2018 and p.mute == 0 and (at_op(&p, 123) or at_op(&p, 91)):
+            rest_decl(&p, hoist, no_in)
+            if not eat_op(&p, 44):
+                return
+            continue
+        binding(&p, hoist)
+        if at_op(&p, 33) and not p.nlb:              # definite assignment x!: T
+            emit_ts(&p)
+            skip_te(&p)
+            next(&p)
+        if at_op(&p, 58):
+            drop_annotation(&p)
+        if at_op(&p, 61):
+            next(&p)
+            assign(&p, no_in)
+        if not eat_op(&p, 44):
+            return
+
+# A declarator with an object pattern, below ES2018: object rest goes through __rest.
+fn rest_decl(p: mut P, hoist: bool, no_in: bool):
+    emit_ts(&p)
+    saved = begin_capture(&p)
+    binding(&p, hoist)
+    emit_pe(&p)
+    pat = end_capture(&p, saved)
+    put(&p, pat)
+    if at_op(&p, 58):
+        drop_annotation(&p)
+    if not at_op(&p, 61):
+        return
+    if not needs_rest(pat):
+        next(&p)
+        assign(&p, no_in)
+        return
+    p.out = p.out[..len(p.out) - len(pat)]
+    next(&p)
+    skip_ts(&p)
+    a = p.ts
+    saved2 = begin_capture(&p)
+    assign(&p, no_in)
+    emit_pe(&p)
+    init0 = end_capture(&p, saved2)
+    init = init0.trim()
+    put(&p, rest_parts(&p, pat, init, simple_copy(p.src[a..p.pe].trim()), true))   # (`o as T` isn't simple: tsc sees the assertion)
+
+# `for (const { a, ...r } of xs)` below ES2018: `for (let _a of xs)`, and the body starts with
+# `const { a } = _a, r = __rest(_a, ["a"]);`. Returns that declaration ("" if not lowered).
+fn for_rest_head(p: mut P, hoist: bool, kind: str) str:
+    a = p.pe
+    emit_ts(&p)
+    saved = begin_capture(&p)
+    binding(&p, hoist)
+    emit_pe(&p)
+    pat = end_capture(&p, saved)
+    if not needs_rest(pat) or not at_kw(&p, K_OF):
+        put(&p, pat)
+        if at_op(&p, 61):
+            next(&p)
+            assign(&p, true)
+        return ""
+    tmp = name_temp(&p)
+    # `const` becomes `let`, as tsc writes it
+    k = len(p.out) - 1
+    while k >= 0 and p.out.byte(k) == 32:
+        k -= 1
+    if p.out[..k + 1].ends_with(kind):
+        p.out = p.out[..k + 1 - len(kind)] + "let" + p.out[k + 1..]
+    put(&p, tmp)
+    return " " + kind + " " + rest_parts(&p, pat, tmp, true, true) + ";"
+
+# At a pattern in a for head: is it for (pattern of ...)? (Else var_decls lowers object rest in each declarator.)
+fn pattern_then_of(p: mut P) bool:
+    s0 = save(&p)
+    p.mute += 1
+    skip_group(&p)
+    r = at_kw(&p, K_OF)
+    p.mute -= 1
+    restore(&p, s0)
+    return r
+
+# for (pattern of xs) below ES2018 with an object rest in the pattern: the loop takes a temp
+# (let _c) and its body starts with the assignment, lowered (tsc's shape).
+fn for_rest_expr_head(p: mut P) str:
+    s0 = save(&p)
+    p.mute += 1
+    skip_group(&p)
+    is_of = at_kw(&p, K_OF)
+    p.mute -= 1
+    restore(&p, s0)
+    emit_ts(&p)
+    saved = begin_capture(&p)
+    np = p.in_pattern
+    p.in_pattern = is_of or np
+    parse_expr_no_in(&p)
+    p.in_pattern = np
+    emit_pe(&p)
+    pat = end_capture(&p, saved)
+    if not is_of or not needs_rest(pat):
+        put(&p, pat)
+        return ""
+    tmp = name_temp(&p)
+    put(&p, "let " + tmp)
+    parts = rest_parts(&p, pat, tmp, true, false)
+    if parts.starts_with("{"):
+        parts = "(" + parts + ")"                # (a statement can't start with "{")
+    return " " + parts + ";"
+
+fn for_stmt(p: mut P):
+    if p.target < 2018 and p.mute == 0 and peek_tok(&p).tok == T_NAME and peek_tok(&p).kw == K_AWAIT:
+        for_await(&p)
+        return
+    rest_body = ""
+    fstart = p.ts
+    next(&p)
+    if at_kw(&p, K_AWAIT):
+        next(&p)
+    push_scope_here(&p, false)
+    expect_op(&p, 40)
+    if p.target < 9999 and p.mute == 0 and at_using_decl(&p, false) and not at_using_decl(&p, true):
+        for_using_classic(&p, fstart)            # for (using x = ...; c; i)
+        pop_scope(&p)
+        return
+    using_for = at_using_decl(&p, true) and p.target < 9999
+    uf_var = -1
+    uf_name = ""
+    uf_async = false
+    if using_for:
+        using_for_head(&p)
+        uf_var = p.u_pre_var                     # (for the body, not a block in the iterable:
+        uf_name = p.u_pre_name                   # for (using d of [{ m() {} }]))
+        uf_async = p.u_pre_async
+        p.u_pre_var = -1
+    elif p.target >= 9999 and (at_using_decl(&p, true) or at_using_decl(&p, false)):
+        if at_kw(&p, K_AWAIT):                   # ESNext: for ([await] using x of / = ...) as it is
+            next(&p)
+        next(&p)
+        var_decls(&p, false, true)
+    elif not at_op(&p, 59):
+        k = p.kw
+        n = peek_tok(&p)
+        if p.tok == T_NAME and (k == K_VAR or k == K_CONST or (k == K_LET and (n.tok == T_NAME or (n.tok == T_OP and (n.op == 91 or n.op == 123))))) and not (n.tok == T_NAME and n.kw == K_OF and k == K_LET):
+            hoist = k == K_VAR
+            fx = ""
+            if hoist and p.has_export_list and p.mute == 0 and p.ns_name == "" and not p.esm and not in_fn_scope(&p):
+                fx = for_export_names(&p)
+            head_start = p.ts
+            kind = tok_text(&p)
+            next(&p)
+            if p.target < 2018 and p.mute == 0 and at_op(&p, 123) and pattern_then_of(&p):
+                rest_body = for_rest_head(&p, hoist, kind)
+            elif fx != "":
+                rest_body = for_export_head(&p, fstart, head_start, fx)
+            else:
+                var_decls(&p, hoist, true)
+        elif p.target < 2018 and p.mute == 0 and (at_op(&p, 123) or at_op(&p, 91)):
+            rest_body = for_rest_expr_head(&p)  # for ([{ ...r }] of xs)
+        else:
+            parse_expr_no_in(&p)
+    if at_kw(&p, K_OF) or at_kw(&p, K_IN):
+        next(&p)
+        parse_expr(&p)
+    else:
+        expect_op(&p, 59)
+        if not at_op(&p, 59):
+            parse_expr(&p)
+        expect_op(&p, 59)
+        if not at_op(&p, 41):
+            fi = p.for_inc
+            p.for_inc = true                     # (its value is unused: x.#p++ as a statement)
+            parse_expr(&p)
+            p.for_inc = fi
+    expect_op(&p, 41)
+    if using_for:
+        p.u_pre_var = uf_var
+        p.u_pre_name = uf_name
+        p.u_pre_async = uf_async
+        using_for_body(&p)
+    elif rest_body != "":
+        p.loop_depth += 1
+        emit_ts(&p)
+        if at_op(&p, 123):
+            next(&p)
+            emit_pe(&p)
+            put(&p, rest_body)
+            statements(&p, false)
+            expect_op(&p, 125)
+        else:
+            put(&p, "{" + rest_body + " ")
+            statement(&p, false)
+            emit_pe(&p)
+            put(&p, " }")
+        p.loop_depth -= 1
+    else:
+        p.loop_depth += 1
+        p.embedded = true
+        p.loop_body = true
+        statement(&p, false)
+        p.loop_depth -= 1
+    pop_scope(&p)
+
+# At `var` of a top-level for head with export lists: its names when one is exported (H_FORVAR), else "".
+fn for_export_names(p: mut P) str:
+    names = var_names_ahead(&p, false)
+    hinted = false
+    for n in names.split(","):
+        if n != "":
+            p.top_vars[n] = true                 # (assignments to it set its exports: B_XLIST)
+            if has_hint(&p, n, H_FORVAR):
+                hinted = true
+            else:
+                p.for_vars.push(n)
+    if hinted:
+        return names
+    return ""
+
+# for (var x = v; ...) exported: `var x = v; exports.x = x;` goes before the loop (as tsc);
+# for (var x in / of o) exported: the body starts with `exports.x = x;` (returned, for the body).
+# body). The exports are a slot marker: the names the lists give.
+fn for_export_head(p: mut P, fstart: int, head_start: int, names: str) str:
+    emit_to(&p, head_start)
+    mark = len(p.out) - (head_start - fstart)
+    saved = begin_capture(&p)
+    var_decls(&p, true, true)
+    emit_pe(&p)
+    decl = end_capture(&p, saved)
+    p.markers = true
+    slot = "\x00S" + names + "\x00"
+    if at_kw(&p, K_OF) or at_kw(&p, K_IN):
+        put(&p, decl)
+        return slot
+    p.out = p.out[..mark] + decl + ";" + slot + "\n" + p.out[mark..]
+    return ""
+
+fn try_stmt(p: mut P):
+    next(&p)
+    statement(&p, false)
+    if at_kw(&p, K_CATCH):
+        next(&p)
+        push_scope_here(&p, false)
+        if at_op(&p, 40):
+            next(&p)
+            binding(&p, false)
+            if at_op(&p, 58):
+                drop_annotation(&p)
+            expect_op(&p, 41)
+        elif p.target < 2019 and p.mute == 0:
+            emit_pe(&p)                          # catch { below ES2019: catch (_a) {
+            put(&p, " (" + name_temp(&p) + ")")
+        statement(&p, false)
+        pop_scope(&p)
+    if at_kw(&p, K_FINALLY):
+        next(&p)
+        statement(&p, false)
+    p.last_asi = false
+
+fn switch_stmt(p: mut P):
+    id = -1
+    if p.has_using:
+        emit_ts(&p)
+        id = u_open(&p)
+    next(&p)
+    paren_expr(&p)
+    push_scope_here(&p, false)
+    expect_op(&p, 123)
+    while not at_op(&p, 125) and p.tok != T_EOF and p.err == "":
+        if at_kw(&p, K_CASE):
+            next(&p)
+            parse_expr(&p)
+            expect_op(&p, 58)
+        elif at_kw(&p, K_DEFAULT):
+            next(&p)
+            expect_op(&p, 58)
+        else:
+            statement(&p, false)
+    expect_op(&p, 125)
+    pop_scope(&p)
+    if p.has_using:
+        emit_pe(&p)
+        u_close(&p, id)
+    p.last_asi = false
+
+# At "(" or "<" of a function or method: does a body follow the signature?
+fn has_body_ahead(p: mut P) bool:
+    mine = lookahead_begin(&p)
+    r = has_body_scan(&p)
+    lookahead_end(&p, mine)
+    return r
+
+fn has_body_scan(p: mut P) bool:
+    s = save(&p)
+    p.mute += 1
+    p.bad = false
+    if at_op(&p, 60):
+        skip_type_params(&p)
+    skip_group(&p)
+    if at_op(&p, 58):
+        next(&p)
+        return_type(&p)
+    r = at_op(&p, 123)
+    p.mute -= 1
+    restore(&p, s)
+    p.bad = false
+    return r
+
+# `function f() {}`; an overload signature (no body) is removed. Returns the function's name.
+fn function_decl(p: mut P, is_async: bool, default_name: str, start: int) str:
+    if is_async:
+        p.async_at = p.pe - 5                    # the `async` before `function`
+    next(&p)                                     # function
+    gen = eat_op(&p, 42)
+    name = default_name
+    name_pos = -1
+    if p.tok == T_NAME:
+        name = tok_text(&p)
+        name_pos = p.ts
+        next(&p)
+    if not has_body_ahead(&p):
+        p.mute += 1
+        if at_op(&p, 60):
+            skip_type_params(&p)
+        skip_group(&p)
+        if at_op(&p, 58):
+            next(&p)
+            return_type(&p)
+        p.mute -= 1
+        end_stmt(&p)
+        drop_from(&p, start)
+        return ""
+    if name_pos >= 0:
+        s = save(&p)
+        # declare in the enclosing scope (hoisted)
+        declare(&p, name_pos, name_pos + len(name), hash_of(name), true)
+        restore(&p, s)
+        p.locals[name] = 2
+        mark_declared(&p, name)
+    elif default_name != "":
+        emit_pe(&p)
+        put(&p, " " + default_name)
+    push_scope_here(&p, true)
+    p.fn_name = name
+    fn_rest(&p, is_async, gen)
+    pop_scope(&p)
+    p.last_asi = false
+    return name
+
+# What a class declaration left to follow its export (lower.tn's moved statics).
+fn flush_class_ref(p: mut P):
+    if p.class_ref != "":
+        cr = p.class_ref
+        p.class_ref = ""
+        put(&p, cr)
+
+fn class_decl(p: mut P, decos: [str], export_as: str, default_name: str) int:
+    idx = parse_class(&p, decos, true, export_as, default_name)
+    p.last_asi = false
+    return idx
+
+# interface I<T> extends A { ... } / type A<T> = ...
+fn type_decl(p: mut P):
+    p.mute += 1
+    is_iface = p.kw == K_INTERFACE
+    next(&p)
+    name = tok_text(&p)
+    next(&p)
+    if is_iface:
+        if not (name in p.locals) or p.locals[name] == 4 or p.locals[name] == 8:
+            p.locals[name] = 4
+        if at_op(&p, 60):
+            skip_type_params(&p)
+        if at_kw(&p, K_EXTENDS):
+            next(&p)
+            p.bad = false
+            parse_type(&p)
+            while eat_op(&p, 44):
+                parse_type(&p)
+        if interface_callable(&p) and p.locals[name] == 4:
+            p.locals[name] = 8
+    else:
+        if not (name in p.locals):
+            p.locals[name] = 5
+        if at_op(&p, 60):
+            skip_type_params(&p)
+        expect_op(&p, 61)
+        p.bad = false
+        t = parse_type(&p)
+        p.alias_ser[name] = t
+        if p.bad:
+            fail(&p, "bad type alias")
+        eat_op(&p, 59)
+    p.mute -= 1
+
+# `declare ...`: removed, but declared classes and enums still count for metadata.
+fn declare_stmt(p: mut P):
+    p.mute += 1
+    next(&p)
+    k = p.kw
+    if k == K_CLASS or (k == K_ABSTRACT and peek_tok(&p).kw == K_CLASS):
+        if k == K_ABSTRACT:
+            next(&p)
+        next(&p)
+        if p.tok == T_NAME and p.kw != K_EXTENDS and p.kw != K_IMPLEMENTS:
+            p.locals[tok_text(&p)] = 1
+            next(&p)
+        if at_op(&p, 60):
+            skip_type_params(&p)                 # <M extends {}>: its braces aren't the body
+            p.bad = false
+        while not at_op(&p, 123) and p.tok != T_EOF:
+            if at_kw(&p, K_EXTENDS) or at_kw(&p, K_IMPLEMENTS) or at_op(&p, 44):
+                next(&p)
+                parse_type(&p)                   # Base<{ a: 1 }>
+                p.bad = false
+            else:
+                next(&p)
+        skip_group(&p)
+    elif k == K_ENUM or (k == K_CONST and peek_tok(&p).kw == K_ENUM):
+        if k == K_CONST:
+            next(&p)
+        next(&p)
+        name = tok_text(&p)
+        next(&p)
+        p.enum_kind[name] = enum_kind_of_body(&p)
+    elif k == K_FUNCTION:
+        next(&p)
+        eat_op(&p, 42)
+        next(&p)
+        if at_op(&p, 60):
+            skip_type_params(&p)
+        skip_group(&p)
+        if at_op(&p, 58):
+            next(&p)
+            return_type(&p)
+        eat_op(&p, 59)
+    elif k == K_VAR or k == K_LET or k == K_CONST:
+        next(&p)
+        while true:
+            if p.tok == T_NAME:
+                next(&p)
+            else:
+                skip_group(&p)
+            if at_op(&p, 58):
+                next(&p)
+                parse_type(&p)
+            if at_op(&p, 61):
+                next(&p)
+                assign(&p, false)
+            if not eat_op(&p, 44):
+                break
+        eat_op(&p, 59)
+    elif k == K_INTERFACE or k == K_TYPE:
+        type_decl(&p)
+    else:
+        # namespace, module, global, and anything else with a body
+        while not at_op(&p, 123) and not at_op(&p, 59) and p.tok != T_EOF and not (p.nlb and p.ts > 0 and not at_op(&p, 46)):
+            next(&p)
+        if at_op(&p, 123):
+            skip_group(&p)                       # (a `;` after the body is a statement of its own)
+        else:
+            eat_op(&p, 59)                       # declare module "m";
+    p.mute -= 1
+
+# A declared enum's kind for metadata: 1 numbers, 2 strings, 3 mixed.
+fn enum_kind_of_body(p: mut P) int:
+    has_num = false
+    has_str = false
+    next(&p)
+    while not at_op(&p, 125) and p.tok != T_EOF:
+        next(&p)
+        if eat_op(&p, 61):
+            if p.tok == T_STR or p.tok == T_TPL:
+                has_str = true
+            else:
+                has_num = true
+            while not at_op(&p, 44) and not at_op(&p, 125) and p.tok != T_EOF:
+                if at_op(&p, 40) or at_op(&p, 91) or at_op(&p, 123):
+                    skip_group(&p)
+                else:
+                    next(&p)
+        else:
+            has_num = true
+        eat_op(&p, 44)
+    next(&p)
+    if has_str and has_num:
+        return 3
+    if has_str:
+        return 2
+    return 1
+
+# The simple names a `var`/`let`/`const` statement declares; with `inited`, only initialized ones (`let x;` exports nothing yet).
+fn var_names_ahead(p: mut P, inited: bool) str:
+    s = save(&p)
+    names: [str] = []
+    seq = p.temp_seq                             # (the muted parse of initializers mustn't keep temps)
+    ntemps = p.temps
+    nnames = len(p.temp_names)
+    ncf = len(p.cf_temps)
+    lt = p.lt_mod
+    p.mute += 1
+    next(&p)
+    while p.tok == T_NAME or at_op(&p, 123) or at_op(&p, 91):
+        found: [str] = []
+        if p.tok == T_NAME:
+            found.push(tok_text(&p))
+            next(&p)
+        else:
+            pattern_names(&p, &found)
+        if at_op(&p, 33):
+            next(&p)
+        if at_op(&p, 58):
+            next(&p)
+            parse_type(&p)
+        if not inited or at_op(&p, 61):
+            for name in found:
+                names.push(name)
+        if at_op(&p, 61):
+            next(&p)
+            assign(&p, false)
+        if not eat_op(&p, 44):
+            break
+    p.mute -= 1
+    restore(&p, s)
+    p.temp_seq = seq
+    p.temps = ntemps
+    while len(p.temp_names) > nnames:
+        p.temp_names.pop()
+    while len(p.cf_temps) > ncf:
+        p.cf_temps.pop()
+    p.lt_mod = lt
+    return ",".join(names)
+
+# The names a destructuring pattern binds, consuming it (muted).
+fn pattern_names(p: mut P, names: mut [str]):
+    close = 125
+    if at_op(&p, 91):
+        close = 93
+    next(&p)
+    while not at_op(&p, close) and p.tok != T_EOF and p.err == "":
+        if at_op(&p, 44):
+            next(&p)
+            continue
+        eat_op(&p, O_DOTS)
+        if close == 125:
+            n = peek_tok(&p)
+            if p.tok == T_NAME and n.tok == T_OP and (n.op == 44 or n.op == 125 or n.op == 61):
+                names.push(tok_text(&p))
+                next(&p)
+            elif p.tok == T_NAME and n.tok == T_OP and n.op == 58 or p.tok == T_STR or p.tok == T_NUM:
+                next(&p)
+                expect_op(&p, 58)
+                pattern_target(&p, &names)
+            elif at_op(&p, 91):
+                skip_group(&p)
+                expect_op(&p, 58)
+                pattern_target(&p, &names)
+            else:
+                pattern_target(&p, &names)
+        else:
+            pattern_target(&p, &names)
+        if at_op(&p, 61):
+            next(&p)
+            assign(&p, false)
+        if not eat_op(&p, 44):
+            break
+    next(&p)
+
+fn pattern_target(p: mut P, names: mut [str]):
+    if p.tok == T_NAME:
+        names.push(tok_text(&p))
+        next(&p)
+    elif at_op(&p, 123) or at_op(&p, 91):
+        pattern_names(&p, &names)
+    else:
+        next(&p)
+
+# At "{" of an interface body: does it have a call signature (a member starting with "(" or "<")? Consumes the body.
+fn interface_callable(p: mut P) bool:
+    if not at_op(&p, 123):
+        return false
+    next(&p)
+    callable = false
+    at_start = true
+    while not at_op(&p, 125) and p.tok != T_EOF:
+        if at_start and (at_op(&p, 40) or at_op(&p, 60)):
+            callable = true
+        if at_start and at_op(&p, 91):
+            computed_key_use(&p)
+        if at_op(&p, 40) or at_op(&p, 91) or at_op(&p, 123):
+            skip_group(&p)
+            at_start = false
+            continue
+        if p.tok == T_TPL_HEAD:
+            template_type(&p)
+            at_start = false
+            continue
+        at_start = at_op(&p, 59) or at_op(&p, 44)
+        next(&p)
+        if p.nlb:
+            at_start = true
+    next(&p)
+    return callable
+
+# ---- jest.mock hoisting (--jest-hoist): as babel-jest, @swc/jest and ts-jest do, top-level jest.mock-style calls
+# (and an import of `jest` from @jest/globals) move above the imports via p.hoisted, so mocks register first.
+
+# `jest.mock(` (and the others) at the start of a statement, spaces allowed around the dot.
+fn at_jest_mock(p: mut P) bool:
+    if p.tok != T_NAME or tok_text(&p) != "jest":
+        return false
+    k = skip_spaces(p.src, p.te)
+    if k >= len(p.src) or p.src.byte(k) != 46:
+        return false
+    k = skip_spaces(p.src, k + 1)
+    e = k
+    while e < len(p.src) and is_id(p.src.byte(e)):
+        e += 1
+    w = p.src[k..e]
+    if not (w == "mock" or w == "unmock" or w == "enableAutomock" or w == "disableAutomock" or w == "deepUnmock"):
+        return false
+    e = skip_spaces(p.src, e)
+    return e < len(p.src) and p.src.byte(e) == 40
+
+fn skip_spaces(s: str, at: int) int:
+    k = at
+    while k < len(s) and (s.byte(k) == 32 or s.byte(k) == 9 or s.byte(k) == 10 or s.byte(k) == 13):
+        k += 1
+    return k
+
+# An import from "@jest/globals" (the statement at `start`, up to its `;` or 500 bytes).
+fn imports_jest_globals(p: mut P, start: int) bool:
+    e = min(len(p.src), start + 500)
+    k = start
+    while k < e and p.src.byte(k) != 59:
+        k += 1
+    return p.src[start..k].contains("@jest/globals")
+
+fn hoist_start(p: mut P, start: int):
+    emit_to(&p, start)                 # what comes before the statement stays where it is
+
+fn hoist_end(p: mut P, mark: int):
+    end = p.pe
+    emit_to(&p, end)
+    p.hoisted += p.out[mark..] + "\n"
+    p.out = p.out[..mark]
+
+# Text that could continue the statement before it without a `;` (see continues).
+fn text_continues(t: str) bool:
+    k = 0
+    while k < len(t) and (t.byte(k) == 32 or t.byte(k) == 10 or t.byte(k) == 9):
+        k += 1
+    if k >= len(t):
+        return false
+    c = t.byte(k)
+    return c == 40 or c == 91 or c == 96 or c == 43 or c == 45 or c == 47
+
+# The block topusing.tn made of a module's statements after its first top-level `using`:
+# lowered as a block, without its braces, its names staying at the top level.
+fn top_using_block(p: mut P):
+    a = p.ts
+    emit_to(&p, a)
+    next(&p)
+    skip_to(&p, a + 1)
+    emit_pe(&p)
+    id = u_open(&p)
+    p.top_u = id
+    statements(&p, true)
+    emit_ts(&p)
+    u_close(&p, id)
+    p.top_u = -1
+    e = p.ts
+    emit_to(&p, e)
+    expect_op(&p, 125)
+    skip_to(&p, e + 1)
+    p.last_asi = false
+
+# An enum or namespace as the body of an if/else/loop/with: tsc writes its statements in a block, with var.
+fn emb_open(p: mut P, emb: bool, start: int):
+    if emb and p.mute == 0:
+        emit_to(&p, start)
+        put(&p, "{ ")
+        p.embed_var = true
+
+fn emb_close(p: mut P, emb: bool):
+    if emb and p.mute == 0:
+        p.embed_var = false
+        put(&p, " }")
+
+# At `label:`: is the labelled statement a `for await`?
+fn label_for_await(p: mut P) bool:
+    s0 = save(&p)
+    next(&p)
+    next(&p)
+    ok = at_kw(&p, K_FOR) and peek_tok(&p).kw == K_AWAIT
+    restore(&p, s0)
+    return ok

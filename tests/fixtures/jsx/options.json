@@ -1,0 +1,44 @@
+{
+  "about": "TSX in each JSX mode (preserve is checked by composing with tsc's react-jsx).",
+  "sets": {
+    "react-jsx": {
+      "module": "esnext",
+      "jsx": "react-jsx",
+      "useDefineForClassFields": false
+    },
+    "react-jsxdev": {
+      "module": "esnext",
+      "jsx": "react-jsxdev",
+      "useDefineForClassFields": false
+    },
+    "react": {
+      "module": "commonjs",
+      "jsx": "react",
+      "useDefineForClassFields": false
+    },
+    "preserve": {
+      "module": "esnext",
+      "jsx": "preserve",
+      "useDefineForClassFields": false
+    },
+    "factory": {
+      "module": "esnext",
+      "jsx": "react",
+      "jsxFactory": "h",
+      "jsxFragmentFactory": "Fragment",
+      "useDefineForClassFields": false
+    },
+    "source": {
+      "module": "commonjs",
+      "jsx": "react-jsx",
+      "jsxImportSource": "preact",
+      "useDefineForClassFields": false
+    },
+    "es2017": {
+      "module": "esnext",
+      "jsx": "react-jsx",
+      "useDefineForClassFields": false,
+      "target": "ES2017"
+    }
+  }
+}

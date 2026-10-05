@@ -1,0 +1,863 @@
+# The lexer. Tokens are positions in the source; the parser copies source text
+# between them to the output and changes only what TypeScript adds to JavaScript.
+
+const T_EOF = 0
+const T_NAME = 1        # identifier or keyword (p.kw is the keyword, 0 for none)
+const T_NUM = 2
+const T_STR = 3
+const T_TPL = 4         # a whole `template`, or the `}...` tail of one
+const T_TPL_HEAD = 5    # `...${ or }...${
+const T_REGEX = 6
+const T_PRIV = 7        # #name
+const T_OP = 8          # punctuation: p.op
+
+# multi-character operators (single characters are their byte value)
+const O_ARROW = 256     # =>
+const O_EQ2 = 257       # ==
+const O_EQ3 = 258       # ===
+const O_NE = 259        # !=
+const O_NE2 = 260       # !==
+const O_LE = 261        # <=
+const O_AND = 262       # &&
+const O_OR = 263        # ||
+const O_NULLISH = 264   # ??
+const O_QDOT = 265      # ?.
+const O_INC = 266       # ++
+const O_DEC = 267       # --
+const O_SHL = 268       # <<
+const O_POW = 269       # **
+const O_DOTS = 270      # ...
+const O_ASSIGN = 271    # += -= *= /= %= &= |= ^= <<= **= &&= ||= ??=
+const O_GE = 272        # >= (made by the parser from ">")
+const O_SHR = 273       # >>
+const O_USHR = 274      # >>>
+
+# keywords; the reserved words come first (up to K_WITH)
+const K_BREAK = 1
+const K_CASE = 2
+const K_CATCH = 3
+const K_CLASS = 4
+const K_CONST = 5
+const K_CONTINUE = 6
+const K_DEBUGGER = 7
+const K_DEFAULT = 8
+const K_DELETE = 9
+const K_DO = 10
+const K_ELSE = 11
+const K_ENUM = 12
+const K_EXPORT = 13
+const K_EXTENDS = 14
+const K_FALSE = 15
+const K_FINALLY = 16
+const K_FOR = 17
+const K_FUNCTION = 18
+const K_IF = 19
+const K_IMPORT = 20
+const K_IN = 21
+const K_INSTANCEOF = 22
+const K_NEW = 23
+const K_NULL = 24
+const K_RETURN = 25
+const K_SUPER = 26
+const K_SWITCH = 27
+const K_THIS = 28
+const K_THROW = 29
+const K_TRUE = 30
+const K_TRY = 31
+const K_TYPEOF = 32
+const K_VAR = 33
+const K_VOID = 34
+const K_WHILE = 35
+const K_WITH = 36
+const K_LET = 37
+const K_STATIC = 38
+const K_IMPLEMENTS = 39
+const K_INTERFACE = 40
+const K_PRIVATE = 41
+const K_PROTECTED = 42
+const K_PUBLIC = 43
+const K_AS = 44
+const K_ASYNC = 45
+const K_AWAIT = 46
+const K_GET = 47
+const K_SET = 48
+const K_OF = 49
+const K_TYPE = 50
+const K_DECLARE = 51
+const K_NAMESPACE = 52
+const K_MODULE = 53
+const K_ABSTRACT = 54
+const K_READONLY = 55
+const K_KEYOF = 56
+const K_INFER = 57
+const K_IS = 58
+const K_ASSERTS = 59
+const K_UNIQUE = 60
+const K_GLOBAL = 61
+const K_SATISFIES = 62
+const K_OVERRIDE = 63
+const K_ACCESSOR = 64
+const K_CONSTRUCTOR = 65
+const K_ANY = 66
+const K_UNKNOWN = 67
+const K_NEVER = 68
+const K_STRING = 69
+const K_NUMBER = 70
+const K_BOOLEAN = 71
+const K_SYMBOL = 72
+const K_BIGINT = 73
+const K_OBJECT = 74
+const K_UNDEFINED = 75
+const K_REQUIRE = 76
+const K_FROM = 77
+const K_YIELD = 78
+const K_USING = 79
+const K_OUT = 80
+
+const KEYWORDS = "break case catch class const continue debugger default delete do else enum export extends false finally for function if import in instanceof new null return super switch this throw true try typeof var void while with let static implements interface private protected public as async await get set of type declare namespace module abstract readonly keyof infer is asserts unique global satisfies override accessor constructor any unknown never string number boolean symbol bigint object undefined require from yield using out"
+
+const KW_SLOTS = 512
+
+struct LexState:
+    pos, tok, op, ts, te, pe: int
+    nlb: bool
+    kw, h, nc: int
+
+# Character classes by byte: 2 starts an identifier (a-z A-Z _ $ \\ and non-ASCII), 1 continues
+# one (also 0-9), 0 neither.
+const ID_CLASS = "0000000000000000000000000000000000002000000000001111111111000000022222222222222222222222222020020222222222222222222222222220000022222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222"
+
+fn is_id_start(c: int) bool:
+    return ID_CLASS.byte(c) == 50
+
+fn is_id(c: int) bool:
+    return ID_CLASS.byte(c) >= 49
+
+fn is_digit(c: int) bool:
+    return c >= 48 and c <= 57
+
+fn hash_step(h: int, c: int) int:
+    return ((h * 33) ^ c) & 0xfffffff
+
+fn hash_of(s: str) int:
+    h = 5381
+    for k in 0..len(s):
+        h = hash_step(h, s.byte(k))
+    return h
+
+# The keyword table: open addressing on the identifier hash.
+fn kw_setup(p: mut P):
+    p.kwh = [-1] * KW_SLOTS
+    p.kwid = [0] * KW_SLOTS
+    p.kwname = [""]
+    for w in KEYWORDS.split(" "):
+        p.kwname.push(w)
+        id = len(p.kwname) - 1
+        slot = hash_of(w) & (KW_SLOTS - 1)
+        while p.kwh[slot] != -1:
+            slot = (slot + 1) & (KW_SLOTS - 1)
+        p.kwh[slot] = hash_of(w)
+        p.kwid[slot] = id
+
+fn same_text(s: str, a: int, n: int, w: str) bool:
+    if len(w) != n:
+        return false
+    for k in 0..n:
+        if s.byte(a + k) != w.byte(k):
+            return false
+    return true
+
+fn kw_lookup(p: mut P, a: int, b: int, h: int) int:
+    slot = h & (KW_SLOTS - 1)
+    while p.kwh[slot] != -1:
+        if p.kwh[slot] == h and same_text(p.src, a, b - a, p.kwname[p.kwid[slot]]):
+            return p.kwid[slot]
+        slot = (slot + 1) & (KW_SLOTS - 1)
+    return 0
+
+# Length of a Unicode space or line terminator at i (negative for a line terminator), or 0.
+fn uni_space(s: str, i: int) int:
+    n = len(s)
+    c = s.byte(i)
+    if c == 0xc2 and i + 1 < n and s.byte(i + 1) == 0xa0:
+        return 2
+    if c == 0xef and i + 2 < n and s.byte(i + 1) == 0xbb and s.byte(i + 2) == 0xbf:
+        return 3
+    if c == 0xe2 and i + 2 < n:
+        d = s.byte(i + 1)
+        e = s.byte(i + 2)
+        if d == 0x80 and (e == 0xa8 or e == 0xa9):
+            return -3
+        if (d == 0x80 and (e <= 0x8a or e == 0xaf)) or (d == 0x81 and e == 0x9f):
+            return 3
+    if c == 0xe3 and i + 2 < n and s.byte(i + 1) == 0x80 and s.byte(i + 2) == 0x80:
+        return 3
+    if c == 0xe1 and i + 2 < n and s.byte(i + 1) == 0x9a and s.byte(i + 2) == 0x80:
+        return 3
+    return 0
+
+fn save(p: mut P) LexState:
+    return LexState(p.pos, p.tok, p.op, p.ts, p.te, p.pe, p.nlb, p.kw, p.h, len(p.cs))
+
+fn restore(p: mut P, s: LexState):
+    p.pos = s.pos
+    p.tok = s.tok
+    p.op = s.op
+    p.ts = s.ts
+    p.te = s.te
+    p.pe = s.pe
+    p.nlb = s.nlb
+    p.kw = s.kw
+    p.h = s.h
+    while len(p.cs) > s.nc:
+        p.cs.pop()
+        p.ce.pop()
+
+fn add_comment(p: mut P, a: int, b: int):
+    if len(p.cs) == 0 or p.cs[len(p.cs) - 1] < a:
+        p.cs.push(a)
+        p.ce.push(b)
+
+# Skip whitespace and comments, then scan one token.
+fn next(p: mut P):
+    if p.pos == p.pk_at:                         # lexed already (peek_tok, or a lookahead's replay)
+        k = p.pk
+        p.pe = p.te
+        p.pos = k.pos
+        p.tok = k.tok
+        p.op = k.op
+        p.ts = k.ts
+        p.te = k.te
+        p.nlb = k.nlb
+        p.kw = k.kw
+        p.h = k.h
+        if p.rb_n > 0:
+            rb_advance(&p)
+        return
+    if p.rb_on:
+        rb_lex(&p)
+        return
+    lex_tok(&p)
+
+# A lookahead's tokens, recorded (rb_on) so the parse after it replays them instead of lexing.
+fn rb_lex(p: mut P):
+    a = p.pos
+    nc = len(p.cs)
+    lex_tok(&p)
+    if len(p.cs) != nc:
+        p.rb_on = false                          # (comments were read: those are lexed for real)
+        return
+    if p.rb_len < len(p.rb):
+        p.rb[p.rb_len] = save(&p)
+        p.rb_from[p.rb_len] = a
+    else:
+        p.rb.push(save(&p))
+        p.rb_from.push(a)
+    p.rb_len += 1
+
+fn rb_advance(p: mut P):
+    p.rb_cur += 1
+    if p.rb_cur < p.rb_n:
+        p.pk_at = p.rb_from[p.rb_cur]
+        p.pk = p.rb[p.rb_cur]
+    else:
+        p.rb_n = 0
+
+# Around a lookahead that the parse then goes over again: its tokens are replayed.
+fn lookahead_begin(p: mut P) bool:
+    if p.rb_on:
+        return false
+    p.rb_on = true
+    p.rb_len = 0
+    p.rb_n = 0
+    return true
+
+fn lookahead_end(p: mut P, mine: bool):
+    if not mine:
+        return
+    p.rb_on = false
+    if p.rb_len > 0:
+        p.rb_n = p.rb_len
+        p.rb_cur = 0
+        p.pk_at = p.rb_from[0]
+        p.pk = p.rb[0]
+
+fn lex_tok(p: mut P):
+    p.pe = p.te
+    p.nlb = false
+    s = p.src
+    n = p.n
+    i = p.pos
+    while i < n:
+        c = s.byte(i)
+        if c == 32 or c == 9 or c == 13 or c == 11 or c == 12:
+            i += 1
+        elif c == 10:
+            p.nlb = true
+            i += 1
+        elif c == 47 and i + 1 < n and s.byte(i + 1) == 47:
+            a = i
+            i += 2
+            while i < n and s.byte(i) != 10 and s.byte(i) != 13:
+                if s.byte(i) == 0xe2 and uni_space(s, i) < 0:
+                    break
+                i += 1
+            add_comment(&p, a, i)
+        elif c == 47 and i + 1 < n and s.byte(i + 1) == 42:
+            a = i
+            i += 2
+            while i < n and not (s.byte(i) == 42 and i + 1 < n and s.byte(i + 1) == 47):
+                b = s.byte(i)
+                if b == 10 or b == 13 or (b == 0xe2 and uni_space(s, i) < 0):
+                    p.nlb = true
+                i += 1
+            i = min(i + 2, n)
+            add_comment(&p, a, i)
+        elif c >= 128:
+            w = uni_space(s, i)
+            if w == 0:
+                break
+            if w < 0:
+                p.nlb = true
+                i -= w
+            else:
+                i += w
+        elif c == 35 and i == 0 and n > 1 and s.byte(1) == 33:     # #!
+            while i < n and s.byte(i) != 10:
+                i += 1
+            add_comment(&p, 0, i)
+        else:
+            break
+    p.ts = i
+    if i >= n:
+        p.tok = T_EOF
+        p.te = n
+        p.pos = n
+        return
+    c = s.byte(i)
+    if is_id_start(c):
+        h = 5381
+        j = i
+        while true:
+            while j < n:
+                d = s.byte(j)
+                if not is_id(d):
+                    break
+                if d >= 128 and uni_space(s, j) != 0:
+                    break
+                h = ((h * 33) ^ d) & 0xfffffff
+                j += 1
+            if j < n and s.byte(j) == 123 and j >= 2 and s.byte(j - 1) == 117 and s.byte(j - 2) == 92:
+                while j < n and s.byte(j) != 125:   # \u{78}: an escaped character, braces and all
+                    h = ((h * 33) ^ s.byte(j)) & 0xfffffff
+                    j += 1
+                j += 1
+                continue
+            break
+        p.tok = T_NAME
+        p.h = h
+        p.te = j
+        p.pos = j
+        p.kw = kw_of(s, i, j - i)
+        if is_digit(s.byte(j - 1)):
+            p.numbered[s[i..j]] = true          # generated names (mod_1) must avoid these
+        return
+    p.kw = 0
+    if is_digit(c) or (c == 46 and i + 1 < n and is_digit(s.byte(i + 1))):
+        p.tok = T_NUM
+        p.te = skip_number(s, i)
+        p.pos = p.te
+        return
+    if c == 34 or c == 39:
+        p.tok = T_STR
+        p.te = skip_string(s, i + 1, c)
+        p.pos = p.te
+        return
+    if c == 96:
+        scan_tpl(&p, i + 1)
+        return
+    if c == 35:
+        j = i + 1
+        while j < n and is_id(s.byte(j)):
+            if s.byte(j) == 92 and j + 2 < n and s.byte(j + 1) == 117 and s.byte(j + 2) == 123:
+                while j < n and s.byte(j) != 125:
+                    j += 1                       # #\u{78}
+            j += 1
+        p.tok = T_PRIV
+        p.te = j
+        p.pos = j
+        return
+    p.tok = T_OP
+    d = 0
+    if i + 1 < n:
+        d = s.byte(i + 1)
+    e = 0
+    if i + 2 < n:
+        e = s.byte(i + 2)
+    op = c
+    w = 1
+    if c == 61:                                  # =
+        if d == 62:
+            op = O_ARROW
+            w = 2
+        elif d == 61:
+            if e == 61:
+                op = O_EQ3
+                w = 3
+            else:
+                op = O_EQ2
+                w = 2
+    elif c == 33:                                # !
+        if d == 61:
+            if e == 61:
+                op = O_NE2
+                w = 3
+            else:
+                op = O_NE
+                w = 2
+    elif c == 60:                                # <
+        if d == 61:
+            op = O_LE
+            w = 2
+        elif d == 60:
+            if e == 61:
+                op = O_ASSIGN
+                w = 3
+            else:
+                op = O_SHL
+                w = 2
+    elif c == 38 or c == 124:                    # & |
+        if d == c:
+            if e == 61:
+                op = O_ASSIGN
+                w = 3
+            elif c == 38:
+                op = O_AND
+                w = 2
+            else:
+                op = O_OR
+                w = 2
+        elif d == 61:
+            op = O_ASSIGN
+            w = 2
+    elif c == 63:                                # ?
+        if d == 63:
+            if e == 61:
+                op = O_ASSIGN
+                w = 3
+            else:
+                op = O_NULLISH
+                w = 2
+        elif d == 46 and not is_digit(e):
+            op = O_QDOT
+            w = 2
+    elif c == 43 or c == 45:                     # + -
+        if d == c:
+            if c == 43:
+                op = O_INC
+            else:
+                op = O_DEC
+            w = 2
+        elif d == 61:
+            op = O_ASSIGN
+            w = 2
+    elif c == 42:                                # *
+        if d == 42:
+            if e == 61:
+                op = O_ASSIGN
+                w = 3
+            else:
+                op = O_POW
+                w = 2
+        elif d == 61:
+            op = O_ASSIGN
+            w = 2
+    elif c == 47 or c == 37 or c == 94:          # / % ^
+        if d == 61:
+            op = O_ASSIGN
+            w = 2
+    elif c == 46:                                # .
+        if d == 46 and e == 46:
+            op = O_DOTS
+            w = 3
+    p.op = op
+    p.te = i + w
+    p.pos = i + w
+
+fn skip_string(s: str, i: int, q: int) int:
+    n = len(s)
+    j = i
+    while j < n:
+        c = s.byte(j)
+        if c == q:
+            return j + 1
+        if c == 92:
+            j += 2
+        elif c == 10:
+            return j
+        else:
+            j += 1
+    return n
+
+fn skip_number(s: str, i: int) int:
+    n = len(s)
+    j = i + 1
+    hex = s.byte(i) == 48 and j < n and (s.byte(j) | 32) != 101 and (s.byte(j) | 32) >= 97
+    dot = s.byte(i) == 46
+    exp = false
+    while j < n:
+        c = s.byte(j)
+        if c == 46 and not dot and not exp and not hex:
+            dot = true
+        elif (c == 43 or c == 45) and not hex and (s.byte(j - 1) | 32) == 101:
+            exp = true
+        elif is_id(c):
+            if (c | 32) == 101 and not hex:
+                exp = true
+        else:
+            return j
+        j += 1
+    return n
+
+# Template text from i: a T_TPL ending at "`", or a T_TPL_HEAD ending at "${".
+fn scan_tpl(p: mut P, i: int):
+    s = p.src
+    n = p.n
+    j = i
+    while j < n:
+        c = s.byte(j)
+        if c == 96:
+            p.tok = T_TPL
+            p.te = j + 1
+            p.pos = j + 1
+            return
+        if c == 92:
+            j += 2
+        elif c == 36 and j + 1 < n and s.byte(j + 1) == 123:
+            p.tok = T_TPL_HEAD
+            p.te = j + 2
+            p.pos = j + 2
+            return
+        else:
+            j += 1
+    p.tok = T_TPL
+    p.te = n
+    p.pos = n
+
+# The parser found "}" closing a template substitution: scan the template text after it.
+fn rescan_tpl(p: mut P):
+    scan_tpl(&p, p.ts + 1)
+
+# The parser wants an operand and found "/" or "/=": it starts a regex.
+fn rescan_regex(p: mut P):
+    s = p.src
+    n = p.n
+    j = p.ts + 1
+    in_class = false
+    while j < n:
+        c = s.byte(j)
+        if c == 92:
+            j += 2
+            continue
+        if c == 10:
+            break
+        if c == 91:
+            in_class = true
+        elif c == 93:
+            in_class = false
+        elif c == 47 and not in_class:
+            j += 1
+            while j < n and is_id(s.byte(j)):
+                j += 1
+            break
+        j += 1
+    p.tok = T_REGEX
+    p.te = j
+    p.pos = j
+
+# The operator that starts with the current ">" token: > >= >> >>= >>> >>>=.
+# Returns the operator and sets `w` to its length.
+fn gt_op(p: mut P, w: mut int) int:
+    s = p.src
+    i = p.ts + 1
+    if i < p.n and s.byte(i) == 61:
+        w = 2
+        return O_GE
+    if i < p.n and s.byte(i) == 62:
+        if i + 1 < p.n and s.byte(i + 1) == 62:
+            if i + 2 < p.n and s.byte(i + 2) == 61:
+                w = 4
+                return O_ASSIGN
+            w = 3
+            return O_USHR
+        if i + 1 < p.n and s.byte(i + 1) == 61:
+            w = 3
+            return O_ASSIGN
+        w = 2
+        return O_SHR
+    w = 1
+    return 62
+
+# At ">": is it `>>=` or `>>>=`? Then it's taken as one token (an O_ASSIGN whose text ends
+# in "="), for code that checks for a compound assignment.
+fn gt_assign(p: mut P) bool:
+    if not at_op(&p, 62):
+        return false
+    w = 0
+    if gt_op(&p, &w) != O_ASSIGN:
+        return false
+    take_gt(&p, w)
+    p.op = O_ASSIGN
+    return true
+
+# Consume an operator that gt_op made longer than one ">".
+# `<<` as two `<` (type arguments opening with a generic function type): the first one.
+fn split_shl(p: mut P):
+    p.op = 60
+    p.te = p.ts + 1
+    p.pos = p.te
+
+fn take_gt(p: mut P, w: int):
+    p.te = p.ts + w
+    p.pos = p.te
+
+# Keyword lookup without tables (generated): by length, then first letter, then the rest.
+fn kw_of(s: str, a: int, n: int) int:
+    c = s.byte(a)
+    if n == 2:
+        if c == 97:
+            if s.byte(a + 1) == 115:
+                return 44
+        elif c == 100:
+            if s.byte(a + 1) == 111:
+                return 10
+        elif c == 105:
+            if s.byte(a + 1) == 102:
+                return 19
+            if s.byte(a + 1) == 110:
+                return 21
+            if s.byte(a + 1) == 115:
+                return 58
+        elif c == 111:
+            if s.byte(a + 1) == 102:
+                return 49
+    elif n == 3:
+        if c == 97:
+            if s.byte(a + 1) == 110 and s.byte(a + 2) == 121:
+                return 66
+        elif c == 102:
+            if s.byte(a + 1) == 111 and s.byte(a + 2) == 114:
+                return 17
+        elif c == 103:
+            if s.byte(a + 1) == 101 and s.byte(a + 2) == 116:
+                return 47
+        elif c == 108:
+            if s.byte(a + 1) == 101 and s.byte(a + 2) == 116:
+                return 37
+        elif c == 110:
+            if s.byte(a + 1) == 101 and s.byte(a + 2) == 119:
+                return 23
+        elif c == 111:
+            if s.byte(a + 1) == 117 and s.byte(a + 2) == 116:
+                return 80
+        elif c == 115:
+            if s.byte(a + 1) == 101 and s.byte(a + 2) == 116:
+                return 48
+        elif c == 116:
+            if s.byte(a + 1) == 114 and s.byte(a + 2) == 121:
+                return 31
+        elif c == 118:
+            if s.byte(a + 1) == 97 and s.byte(a + 2) == 114:
+                return 33
+    elif n == 4:
+        if c == 99:
+            if s.byte(a + 1) == 97 and s.byte(a + 2) == 115 and s.byte(a + 3) == 101:
+                return 2
+        elif c == 101:
+            if s.byte(a + 1) == 108 and s.byte(a + 2) == 115 and s.byte(a + 3) == 101:
+                return 11
+            if s.byte(a + 1) == 110 and s.byte(a + 2) == 117 and s.byte(a + 3) == 109:
+                return 12
+        elif c == 102:
+            if s.byte(a + 1) == 114 and s.byte(a + 2) == 111 and s.byte(a + 3) == 109:
+                return 77
+        elif c == 110:
+            if s.byte(a + 1) == 117 and s.byte(a + 2) == 108 and s.byte(a + 3) == 108:
+                return 24
+        elif c == 116:
+            if s.byte(a + 1) == 104 and s.byte(a + 2) == 105 and s.byte(a + 3) == 115:
+                return 28
+            if s.byte(a + 1) == 114 and s.byte(a + 2) == 117 and s.byte(a + 3) == 101:
+                return 30
+            if s.byte(a + 1) == 121 and s.byte(a + 2) == 112 and s.byte(a + 3) == 101:
+                return 50
+        elif c == 118:
+            if s.byte(a + 1) == 111 and s.byte(a + 2) == 105 and s.byte(a + 3) == 100:
+                return 34
+        elif c == 119:
+            if s.byte(a + 1) == 105 and s.byte(a + 2) == 116 and s.byte(a + 3) == 104:
+                return 36
+    elif n == 5:
+        if c == 97:
+            if s.byte(a + 1) == 115 and s.byte(a + 2) == 121 and s.byte(a + 3) == 110 and s.byte(a + 4) == 99:
+                return 45
+            if s.byte(a + 1) == 119 and s.byte(a + 2) == 97 and s.byte(a + 3) == 105 and s.byte(a + 4) == 116:
+                return 46
+        elif c == 98:
+            if s.byte(a + 1) == 114 and s.byte(a + 2) == 101 and s.byte(a + 3) == 97 and s.byte(a + 4) == 107:
+                return 1
+        elif c == 99:
+            if s.byte(a + 1) == 97 and s.byte(a + 2) == 116 and s.byte(a + 3) == 99 and s.byte(a + 4) == 104:
+                return 3
+            if s.byte(a + 1) == 108 and s.byte(a + 2) == 97 and s.byte(a + 3) == 115 and s.byte(a + 4) == 115:
+                return 4
+            if s.byte(a + 1) == 111 and s.byte(a + 2) == 110 and s.byte(a + 3) == 115 and s.byte(a + 4) == 116:
+                return 5
+        elif c == 102:
+            if s.byte(a + 1) == 97 and s.byte(a + 2) == 108 and s.byte(a + 3) == 115 and s.byte(a + 4) == 101:
+                return 15
+        elif c == 105:
+            if s.byte(a + 1) == 110 and s.byte(a + 2) == 102 and s.byte(a + 3) == 101 and s.byte(a + 4) == 114:
+                return 57
+        elif c == 107:
+            if s.byte(a + 1) == 101 and s.byte(a + 2) == 121 and s.byte(a + 3) == 111 and s.byte(a + 4) == 102:
+                return 56
+        elif c == 110:
+            if s.byte(a + 1) == 101 and s.byte(a + 2) == 118 and s.byte(a + 3) == 101 and s.byte(a + 4) == 114:
+                return 68
+        elif c == 115:
+            if s.byte(a + 1) == 117 and s.byte(a + 2) == 112 and s.byte(a + 3) == 101 and s.byte(a + 4) == 114:
+                return 26
+        elif c == 116:
+            if s.byte(a + 1) == 104 and s.byte(a + 2) == 114 and s.byte(a + 3) == 111 and s.byte(a + 4) == 119:
+                return 29
+        elif c == 117:
+            if s.byte(a + 1) == 115 and s.byte(a + 2) == 105 and s.byte(a + 3) == 110 and s.byte(a + 4) == 103:
+                return 79
+        elif c == 119:
+            if s.byte(a + 1) == 104 and s.byte(a + 2) == 105 and s.byte(a + 3) == 108 and s.byte(a + 4) == 101:
+                return 35
+        elif c == 121:
+            if s.byte(a + 1) == 105 and s.byte(a + 2) == 101 and s.byte(a + 3) == 108 and s.byte(a + 4) == 100:
+                return 78
+    elif n == 6:
+        if c == 98:
+            if s.byte(a + 1) == 105 and s.byte(a + 2) == 103 and s.byte(a + 3) == 105 and s.byte(a + 4) == 110 and s.byte(a + 5) == 116:
+                return 73
+        elif c == 100:
+            if s.byte(a + 1) == 101 and s.byte(a + 2) == 108 and s.byte(a + 3) == 101 and s.byte(a + 4) == 116 and s.byte(a + 5) == 101:
+                return 9
+        elif c == 101:
+            if s.byte(a + 1) == 120 and s.byte(a + 2) == 112 and s.byte(a + 3) == 111 and s.byte(a + 4) == 114 and s.byte(a + 5) == 116:
+                return 13
+        elif c == 103:
+            if s.byte(a + 1) == 108 and s.byte(a + 2) == 111 and s.byte(a + 3) == 98 and s.byte(a + 4) == 97 and s.byte(a + 5) == 108:
+                return 61
+        elif c == 105:
+            if s.byte(a + 1) == 109 and s.byte(a + 2) == 112 and s.byte(a + 3) == 111 and s.byte(a + 4) == 114 and s.byte(a + 5) == 116:
+                return 20
+        elif c == 109:
+            if s.byte(a + 1) == 111 and s.byte(a + 2) == 100 and s.byte(a + 3) == 117 and s.byte(a + 4) == 108 and s.byte(a + 5) == 101:
+                return 53
+        elif c == 110:
+            if s.byte(a + 1) == 117 and s.byte(a + 2) == 109 and s.byte(a + 3) == 98 and s.byte(a + 4) == 101 and s.byte(a + 5) == 114:
+                return 70
+        elif c == 111:
+            if s.byte(a + 1) == 98 and s.byte(a + 2) == 106 and s.byte(a + 3) == 101 and s.byte(a + 4) == 99 and s.byte(a + 5) == 116:
+                return 74
+        elif c == 112:
+            if s.byte(a + 1) == 117 and s.byte(a + 2) == 98 and s.byte(a + 3) == 108 and s.byte(a + 4) == 105 and s.byte(a + 5) == 99:
+                return 43
+        elif c == 114:
+            if s.byte(a + 1) == 101 and s.byte(a + 2) == 116 and s.byte(a + 3) == 117 and s.byte(a + 4) == 114 and s.byte(a + 5) == 110:
+                return 25
+        elif c == 115:
+            if s.byte(a + 1) == 119 and s.byte(a + 2) == 105 and s.byte(a + 3) == 116 and s.byte(a + 4) == 99 and s.byte(a + 5) == 104:
+                return 27
+            if s.byte(a + 1) == 116 and s.byte(a + 2) == 97 and s.byte(a + 3) == 116 and s.byte(a + 4) == 105 and s.byte(a + 5) == 99:
+                return 38
+            if s.byte(a + 1) == 116 and s.byte(a + 2) == 114 and s.byte(a + 3) == 105 and s.byte(a + 4) == 110 and s.byte(a + 5) == 103:
+                return 69
+            if s.byte(a + 1) == 121 and s.byte(a + 2) == 109 and s.byte(a + 3) == 98 and s.byte(a + 4) == 111 and s.byte(a + 5) == 108:
+                return 72
+        elif c == 116:
+            if s.byte(a + 1) == 121 and s.byte(a + 2) == 112 and s.byte(a + 3) == 101 and s.byte(a + 4) == 111 and s.byte(a + 5) == 102:
+                return 32
+        elif c == 117:
+            if s.byte(a + 1) == 110 and s.byte(a + 2) == 105 and s.byte(a + 3) == 113 and s.byte(a + 4) == 117 and s.byte(a + 5) == 101:
+                return 60
+    elif n == 7:
+        if c == 97:
+            if s.byte(a + 1) == 115 and s.byte(a + 2) == 115 and s.byte(a + 3) == 101 and s.byte(a + 4) == 114 and s.byte(a + 5) == 116 and s.byte(a + 6) == 115:
+                return 59
+        elif c == 98:
+            if s.byte(a + 1) == 111 and s.byte(a + 2) == 111 and s.byte(a + 3) == 108 and s.byte(a + 4) == 101 and s.byte(a + 5) == 97 and s.byte(a + 6) == 110:
+                return 71
+        elif c == 100:
+            if s.byte(a + 1) == 101 and s.byte(a + 2) == 102 and s.byte(a + 3) == 97 and s.byte(a + 4) == 117 and s.byte(a + 5) == 108 and s.byte(a + 6) == 116:
+                return 8
+            if s.byte(a + 1) == 101 and s.byte(a + 2) == 99 and s.byte(a + 3) == 108 and s.byte(a + 4) == 97 and s.byte(a + 5) == 114 and s.byte(a + 6) == 101:
+                return 51
+        elif c == 101:
+            if s.byte(a + 1) == 120 and s.byte(a + 2) == 116 and s.byte(a + 3) == 101 and s.byte(a + 4) == 110 and s.byte(a + 5) == 100 and s.byte(a + 6) == 115:
+                return 14
+        elif c == 102:
+            if s.byte(a + 1) == 105 and s.byte(a + 2) == 110 and s.byte(a + 3) == 97 and s.byte(a + 4) == 108 and s.byte(a + 5) == 108 and s.byte(a + 6) == 121:
+                return 16
+        elif c == 112:
+            if s.byte(a + 1) == 114 and s.byte(a + 2) == 105 and s.byte(a + 3) == 118 and s.byte(a + 4) == 97 and s.byte(a + 5) == 116 and s.byte(a + 6) == 101:
+                return 41
+        elif c == 114:
+            if s.byte(a + 1) == 101 and s.byte(a + 2) == 113 and s.byte(a + 3) == 117 and s.byte(a + 4) == 105 and s.byte(a + 5) == 114 and s.byte(a + 6) == 101:
+                return 76
+        elif c == 117:
+            if s.byte(a + 1) == 110 and s.byte(a + 2) == 107 and s.byte(a + 3) == 110 and s.byte(a + 4) == 111 and s.byte(a + 5) == 119 and s.byte(a + 6) == 110:
+                return 67
+    elif n == 8:
+        if c == 97:
+            if s.byte(a + 1) == 98 and s.byte(a + 2) == 115 and s.byte(a + 3) == 116 and s.byte(a + 4) == 114 and s.byte(a + 5) == 97 and s.byte(a + 6) == 99 and s.byte(a + 7) == 116:
+                return 54
+            if s.byte(a + 1) == 99 and s.byte(a + 2) == 99 and s.byte(a + 3) == 101 and s.byte(a + 4) == 115 and s.byte(a + 5) == 115 and s.byte(a + 6) == 111 and s.byte(a + 7) == 114:
+                return 64
+        elif c == 99:
+            if s.byte(a + 1) == 111 and s.byte(a + 2) == 110 and s.byte(a + 3) == 116 and s.byte(a + 4) == 105 and s.byte(a + 5) == 110 and s.byte(a + 6) == 117 and s.byte(a + 7) == 101:
+                return 6
+        elif c == 100:
+            if s.byte(a + 1) == 101 and s.byte(a + 2) == 98 and s.byte(a + 3) == 117 and s.byte(a + 4) == 103 and s.byte(a + 5) == 103 and s.byte(a + 6) == 101 and s.byte(a + 7) == 114:
+                return 7
+        elif c == 102:
+            if s.byte(a + 1) == 117 and s.byte(a + 2) == 110 and s.byte(a + 3) == 99 and s.byte(a + 4) == 116 and s.byte(a + 5) == 105 and s.byte(a + 6) == 111 and s.byte(a + 7) == 110:
+                return 18
+        elif c == 111:
+            if s.byte(a + 1) == 118 and s.byte(a + 2) == 101 and s.byte(a + 3) == 114 and s.byte(a + 4) == 114 and s.byte(a + 5) == 105 and s.byte(a + 6) == 100 and s.byte(a + 7) == 101:
+                return 63
+        elif c == 114:
+            if s.byte(a + 1) == 101 and s.byte(a + 2) == 97 and s.byte(a + 3) == 100 and s.byte(a + 4) == 111 and s.byte(a + 5) == 110 and s.byte(a + 6) == 108 and s.byte(a + 7) == 121:
+                return 55
+    elif n == 9:
+        if c == 105:
+            if s.byte(a + 1) == 110 and s.byte(a + 2) == 116 and s.byte(a + 3) == 101 and s.byte(a + 4) == 114 and s.byte(a + 5) == 102 and s.byte(a + 6) == 97 and s.byte(a + 7) == 99 and s.byte(a + 8) == 101:
+                return 40
+        elif c == 110:
+            if s.byte(a + 1) == 97 and s.byte(a + 2) == 109 and s.byte(a + 3) == 101 and s.byte(a + 4) == 115 and s.byte(a + 5) == 112 and s.byte(a + 6) == 97 and s.byte(a + 7) == 99 and s.byte(a + 8) == 101:
+                return 52
+        elif c == 112:
+            if s.byte(a + 1) == 114 and s.byte(a + 2) == 111 and s.byte(a + 3) == 116 and s.byte(a + 4) == 101 and s.byte(a + 5) == 99 and s.byte(a + 6) == 116 and s.byte(a + 7) == 101 and s.byte(a + 8) == 100:
+                return 42
+        elif c == 115:
+            if s.byte(a + 1) == 97 and s.byte(a + 2) == 116 and s.byte(a + 3) == 105 and s.byte(a + 4) == 115 and s.byte(a + 5) == 102 and s.byte(a + 6) == 105 and s.byte(a + 7) == 101 and s.byte(a + 8) == 115:
+                return 62
+        elif c == 117:
+            if s.byte(a + 1) == 110 and s.byte(a + 2) == 100 and s.byte(a + 3) == 101 and s.byte(a + 4) == 102 and s.byte(a + 5) == 105 and s.byte(a + 6) == 110 and s.byte(a + 7) == 101 and s.byte(a + 8) == 100:
+                return 75
+    elif n == 10:
+        if c == 105:
+            if s.byte(a + 1) == 110 and s.byte(a + 2) == 115 and s.byte(a + 3) == 116 and s.byte(a + 4) == 97 and s.byte(a + 5) == 110 and s.byte(a + 6) == 99 and s.byte(a + 7) == 101 and s.byte(a + 8) == 111 and s.byte(a + 9) == 102:
+                return 22
+            if s.byte(a + 1) == 109 and s.byte(a + 2) == 112 and s.byte(a + 3) == 108 and s.byte(a + 4) == 101 and s.byte(a + 5) == 109 and s.byte(a + 6) == 101 and s.byte(a + 7) == 110 and s.byte(a + 8) == 116 and s.byte(a + 9) == 115:
+                return 39
+    elif n == 11:
+        if c == 99:
+            if s.byte(a + 1) == 111 and s.byte(a + 2) == 110 and s.byte(a + 3) == 115 and s.byte(a + 4) == 116 and s.byte(a + 5) == 114 and s.byte(a + 6) == 117 and s.byte(a + 7) == 99 and s.byte(a + 8) == 116 and s.byte(a + 9) == 111 and s.byte(a + 10) == 114:
+                return 65
+    return 0

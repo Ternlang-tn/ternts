@@ -1,0 +1,84 @@
+{
+  "about": "Plain TypeScript: enums, namespaces, classes, using, type syntax. Per-file (transpileModule) output.",
+  "sets": {
+    "cjs": {
+      "module": "commonjs",
+      "useDefineForClassFields": false
+    },
+    "esm": {
+      "module": "esnext",
+      "useDefineForClassFields": false
+    },
+    "interop": {
+      "module": "commonjs",
+      "esModuleInterop": true,
+      "strictNullChecks": true,
+      "useDefineForClassFields": false
+    },
+    "define": {
+      "module": "commonjs",
+      "useDefineForClassFields": true
+    },
+    "es2021": {
+      "module": "commonjs",
+      "useDefineForClassFields": false,
+      "target": "ES2021"
+    },
+    "es2019": {
+      "module": "commonjs",
+      "useDefineForClassFields": false,
+      "target": "ES2019"
+    },
+    "es2017": {
+      "module": "commonjs",
+      "useDefineForClassFields": false,
+      "target": "ES2017"
+    },
+    "es2015": {
+      "module": "commonjs",
+      "useDefineForClassFields": false,
+      "target": "ES2015"
+    },
+    "es2020-define": {
+      "module": "commonjs",
+      "useDefineForClassFields": true,
+      "target": "ES2020"
+    }
+  },
+  "known": {
+    "async-super-index.ts": {
+      "why": "tsc bug, not copied: at ES2017 (async methods native) tsc rewrites super in the native async methods to an undeclared _super/_superIndex when the file also has async generators (a ReferenceError at run time); ternts keeps super",
+      "sets": [
+        "es2017"
+      ]
+    },
+    "static-accessor-unnamed.ts": {
+      "why": "guards against the old refusal (a crash fails it anyway): at ES2022 tsc reads the storage through a temp it never assigns (_a.#a_accessor_storage, a TypeError at run time), where ternts uses the variable the class is assigned to; below that, ternts names the default class's storage _b_accessor_storage (tsc: _default_1_b_accessor_storage) and writes exports.X after the class instead of folding it",
+      "sets": [
+        "cjs",
+        "esm",
+        "interop",
+        "define",
+        "es2021",
+        "es2019",
+        "es2017",
+        "es2015",
+        "es2020-define"
+      ]
+    },
+    "enum-nonfinite.ts": {
+      "why": "guards against crashes (a crash fails it anyway): tsc folds members through non-finite values (2 ** 1e300 is Infinity, 5 % (1/0) is 5) where ternts leaves an expression that reaches Infinity, NaN or a division by zero as written",
+      "sets": [
+        "cjs",
+        "esm",
+        "interop",
+        "define",
+        "es2021",
+        "es2019",
+        "es2017",
+        "es2015",
+        "es2020-define"
+      ]
+    }
+  }
+}

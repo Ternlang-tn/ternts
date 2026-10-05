@@ -1,0 +1,12 @@
+{
+  "about": "module node16..nodenext and preserve (TypeScript's conformance cases found these).",
+  "sets": {
+    "node16": { "module": "node16", "useDefineForClassFields": false, "files": ["dynamic.ts", "dynamic.mts", "require-esm.mts"] },
+    "nodenext": { "module": "nodenext", "useDefineForClassFields": false, "files": ["dynamic.ts"] },
+    "commonjs": { "module": "commonjs", "useDefineForClassFields": false, "files": ["dynamic.ts"] },
+    "preserve": { "module": "preserve", "target": "esnext", "useDefineForClassFields": false, "files": ["preserve.ts", "preserve-equals.ts", "preserve-empty.ts", "preserve-cjs.cts"] },
+    "es2015": { "module": "es2015", "useDefineForClassFields": false, "files": ["star-as-es2015.ts"] },
+    "commonjs-star": { "module": "commonjs", "esModuleInterop": true, "useDefineForClassFields": false, "files": ["star-as-es2015.ts"] },
+    "preserve-verbatim": { "module": "preserve", "target": "esnext", "verbatimModuleSyntax": true, "useDefineForClassFields": false, "files": ["preserve-verbatim.ts", "preserve-empty.ts"] }
+  }
+}

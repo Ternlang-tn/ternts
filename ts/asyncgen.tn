@@ -1,0 +1,394 @@
+# Async generators and `for await` below ES2018, lowered as tsc writes them (__asyncGenerator,
+# __await, __asyncValues).
+
+const H_AWAIT = 16384
+const H_ASYNC_VALUES = 32768
+const H_ASYNC_DELEGATOR = 65536
+const H_ASYNC_GENERATOR = 131072
+
+const HELPER_AWAIT = """var __await = (this && this.__await) || function (v) { return this instanceof __await ? (this.v = v, this) : new __await(v); }"""
+
+const HELPER_ASYNC_VALUES = """var __asyncValues = (this && this.__asyncValues) || function (o) {
+    if (!Symbol.asyncIterator) throw new TypeError("Symbol.asyncIterator is not defined.");
+    var m = o[Symbol.asyncIterator], i;
+    return m ? m.call(o) : (o = typeof __values === "function" ? __values(o) : o[Symbol.iterator](), i = {}, verb("next"), verb("throw"), verb("return"), i[Symbol.asyncIterator] = function () { return this; }, i);
+    function verb(n) { i[n] = o[n] && function (v) { return new Promise(function (resolve, reject) { v = o[n](v), settle(resolve, reject, v.done, v.value); }); }; }
+    function settle(resolve, reject, d, v) { Promise.resolve(v).then(function(v) { resolve({ value: v, done: d }); }, reject); }
+};"""
+
+const HELPER_ASYNC_DELEGATOR = """var __asyncDelegator = (this && this.__asyncDelegator) || function (o) {
+    var i, p;
+    return i = {}, verb("next"), verb("throw", function (e) { throw e; }), verb("return"), i[Symbol.iterator] = function () { return this; }, i;
+    function verb(n, f) { i[n] = o[n] ? function (v) { return (p = !p) ? { value: __await(o[n](v)), done: false } : f ? f(v) : v; } : f; }
+};"""
+
+const HELPER_ASYNC_GENERATOR = """var __asyncGenerator = (this && this.__asyncGenerator) || function (thisArg, _arguments, generator) {
+    if (!Symbol.asyncIterator) throw new TypeError("Symbol.asyncIterator is not defined.");
+    var g = generator.apply(thisArg, _arguments || []), i, q = [];
+    return i = Object.create((typeof AsyncIterator === "function" ? AsyncIterator : Object).prototype), verb("next"), verb("throw"), verb("return", awaitReturn), i[Symbol.asyncIterator] = function () { return this; }, i;
+    function awaitReturn(f) { return function (v) { return Promise.resolve(v).then(f, reject); }; }
+    function verb(n, f) { if (g[n]) { i[n] = function (v) { return new Promise(function (a, b) { q.push([n, v, a, b]) > 1 || resume(n, v); }); }; if (f) i[n] = f(i[n]); } }
+    function resume(n, v) { try { step(g[n](v)); } catch (e) { settle(q[0][3], e); } }
+    function step(r) { r.value instanceof __await ? Promise.resolve(r.value.v).then(fulfill, reject) : settle(q[0][2], r); }
+    function fulfill(value) { resume("next", value); }
+    function reject(value) { resume("throw", value); }
+    function settle(f, v) { if (f(v), q.shift(), q.length) resume(q[0][0], q[0][1]); }
+};"""
+
+# The helpers in the order the code asks for them, a helper's dependency (__await) first.
+fn agen_req(p: mut P, h: int):
+    if (h == H_ASYNC_GENERATOR or h == H_ASYNC_DELEGATOR) and p.helpers & H_AWAIT == 0:
+        agen_req(&p, H_AWAIT)
+    if p.helpers & h != 0:
+        return
+    p.helpers = p.helpers | h                    # (after the #private helpers: tsc's ES2018 transform runs later)
+    p.agen_order.push(h)
+
+fn agen_helpers_text(p: mut P, rest_at: int) str:
+    t = ""
+    for i in 0..len(p.agen_order):
+        if i == rest_at:                         # (__rest, wanted before this one)
+            t += HELPER_REST + "\n"
+        t += agen_helper_text(p.agen_order[i])
+    return t
+
+fn agen_helper_text(h: int) str:
+    t = ""
+    if true:
+        if h == H_AWAIT:
+            t += HELPER_AWAIT + "\n"
+        elif h == H_ASYNC_VALUES:
+            t += HELPER_ASYNC_VALUES + "\n"
+        elif h == H_ASYNC_DELEGATOR:
+            t += HELPER_ASYNC_DELEGATOR + "\n"
+        elif h == H_ASYNC_GENERATOR:
+            t += HELPER_ASYNC_GENERATOR + "\n"
+    return t
+
+# Inside a lowered async generator?
+fn in_agen(p: mut P) bool:
+    t = async_top(&p)
+    return t >= 0 and p.actx[t].gen
+
+# An async generator function's parameters and body (at "(" or "<"; `async` dropped), lowered.
+fn agen_fn_rest(p: mut P, collect: bool, name: str) AsyncRes:
+    drop_async(&p)
+    id = len(p.actx)
+    p.actx.push(ACtx("", false, [], false, false, true, "", false))
+    p.aw.push(id)
+    emit_ts(&p)
+    drop_star(&p)
+    saved = begin_capture(&p)
+    if at_op(&p, 60):
+        emit_ts(&p)
+        skip_type_params(&p)
+        skip_pe(&p)
+    info = fparams(&p, collect)
+    emit_pe(&p)
+    pt = end_capture(&p, saved)
+    rt = ser(SER_VOID)
+    has_rt = false
+    if at_op(&p, 58):
+        rt = drop_return_type(&p)
+        has_rt = true
+    skip_ts(&p)
+    outer = pt.trim()
+    gen = "()"
+    if not params_simple(outer):                 # defaults, patterns: on the generator, with copies
+        cp = param_copies(&p, outer, p.u_fns + 1)    # outside (for the length), named before the body's
+        gen = outer
+        outer = "(" + ", ".join(cp.names) + ")"
+    saved2 = begin_capture(&p)
+    ga = p.in_gen
+    aa = p.in_async
+    p.in_gen = 1
+    p.in_async = 1
+    p.this_depth += 1
+    fn_body(&p)
+    p.this_depth -= 1
+    p.in_gen = ga
+    p.in_async = aa
+    emit_pe(&p)
+    body = end_capture(&p, saved2)
+    p.aw.pop()
+    gname = ""
+    if name == "\x01":
+        gname = " " + name_temp(&p)              # a method with a computed name: a temp
+    elif name != "":
+        gname = " " + unique_name(&p, name)
+    agen_req(&p, H_ASYNC_GENERATOR)
+    sn = super_names_of(&p)
+    c = p.actx[id]
+    put(&p, outer + " {" + agen_prelude(c, sn) + " return __asyncGenerator(this, arguments, function*" + gname + gen + " " + body.trim() + "); }")
+    return AsyncRes(info, rt, has_rt)
+
+# `yield` in a lowered async generator (at it).
+fn agen_yield(p: mut P, no_in: bool):
+    before = prev_binds(&p)
+    a = p.ts
+    emit_to(&p, a)
+    next(&p)
+    star = false
+    arg = ""
+    if not p.nlb:
+        star = eat_op(&p, 42)
+        if starts_expr(&p):
+            skip_ts(&p)
+            saved = begin_capture(&p)
+            assign(&p, no_in)
+            emit_pe(&p)
+            t = end_capture(&p, saved)
+            arg = t.trim()
+    e = p.pe
+    skip_to(&p, e)
+    s = ""
+    if star:
+        agen_req(&p, H_ASYNC_VALUES)
+        agen_req(&p, H_ASYNC_DELEGATOR)
+        agen_req(&p, H_AWAIT)
+        s = "yield __await(yield* __asyncDelegator(__asyncValues(" + arg + ")))"
+    elif arg == "":
+        agen_req(&p, H_AWAIT)
+        s = "yield yield __await(void 0)"
+    else:
+        agen_req(&p, H_AWAIT)
+        s = "yield yield __await(" + arg + ")"
+    if before or next_binds(&p):
+        s = "(" + s + ")"
+    put(&p, s)
+
+# `return x` in a lowered async generator (at `return`): return yield __await(x).
+fn agen_return(p: mut P):
+    a = p.ts
+    emit_to(&p, a)
+    next(&p)
+    arg = "void 0"
+    if not p.nlb and not at_op(&p, 59) and not at_op(&p, 125) and p.tok != T_EOF:
+        skip_ts(&p)
+        saved = begin_capture(&p)
+        parse_expr(&p)
+        emit_pe(&p)
+        t = end_capture(&p, saved)
+        arg = t.trim()
+    e = p.pe
+    skip_to(&p, e)
+    agen_req(&p, H_AWAIT)
+    put(&p, "return yield __await(" + arg + ")")
+    end_stmt(&p)
+
+# `for await (...) body` below ES2018 (at `for`).
+fn for_await(p: mut P):
+    flabel = p.fa_label
+    p.fa_label = ""
+    a = p.ts
+    emit_to(&p, a)
+    next(&p)                                     # for
+    next(&p)                                     # await
+    push_scope_here(&p, false)
+    expect_op(&p, 40)
+    skip_ts(&p)
+    head = ""
+    use_body = false
+    u_req_id = -1
+    uname = ""
+    u_async = false
+    if at_using_decl(&p, true):
+        # for await ([await] using x of xs): the loop takes x_1 and its body declares x (as using.tn)
+        if not p.has_using:
+            p.retry = true
+            p.want_using = true
+        u_async = at_kw(&p, K_AWAIT)
+        if u_async:
+            next(&p)
+        next(&p)                                 # using
+        uname = tok_text(&p)
+        declare_tok(&p, false)
+        next(&p)
+        if at_op(&p, 58):
+            next(&p)
+            p.bad = false
+            parse_type(&p)
+        req = u_req(&p, uname, true)
+        p.markers = true
+        head = "const \x00U" + str(req) + "\x00 = "
+        use_body = true                          # (u_pre_* are set at the body: the iterable may hold functions)
+        u_req_id = req
+    elif p.tok == T_NAME and (p.kw == K_VAR or p.kw == K_LET or p.kw == K_CONST):
+        kind = tok_text(&p)
+        hoist = p.kw == K_VAR
+        next(&p)
+        skip_ts(&p)
+        saved = begin_capture(&p)
+        binding(&p, hoist)
+        emit_pe(&p)
+        pat = end_capture(&p, saved)
+        if at_op(&p, 58):
+            drop_annotation(&p)
+        head = kind + " " + pat.trim() + " = "
+    else:
+        saved = begin_capture(&p)
+        lhs_root(&p)
+        emit_pe(&p)
+        t = end_capture(&p, saved)
+        head = t.trim() + " = "
+    if not at_kw(&p, K_OF):
+        fail(&p, "expected 'of' in for await")
+        return
+    next(&p)
+    skip_ts(&p)
+    src_a = p.ts
+    saved = begin_capture(&p)
+    assign(&p, false)
+    emit_pe(&p)
+    it0 = end_capture(&p, saved)
+    itext = it0.trim()
+    as_written = p.src[src_a..p.pe].trim() == itext   # (x as T, x!: not a name to tsc)
+    agen_req(&p, H_ASYNC_VALUES)                 # (asked for before the body's, as tsc)
+    if in_agen(&p):
+        agen_req(&p, H_AWAIT)
+    expect_op(&p, 41)
+    skip_ts(&p)
+    p.markers = true                             # e_N: numbered with using's names, in tsc's print order
+    ereq = u_req(&p, "e", p.mute == 0)           # (with the function's vars, before its blocks')
+    p.u_reqs[ereq].seq = p.u_reqs[ereq].seq - 1000000000
+    if not in_fn_scope(&p):                      # (an arrow is a function too, though not for `this`)
+        p.u_reqs[ereq].owner = -1                # (the module's: in the prologue, printed first)
+    err = "\x00U" + str(ereq) + "\x00"
+    pre_named = simple_copy(itext) and itext != "this" and not is_digit(itext.byte(0)) and as_written
+    iter_m = ""                                  # its iterator's name (xs_1): numbered the same way
+    if pre_named:
+        ireq = u_req(&p, itext, p.mute == 0)
+        p.u_reqs[ireq].seq = p.u_reqs[ireq].seq - 1000000000
+        p.u_reqs[ireq].owner = p.u_reqs[ereq].owner
+        iter_m = "\x00U" + str(ireq) + "\x00"
+    body = ""
+    done = low_temp(&p, 2018)                    # (its hoisted names before a nested loop's, as tsc)
+    lt_push(&p, 2018, err)
+    ret = low_temp(&p, 2018)
+    val = low_temp(&p, 2018)
+    in_loop = p.loop_depth > 0
+    p.loop_depth += 1
+    if at_op(&p, 123):
+        next(&p)
+        skip_ts(&p)
+        saved2 = begin_capture(&p)
+        uid = -1
+        if use_body:
+            p.u_pre_var = u_req_id
+            p.u_pre_name = uname
+            p.u_pre_async = u_async
+            uid = u_open(&p)
+        statements(&p, false)
+        emit_ts(&p)
+        if use_body:
+            u_close(&p, uid)
+        body = end_capture(&p, saved2)
+        expect_op(&p, 125)
+        e = p.pe
+        skip_to(&p, e)
+    else:
+        saved2 = begin_capture(&p)
+        uid = -1
+        if use_body:
+            p.u_pre_var = u_req_id
+            p.u_pre_name = uname
+            p.u_pre_async = u_async
+            uid = u_open(&p)
+        statement(&p, false)
+        emit_pe(&p)
+        if use_body:
+            u_close(&p, uid)
+        body = end_capture(&p, saved2)
+    p.loop_depth -= 1
+    pop_scope(&p)
+    # how its awaits are written: in an async generator, inside __awaiter, or native
+    agen = in_agen(&p)
+    awt = async_top(&p) >= 0 and not agen
+    flag = ""
+    iter = ""
+    res = ""
+    named = simple_copy(itext) and itext != "this" and not is_digit(itext.byte(0)) and as_written
+    hoist = awt and named and is_param(p.actx[async_top(&p)].params, itext)   # (collides with a parameter: tsc hoists it)
+    if hoist:
+        flag = low_temp(&p, 2016)
+    else:
+        flag = name_temp(&p)
+    if named:
+        iter = iter_m
+        res = iter + "_1"
+        if hoist:
+            lt_push(&p, 2016, iter)
+            lt_push(&p, 2016, res)
+    else:
+        iter = name_temp(&p)
+        res = name_temp(&p)
+    agen_req(&p, H_ASYNC_VALUES)
+    nxt = ""
+    fin = ""
+    if agen:
+        agen_req(&p, H_AWAIT)
+        nxt = "yield __await(" + iter + ".next())"
+        fin = "yield __await(" + ret + ".call(" + iter + "))"
+    elif awt:
+        nxt = "yield " + iter + ".next()"
+        fin = "yield " + ret + ".call(" + iter + ")"
+    else:
+        nxt = "await " + iter + ".next()"
+        fin = "await " + ret + ".call(" + iter + ")"
+    av = "__asyncValues(" + itext + ")"
+    if in_loop:
+        av = "(" + err + " = void 0, " + av + ")"  # a loop runs it again: its error starts clear
+    init = "var " + flag + " = true, " + iter + " = " + av + ", " + res
+    if hoist:
+        init = flag + " = true, " + iter + " = " + av
+    lbl = ""
+    if flabel != "":
+        lbl = flabel + ": "
+    o = "try {\n    " + lbl + "for (" + init + "; " + res + " = " + nxt + ", " + done + " = " + res + ".done, !" + done + "; " + flag + " = true) {\n"
+    o += "        " + val + " = " + res + ".value;\n        " + flag + " = false;\n        " + head + val + ";\n"
+    o += body + "\n    }\n}\ncatch (" + err + "_1) { " + err + " = { error: " + err + "_1 }; }\n"
+    o += "finally {\n    try {\n        if (!" + flag + " && !" + done + " && (" + ret + " = " + iter + ".return)) " + fin + ";\n    }\n    finally { if (" + err + ") throw " + err + ".error; }\n}"
+    put(&p, o)
+
+# A name declared in the var statement of the transform for `year` (as low_temp's).
+fn lt_push(p: mut P, year: int, name: str):
+    g = year - 2015
+    if len(p.fn_stack) > 0:
+        f = p.fn_stack[len(p.fn_stack) - 1]
+        if len(p.fn_lt[f]) == 0:
+            p.fn_lt[f] = [[], [], [], [], [], [], []]
+        p.fn_lt[f][g].push(name)
+    else:
+        if len(p.lt_mod) == 0:
+            p.lt_mod = [[], [], [], [], [], [], []]
+        p.lt_mod[g].push(name)
+
+# The `*` of `function* g` / `async *m` in the output so far: the outer function isn't one.
+fn drop_star(p: mut P):
+    k = len(p.out) - 1
+    while k >= 0:
+        c = p.out.byte(k)
+        if c == 42:
+            p.out = p.out[..k] + p.out[k + 1..]
+            return
+        if not (is_id(c) or c == 32 or c == 9 or c == 10 or c == 13 or c == 34 or c == 39 or c == 91 or c == 93 or c == 46):
+            return
+        k -= 1
+
+# Is `name` one of the parameters (text "(a, b = 1, ...c)")?
+fn is_param(pt: str, name: str) bool:
+    t = pt.trim()
+    if t.starts_with("("):
+        t = t[1..]
+    if t.ends_with(")"):
+        t = t[..len(t) - 1]
+    for e0 in top_split(t, 44):
+        e = e0.trim()
+        if e.starts_with("..."):
+            e = e[3..].trim()
+        d = top_assign(e)
+        if d >= 0:
+            e = e[..d].trim()
+        if e == name:
+            return true
+    return false

@@ -1,0 +1,525 @@
+# Loads tsconfig.json: the options ternts needs, with `extends` followed and tsc's defaults applied.
+import fs
+import json
+import os
+import ts
+
+struct Config:
+    err: str
+    path: str               # the config file, absolute
+    dir: str                # its directory
+    module: str             # compilerOptions.module, lowercased ("" when not set)
+    target: str
+    esm: bool               # ES module output (module es2015..esnext / preserve)
+    per_file_module: bool   # node16/node18/nodenext: .mts/.cts and package.json "type" decide
+    interop: bool           # esModuleInterop
+    strict_null: bool       # strictNullChecks (or strict)
+    use_define: bool        # useDefineForClassFields (true from target ES2022 unless set)
+    decorators: bool        # experimentalDecorators
+    no_emit_helpers: bool   # noEmitHelpers
+    metadata: bool          # emitDecoratorMetadata
+    verbatim: bool          # verbatimModuleSyntax
+    jsx: str
+    jsx_source: str
+    jsx_factory: str
+    jsx_frag: str
+    root: str               # rootDir
+    out_dir: str            # outDir
+    source_map: bool
+    no_emit: bool           # noEmit: tsc writes nothing (the project is type-checked only)
+    always_strict: bool     # alwaysStrict (default: strict)
+    files: [str]            # absolute
+    include: [str]          # absolute patterns
+    exclude: [str]
+    warnings: [str]
+    paths: [str]            # compilerOptions.paths: "pattern \x01 target \x02 target ...", targets absolute
+    force_module: bool      # moduleDetection force: every file is a module
+
+# Everything a config file sets, before defaults (one level of `extends`).
+struct Raw:
+    err: str
+    opts: {str: json.Value}
+    base_dir: {str: str}    # for path options: the directory of the config that set them
+    files: [str]
+    include: [str]
+    exclude: [str]
+    has_files: bool
+    has_include: bool
+    has_exclude: bool
+
+fn load(path: str) Config:
+    c = Config("", "", "", "", "", false, false, false, false, false, false, false, false, false, "", "react", "React.createElement", "React.Fragment", "", "", false, false, false, [], [], [], [], [], false)
+    p = absolute(path)
+    if not fs.exists(p):
+        c.err = f"{path}: no such file"
+        return c
+    raw = load_raw(p, 0)
+    if raw.err != "":
+        c.err = raw.err
+        return c
+    c.path = p
+    c.dir = dir_of(p)
+    apply(&c, raw)
+    return c
+
+# The config's moduleResolution (node10, node16, nodenext, bundler or classic), else tsc 5's default for module.
+fn resolution(path: str) str:
+    p = absolute(path)
+    if not fs.exists(p):
+        return "node10"
+    r = load_raw(p, 0)
+    mr = opt_str(r, "moduleResolution")
+    if mr == "node" or mr == "node10":
+        return "node10"
+    if mr == "classic" or mr == "node16" or mr == "nodenext" or mr == "bundler":
+        return mr
+    m = opt_str(r, "module")
+    if m == "":
+        m = "commonjs"
+        if target_year(opt_str(r, "target")) >= 2015:
+            m = "es2015"
+    if m == "commonjs":
+        return "node10"
+    if m == "node16" or m == "node18" or m == "node20":
+        return "node16"
+    if m == "nodenext":
+        return "nodenext"
+    if m == "preserve":
+        return "bundler"
+    return "classic"
+
+# tsconfig's compilerOptions over the defaults; flags given on the command line add to them.
+fn options(c: Config, flags: ts.Opts, jsx_given: bool) ts.Opts:
+    o = flags
+    o.esm = flags.esm or c.esm
+    o.interop = flags.interop or c.interop
+    o.strict = flags.strict or c.strict_null
+    o.always_strict = c.always_strict
+    o.use_define = flags.use_define or c.use_define
+    if flags.target <= 0 and c.target != "":
+        o.target = target_year(c.target)
+    o.metadata = c.metadata
+    o.decorators = c.decorators
+    o.no_emit_helpers = c.no_emit_helpers
+    o.verbatim = c.verbatim
+    o.per_file_module = c.per_file_module
+    o.force_module = c.force_module
+    o.preserve = c.module == "preserve"
+    o.es2015_module = c.module == "es2015" or c.module == "es6" or (c.module == "" and c.target != "" and target_year(c.target) >= 2015)
+    if not jsx_given and c.jsx != "":
+        if c.jsx == "react":
+            o.jsx = ts.JSX_REACT
+        elif c.jsx == "react-jsxdev":
+            o.jsx = ts.JSX_DEV
+        elif c.jsx == "preserve" or c.jsx == "react-native":
+            o.jsx = ts.JSX_PRESERVE
+        else:
+            o.jsx = ts.JSX_AUTO
+    o.jsx_source = c.jsx_source
+    o.jsx_factory = c.jsx_factory
+    o.jsx_frag = c.jsx_frag
+    return o
+
+# A Config from compilerOptions JSON alone, without file access (for the wasm library).
+fn from_options(text: str) Config:
+    c = Config("", "", "", "", "", false, false, false, false, false, false, false, false, false, "", "react", "React.createElement", "React.Fragment", "", "", false, false, false, [], [], [], [], [], false)
+    r = empty_raw()
+    match json.parse(strip_jsonc(text)):
+        Ok(v):
+            match v:
+                Obj(keys, vals):
+                    for i in 0..len(keys):
+                        r.opts[keys[i]] = vals[i]
+                        r.base_dir[keys[i]] = ""
+                _:
+                    c.err = "compilerOptions: not an object"
+                    return c
+        Err(e):
+            c.err = "compilerOptions: " + e
+            return c
+    apply(&c, r)
+    return c
+
+fn empty_raw() Raw:
+    return Raw("", {}, {}, [], [], [], false, false, false)
+
+# One config file, merged over what it extends.
+fn load_raw(path: str, depth: int) Raw:
+    r = empty_raw()
+    if depth > 16:
+        r.err = f"{path}: `extends` goes around in a circle"
+        return r
+    text = strip_jsonc(fs.read(path))
+    v = json.Value.Null
+    match json.parse(text):
+        Ok(x):
+            v = x
+        Err(e):
+            r.err = f"{path}: {e}"
+            return r
+    dir = dir_of(path)
+    # what it extends comes first, then this file on top
+    ext = v.field("extends")
+    bases: [str] = []
+    match ext:
+        Str(s):
+            bases.push(s)
+        Arr(items):
+            for it in items:
+                bases.push(it.str_or(""))
+        _:
+            pass
+    for b in bases:
+        bp = resolve_extends(dir, b)
+        if bp == "":
+            r.err = f"{path}: can't find the config it extends, `{b}`"
+            return r
+        br = load_raw(bp, depth + 1)
+        if br.err != "":
+            r.err = br.err
+            return r
+        for k in br.opts.keys():
+            r.opts[k] = br.opts[k]
+            if (k in br.base_dir):
+                r.base_dir[k] = br.base_dir[k]
+        if br.has_files:
+            r.files = br.files
+            r.has_files = true
+        if br.has_include:
+            r.include = br.include
+            r.has_include = true
+        if br.has_exclude:
+            r.exclude = br.exclude
+            r.has_exclude = true
+    co = v.field("compilerOptions")
+    match co:
+        Obj(keys, vals):
+            for i in 0..len(keys):
+                r.opts[keys[i]] = vals[i]
+                r.base_dir[keys[i]] = dir
+        _:
+            pass
+    f = v.field("files")
+    match f:
+        Arr(items):
+            r.files = []
+            for it in items:
+                r.files.push(join_path(dir, it.str_or("")))
+            r.has_files = true
+        _:
+            pass
+    inc = v.field("include")
+    match inc:
+        Arr(items):
+            r.include = []
+            for it in items:
+                r.include.push(join_path(dir, it.str_or("")))
+            r.has_include = true
+        _:
+            pass
+    exc = v.field("exclude")
+    match exc:
+        Arr(items):
+            r.exclude = []
+            for it in items:
+                r.exclude.push(join_path(dir, it.str_or("")))
+            r.has_exclude = true
+        _:
+            pass
+    return r
+
+# "./base" / "../tsconfig.json" / "@tsconfig/node20/tsconfig.json" / "@scope/pkg" -> a file, or "".
+fn resolve_extends(dir: str, name: str) str:
+    if name.starts_with("./") or name.starts_with("../") or name.starts_with("/"):
+        p = join_path(dir, name)
+        if fs.exists(p) and not fs.stat(p).is_dir:
+            return p
+        if fs.exists(p + ".json"):
+            return p + ".json"
+        return ""
+    d = dir
+    while true:
+        base = d + "/node_modules/" + name
+        if fs.exists(base) and not fs.stat(base).is_dir:
+            return base
+        if fs.exists(base + ".json"):
+            return base + ".json"
+        if fs.exists(base + "/tsconfig.json"):
+            return base + "/tsconfig.json"
+        if d == "/" or d == "":
+            return ""
+        d = dir_of(d)
+    return ""
+
+fn opt_bool(r: Raw, key: str, dflt: bool) bool:
+    if (key in r.opts):
+        return r.opts[key].bool_or(dflt)
+    return dflt
+
+fn opt_str(r: Raw, key: str) str:
+    if (key in r.opts):
+        return r.opts[key].str_or("").lower()
+    return ""
+
+fn opt_path(r: Raw, key: str) str:
+    if (key in r.opts):
+        s = r.opts[key].str_or("")
+        if s != "":
+            return join_path(r.base_dir[key], s)
+    return ""
+
+# The target as a year (ES2022 -> 2022, ESNext -> 9999, ES5 -> 5); tsc's default is ES5.
+fn target_year(t: str) int:
+    if t == "" or t == "es3" or t == "es5":
+        return 5
+    if t == "es6" or t == "es2015":
+        return 2015
+    if t == "esnext" or t == "latest":
+        return 9999
+    if t.starts_with("es"):
+        return t[2..].to_int(5)
+    return 5
+
+fn apply(c: mut Config, r: Raw):
+    c.target = opt_str(r, "target")
+    year = target_year(c.target)
+    c.module = opt_str(r, "module")
+    m = c.module
+    if m == "":
+        m = "commonjs"
+        if year >= 2015:
+            m = "es2015"
+    c.per_file_module = m == "node16" or m == "node18" or m == "node20" or m == "nodenext"
+    md = opt_str(r, "moduleDetection")
+    c.force_module = md == "force" or (md == "" and c.per_file_module)
+    c.esm = m == "es6" or m == "es2015" or m == "es2020" or m == "es2022" or m == "esnext" or m == "preserve"
+    c.interop = opt_bool(r, "esModuleInterop", c.per_file_module)
+    strict = opt_bool(r, "strict", false)
+    c.strict_null = opt_bool(r, "strictNullChecks", strict)
+    c.always_strict = opt_bool(r, "alwaysStrict", strict)
+    c.use_define = opt_bool(r, "useDefineForClassFields", year >= 2022)
+    c.decorators = opt_bool(r, "experimentalDecorators", false)
+    c.no_emit_helpers = opt_bool(r, "noEmitHelpers", false)
+    c.metadata = opt_bool(r, "emitDecoratorMetadata", false)
+    c.verbatim = opt_bool(r, "verbatimModuleSyntax", false)
+    c.jsx = opt_str(r, "jsx")
+    if (("jsxImportSource" in r.opts)):
+        c.jsx_source = r.opts["jsxImportSource"].str_or("react")
+    if (("jsxFactory" in r.opts)):
+        c.jsx_factory = r.opts["jsxFactory"].str_or("React.createElement")
+    elif (("reactNamespace" in r.opts)):
+        c.jsx_factory = r.opts["reactNamespace"].str_or("React") + ".createElement"
+    if (("jsxFragmentFactory" in r.opts)):
+        c.jsx_frag = r.opts["jsxFragmentFactory"].str_or("React.Fragment")
+    c.root = opt_path(r, "rootDir")
+    c.out_dir = opt_path(r, "outDir")
+    c.source_map = opt_bool(r, "sourceMap", false)
+    c.no_emit = opt_bool(r, "noEmit", false)
+    # paths: relative to baseUrl, or to the config that set them when there's no baseUrl
+    if ("paths" in r.opts):
+        base = opt_path(r, "baseUrl")
+        if base == "":
+            base = r.base_dir.get("paths", c.dir)
+            if base == "":
+                base = c.dir
+        pv = r.opts["paths"]
+        for pat in pv.fields():
+            targets: [str] = []
+            match pv.field(pat):
+                json.Value.Arr(items):
+                    for it in items:
+                        t = it.str_or("")
+                        if t != "":
+                            targets.push(join_path(base, t))
+                _:
+                    pass
+            if len(targets) > 0:
+                c.paths.push(pat + "\x01" + "\x02".join(targets))
+    c.files = r.files
+    c.include = r.include
+    if not r.has_include and not r.has_files:
+        c.include = [c.dir + "/**/*"]
+    if r.has_exclude:
+        c.exclude = r.exclude
+    else:
+        c.exclude = [c.dir + "/node_modules", c.dir + "/bower_components", c.dir + "/jspm_packages"]
+        if c.out_dir != "":
+            c.exclude.push(c.out_dir)
+    if year < 2015 and c.target != "":
+        c.warnings.push(f"target {c.target}: ternts' lowest target is ES2015 (classes, arrow functions and let stay as they are); it writes ES2015 JavaScript")
+    if opt_bool(r, "importHelpers", false):
+        c.warnings.push("importHelpers: helpers are written into each file (tslib isn't used)")
+    if opt_bool(r, "inlineSourceMap", false):
+        c.warnings.push("inlineSourceMap: not supported; use sourceMap")
+
+# Is `path` (absolute) one of the project's sources?
+fn included(c: Config, path: str) bool:
+    for f in c.files:
+        if f == path:
+            return true
+    ok = false
+    for pat in c.include:
+        if matches(pat, path):
+            ok = true
+            break
+    if not ok:
+        return false
+    for pat in c.exclude:
+        if matches(pat, path):
+            return false
+    return true
+
+# tsc's include/exclude patterns; one without wildcards matches a directory and all below it.
+fn matches(pat: str, path: str) bool:
+    if not pat.contains("*") and not pat.contains("?"):
+        return path == pat or path.starts_with(pat + "/")
+    last = pat
+    k = pat.find("/**/")
+    if pat.ends_with("/**"):
+        return path.starts_with(pat[..len(pat) - 3] + "/")
+    return glob(pat, 0, path, 0)
+
+fn glob(p: str, i: int, s: str, j: int) bool:
+    if i == len(p):
+        return j == len(s)
+    if p[i..].starts_with("**/"):
+        # zero or more directories
+        if glob(p, i + 3, s, j):
+            return true
+        k = j
+        while k < len(s):
+            if s.byte(k) == 47 and glob(p, i + 3, s, k + 1):
+                return true
+            k += 1
+        return false
+    c = p.byte(i)
+    if c == 42:
+        k = j
+        while true:
+            if glob(p, i + 1, s, k):
+                return true
+            if k >= len(s) or s.byte(k) == 47:
+                return false
+            k += 1
+        return false
+    if j >= len(s):
+        return false
+    if c == 63:
+        return s.byte(j) != 47 and glob(p, i + 1, s, j + 1)
+    return s.byte(j) == c and glob(p, i + 1, s, j + 1)
+
+# JSON with comments and trailing commas (what tsconfig files are) -> JSON.
+fn strip_jsonc(s: str) str:
+    out = ""
+    i = 0
+    start = 0
+    while i < len(s):
+        c = s.byte(i)
+        if c == 34:
+            i += 1
+            while i < len(s) and s.byte(i) != 34:
+                if s.byte(i) == 92:
+                    i += 1
+                i += 1
+            i += 1
+        elif c == 47 and i + 1 < len(s) and s.byte(i + 1) == 47:
+            out += s[start..i]
+            while i < len(s) and s.byte(i) != 10:
+                i += 1
+            start = i
+        elif c == 47 and i + 1 < len(s) and s.byte(i + 1) == 42:
+            out += s[start..i]
+            k = s.find_from("*/", i + 2)
+            if k < 0:
+                i = len(s)
+            else:
+                i = k + 2
+            start = i
+        elif c == 44:
+            # a comma before } or ] (only whitespace or comments between) goes
+            k = i + 1
+            while k < len(s):
+                d = s.byte(k)
+                if d == 32 or d == 9 or d == 10 or d == 13:
+                    k += 1
+                elif d == 47 and k + 1 < len(s) and s.byte(k + 1) == 47:
+                    while k < len(s) and s.byte(k) != 10:
+                        k += 1
+                elif d == 47 and k + 1 < len(s) and s.byte(k + 1) == 42:
+                    e = s.find_from("*/", k + 2)
+                    if e < 0:
+                        k = len(s)
+                    else:
+                        k = e + 2
+                else:
+                    break
+            if k < len(s) and (s.byte(k) == 125 or s.byte(k) == 93):
+                out += s[start..i]
+                start = i + 1
+            i += 1
+        else:
+            i += 1
+    return out + s[start..]
+
+fn absolute(p: str) str:
+    if p.starts_with("/"):
+        return normalize(p)
+    return normalize(os.cwd() + "/" + p)
+
+fn join_path(dir: str, p: str) str:
+    if p.starts_with("/"):
+        return normalize(p)
+    return normalize(dir + "/" + p)
+
+# Removes "." and "a/.." segments and trailing slashes.
+fn normalize(p: str) str:
+    parts: [str] = []
+    for seg in p.split("/"):
+        if seg == "" or seg == ".":
+            continue
+        if seg == ".." and len(parts) > 0 and parts[len(parts) - 1] != "..":
+            parts.pop()
+        else:
+            parts.push(seg)
+    return "/" + "/".join(parts)
+
+fn dir_of(p: str) str:
+    k = len(p) - 1
+    while k > 0 and p.byte(k) != 47:
+        k -= 1
+    if k <= 0:
+        return "/"
+    return p[..k]
+
+# The "type" of the package.json nearest to `dir` ("module" or "commonjs").
+fn package_type(dir: str) str:
+    d = dir
+    while true:
+        pj = d + "/package.json"
+        if fs.exists(pj):
+            match json.parse(fs.read(pj)):
+                Ok(v):
+                    return v.field("type").str_or("commonjs")
+                Err(e):
+                    return "commonjs"
+        if d == "/" or d == "":
+            return "commonjs"
+        d = dir_of(d)
+    return "commonjs"
+
+# The project's sources (absolute): under its directory, not in node_modules or dot-directories.
+fn project_files(c: Config) [str]:
+    files: [str] = []
+    collect(c, c.dir, &files)
+    return files
+
+fn collect(c: Config, dir: str, files: mut [str]):
+    for n in fs.list(dir).sorted():
+        if n.starts_with(".") or n == "node_modules":
+            continue
+        path = dir + "/" + n
+        if fs.stat(path).is_dir:
+            if path != c.out_dir:
+                collect(c, path, &files)
+        elif ((n.ends_with(".ts") and not n.ends_with(".d.ts")) or n.ends_with(".tsx") or n.ends_with(".mts") or n.ends_with(".cts")) and included(c, path):
+            files.push(path)

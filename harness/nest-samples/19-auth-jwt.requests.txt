@@ -1,0 +1,3 @@
+POST /auth/login {"username":"john","password":"changeme"}
+POST /auth/login {"username":"john","password":"wrong"}
+GET /auth/profile

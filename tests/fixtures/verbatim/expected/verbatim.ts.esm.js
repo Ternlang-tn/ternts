@@ -1,0 +1,10 @@
+import { b } from "./a";
+import D, { e } from "./d";
+import * as F from "./f";
+import "./side-effect";
+export { b };
+export * from "./star";
+export * as nsStar from "./star2";
+const x = b;
+export default x;
+export const used = [e, F];

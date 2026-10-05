@@ -1,0 +1,18 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+class Foo2 {
+    A;
+    B;
+    constructor(A, B) {
+        "ngInject1";
+        "ngInject2";
+        this.A = A;
+        this.B = B;
+        console.log(1);
+    }
+}
+exports.a.__foo;
+var N;
+(function (N) {
+    N.r = N.q + 1;
+})(N || (N = {}));

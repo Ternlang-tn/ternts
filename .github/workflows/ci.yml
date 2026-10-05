@@ -1,0 +1,51 @@
+# ternts CI: the test suite (harness/test.sh) on macOS and Linux.
+#
+# Tern isn't public yet: it's cloned from the private Ternlang-tn/tern with a read-only deploy
+# key (secret TERN_DEPLOY_KEY) and built by its ./install.sh, which starts from
+# bootstrap/ternc.c with only a C compiler. When Tern ships releases, download one instead.
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    env:
+      TERN_DEPLOY_KEY: ${{ secrets.TERN_DEPLOY_KEY }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: harness/package-lock.json
+      - name: Tern
+        run: |
+          mkdir -p ~/.ssh && printf "%s\n" "$TERN_DEPLOY_KEY" > ~/.ssh/tern && chmod 600 ~/.ssh/tern
+          GIT_SSH_COMMAND="ssh -i ~/.ssh/tern -o StrictHostKeyChecking=accept-new" git clone --depth 1 git@github.com:Ternlang-tn/tern.git "$RUNNER_TEMP/tern"
+          "$RUNNER_TEMP/tern/install.sh" "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Wasm toolchain
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then brew install llvm lld wasi-libc wasi-runtimes
+          else
+            # (Tern finds a wasm toolchain through Homebrew's layout or WASI_SDK_PATH)
+            arch=$(uname -m | sed 's/aarch64/arm64/')
+            curl -sSL "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-$arch-linux.tar.gz" | tar xz -C "$RUNNER_TEMP"
+            echo "WASI_SDK_PATH=$RUNNER_TEMP/wasi-sdk-34.0-$arch-linux" >> "$GITHUB_ENV"
+          fi
+      - name: harness packages
+        run: cd harness && npm ci
+      - name: Tests (fixtures vs tsc, wasm engine, whole-program builds, CLI)
+        run: harness/test.sh --build-wasm
+      - name: Corpus (NestJS, pinned; every option set)
+        if: github.event_name == 'push'
+        run: |
+          bench/setup.sh
+          harness/test.sh fixtures --corpus

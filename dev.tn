@@ -1,0 +1,188 @@
+# Starting, restarting and stopping the app for `ternts dev`.
+import fs
+import os
+import task
+import time
+
+# The command after `--`, or `node OUT/main.js` without one.
+fn command(args: [str], out: str, maps: bool) [str]:
+    for k in 0..len(args):
+        if args[k] == "--":
+            cmd: [str] = []
+            for j in k + 1..len(args):
+                cmd.push(args[j])
+            if len(cmd) > 0:
+                return cmd
+    if maps:
+        return ["node", "--enable-source-maps", out + "/main.js"]
+    return ["node", out + "/main.js"]
+
+struct App:
+    cmd: [str]
+    p: os.Process
+    running: bool
+    standby: [str]           # --warm: the command that starts a standby (empty: no standby)
+    next: os.Process         # the standby, when there is one
+    has_next: bool
+
+fn app(cmd: [str], out: str, warm: bool) App:
+    s: [str] = []
+    if warm:
+        s = standby_command(cmd, out)
+    return App(cmd, os.Process(-1), false, s, os.Process(-1), false)
+
+fn spawn(cmd: [str]) os.Process:
+    args: [str] = []
+    for k in 1..len(cmd):
+        args.push(cmd[k])
+    p = os.spawn_with(cmd[0], args, os.ProcOpts("", [], "inherit", "inherit"))
+    if not p.ok():
+        os.eprint(f"[ternts] can't start {cmd[0]}: {os.error()}")
+    return p
+
+fn start(a: mut App):
+    a.p = spawn(a.cmd)
+    a.running = a.p.ok()
+    make_standby(&a)
+
+# Stop the app and run the new build, in the warm standby when there is one.
+fn restart(a: mut App):
+    stop(&a)
+    if a.has_next and a.next.wait_ms(0) == -1 and a.next.write("go\n"):
+        a.p = a.next
+        a.running = true
+        a.has_next = false
+    else:
+        a.p = spawn(a.cmd)
+        a.running = a.p.ok()
+    make_standby(&a)
+
+fn make_standby(a: mut App):
+    if len(a.standby) == 0 or a.has_next:
+        return
+    a.next = spawn(a.standby)
+    a.has_next = a.next.ok()
+
+# SIGTERM (what Nest's enableShutdownHooks listens for), then SIGKILL after 3 s.
+fn stop(a: mut App):
+    if not a.running:
+        return
+    a.p.kill(15)
+    if a.p.wait_ms(3000) == -1:
+        a.p.kill(9)
+        a.p.wait()
+    a.running = false
+
+fn stop_all(a: mut App):
+    stop(&a)
+    if a.has_next:
+        a.next.kill(9)
+        a.next.wait()
+        a.has_next = false
+
+# --warm: `node [flags] ENTRY` with the standby script before ENTRY; other commands get none.
+fn standby_command(cmd: [str], out: str) [str]:
+    if not (cmd[0] == "node" or cmd[0].ends_with("/node")):
+        return []
+    valued = ["-r", "--require", "--import", "--loader", "--experimental-loader", "-e", "--eval", "-p", "--print", "-C", "--conditions"]
+    for k in 1..len(cmd):
+        if cmd[k] in valued:
+            return []
+        if not cmd[k].starts_with("-"):
+            fs.write(out + "/.ternts-standby.mjs", STANDBY)
+            s: [str] = []
+            for j in 0..k:
+                s.push(cmd[j])
+            s.push(out + "/.ternts-standby.mjs")
+            for j in k..len(cmd):
+                s.push(cmd[j])
+            return s
+    return []
+
+# The standby preloads the app's static package imports, then on a stdin line runs the app as `node ENTRY` would.
+const STANDBY = `// Written by ternts dev --warm (a standby that has the app's packages loaded); safe to delete.
+import fs from 'node:fs';
+import path from 'node:path';
+import Module, { createRequire } from 'node:module';
+const main = path.resolve(process.argv[2]);
+const seen = new Set();
+const pkgs = [];
+// Groups 1 and 3 are imports for side effects only: import './x', require('./x').
+const RE = /^import\s*["']([^"']+)["']|^(?:import|export)\b[^'";]*?\bfrom\s*["']([^"']+)["']|^require\(["']([^"']+)["']\)|^(?:const|let|var)\s+[\w$]+\s*=\s*(?:__importStar\(|__importDefault\()?require\(["']([^"']+)["']\)/gm;
+// A local module imported only for its side effects (Sentry's and OpenTelemetry's
+// import './instrument', a file that sets process.env) has to run before the packages
+// imported after it load, so those aren't loaded early.
+let stopped = false;
+function scan(f) {
+  if (seen.has(f)) return;
+  seen.add(f);
+  let s;
+  try { s = fs.readFileSync(f, 'utf8'); } catch { return; }
+  for (const m of s.matchAll(RE)) {
+    if (stopped) return;
+    const spec = m[1] || m[2] || m[3] || m[4];
+    if (spec.startsWith('.') || spec.startsWith('/')) {
+      const p = path.resolve(path.dirname(f), spec);
+      for (const c of [p, p + '.js', path.join(p, 'index.js')]) {
+        if (fs.existsSync(c) && fs.statSync(c).isFile()) { scan(c); break; }
+      }
+      if (m[1] || m[3]) stopped = true;
+    } else if (!spec.startsWith('node:') && !pkgs.includes(spec)) {
+      pkgs.push(spec);
+    }
+  }
+}
+scan(main);
+const esm = /^(import|export)\b/m.test(fs.readFileSync(main, 'utf8'));
+const req = createRequire(main);
+for (const p of pkgs) {
+  try { if (esm) await import(p); else req(p); } catch {}
+}
+process.stdin.once('data', () => {
+  process.stdin.pause();
+  process.stdin.unref();
+  process.argv.splice(1, 2, main);
+  Module.runMain();
+});
+`
+
+# Whether the app ended by itself since the last look (it crashed, or it finished).
+fn ended(a: mut App) bool:
+    if not a.running:
+        return false
+    st = a.p.wait_ms(0)
+    if st == -1:
+        return false
+    a.running = false
+    os.eprint(f"[ternts] app exited with status {st}; waiting for changes")
+    return true
+
+# Signals go on a channel the watch loop checks, since only the loop touches the processes.
+# A second Ctrl-C, or 5 s without the loop acting, exits at once.
+fn signals() chan[str]:
+    ch: chan[str] = task.channel(4)
+    task.spawn(fn() pass_signals(ch))
+    time.sleep(1)                    # the waiter is registered before the app starts
+    return ch
+
+fn pass_signals(ch: chan[str]) int:
+    ch.send(os.wait_signal())
+    task.spawn(fn() exit_after(5000))
+    os.wait_signal()
+    os.exit(130)
+    return 0
+
+fn exit_after(ms: int) int:
+    time.sleep(ms)
+    os.eprint("[ternts] the app didn't stop; exiting")
+    os.exit(1)
+    return 0
+
+fn quit_if_asked(ch: chan[str], a: mut App):
+    sig = ""
+    if not ch.try_recv(&sig):
+        return
+    stop_all(&a)
+    if sig == "SIGINT":
+        os.exit(130)
+    os.exit(143)

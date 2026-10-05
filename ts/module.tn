@@ -1,0 +1,1547 @@
+# ES module syntax to CommonJS, the way tsc does it: imports become requires
+# (dropped when nothing uses them), exported names become `exports.x`.
+
+struct ExportItem:
+    local: str
+    exported: str
+    order: int          # position in p.exported, or -1
+    fn_slot: int        # its place in p.fn_exports, if the local is a function
+
+# An import is added: a reference above it (pass 2 of a late import) may have used it.
+fn push_import(p: mut P, im: Import):
+    idx = len(p.imports)
+    p.imports.push(im)
+    p.import_at.push(p.ts)
+    if (idx in p.early_used):
+        p.imports[idx].used = true
+    if len(p.early_subs) > 0:
+        # used above the import (pass 2): which of its names were
+        if (f"{idx}:-1" in p.early_subs):
+            p.imports[idx].named_used = true
+        if (f"{idx}:-2" in p.early_subs):
+            p.imports[idx].def_used = true
+        if (f"{idx}:-3" in p.early_subs):
+            p.imports[idx].ns_used = true
+        for i in 0..len(p.imports[idx].spec_used):
+            if (f"{idx}:{i}" in p.early_subs):
+                p.imports[idx].spec_used[i] = true
+
+# An exported name as a member of exports: .x, or ["a-b"] for a string name (export { x as "a-b" }).
+fn xname(name: str) str:
+    if len(name) > 0 and (name.byte(0) == 34 or name.byte(0) == 39):
+        return "[" + name + "]"
+    return "." + name
+
+# An exported name as a string: "x" (a string name as written).
+fn js_name(name: str) str:
+    if len(name) > 0 and (name.byte(0) == 34 or name.byte(0) == 39):
+        return name
+    return "\"" + name + "\""
+
+fn marker(p: mut P, kind: str, payload: str):
+    p.markers = true
+    put(&p, "\x00" + kind + payload + "\x00")
+
+# The prefix for exported names here: "exports." or the namespace's "NS.".
+fn export_prefix(p: mut P) str:
+    if p.ns_name != "":
+        return p.ns_name + "."
+    return "exports."
+
+# The `x_1` variable for a module. tsc numbers only the imports it emits, known at the end: `check_names` may ask for a second pass.
+fn module_var(p: mut P, spec: str, imp: int) str:
+    ev = len(p.name_base)
+    base = module_base(spec)
+    name = ""
+    if ev < len(p.forced) and p.forced[ev] != "":
+        name = p.forced[ev]
+    else:
+        n = 1
+        if (base in p.modnames):
+            n = p.modnames[base] + 1
+        p.modnames[base] = n
+        name = unique_suffix(base, n)
+    p.name_base.push(base)
+    p.name_imp.push(imp)
+    p.name_got.push(name)
+    return name
+
+fn unique_suffix(base: str, n: int) str:
+    if len(base) > 0 and base.byte(len(base) - 1) == 95:
+        return base + str(n)
+    return base + "_" + str(n)
+
+fn module_base(spec: str) str:
+    inner = spec[1..len(spec) - 1]
+    k = len(inner)
+    while k > 0 and inner.byte(k - 1) == 47:
+        k -= 1
+    inner = inner[..k]
+    slash = -1
+    for i in 0..len(inner):
+        if inner.byte(i) == 47:
+            slash = i
+    base = inner[slash + 1..]
+    name = ""
+    for i in 0..len(base):
+        c = base.byte(i)
+        if (c >= 97 and c <= 122) or (c >= 65 and c <= 90) or (c >= 48 and c <= 57) or c == 95:
+            name += base[i..i + 1]
+        else:
+            name += "_"
+    if len(name) > 0 and is_digit(name.byte(0)):
+        name = "_" + name
+    return name
+
+# 'x' -> "x"
+fn dq(spec: str) str:
+    if spec.byte(0) == 1:
+        return spec[1..]
+    if spec.byte(0) == 34:
+        return spec
+    inner = spec[1..len(spec) - 1].replace("\\'", "'").replace("\"", "\\\"")
+    return "\"" + inner + "\""
+
+fn import_decl(p: mut P, exported: bool):
+    start = p.ts
+    was_module = p.is_module
+    p.is_module = true
+    next(&p)                                     # import
+    if at_kw(&p, K_TYPE):
+        n = peek_tok(&p)
+        if (n.tok == T_NAME and n.kw != K_FROM) or (n.tok == T_OP and (n.op == 123 or n.op == 42)) or (n.tok == T_NAME and n.kw == K_FROM and is_type_import_from(&p)):
+            if p.file != "":
+                record_type_import(&p)           # project mode: where its names come from (metadata)
+            p.mute += 1
+            while p.tok != T_EOF:
+                if p.tok == T_NAME and p.kw != K_FROM and p.kw != K_TYPE and p.kw != K_AS:
+                    p.locals[tok_text(&p)] = 7
+                if at_op(&p, 123):
+                    next(&p)
+                    while not at_op(&p, 125) and p.tok != T_EOF:
+                        n = peek_tok(&p)
+                        if p.tok == T_NAME and not (n.tok == T_NAME and n.kw == K_AS):
+                            p.locals[tok_text(&p)] = 7
+                        next(&p)
+                    next(&p)
+                elif at_kw(&p, K_FROM) and peek_tok(&p).tok == T_STR:
+                    next(&p)
+                    next(&p)
+                    break
+                elif at_kw(&p, K_REQUIRE) and peek_tok(&p).tok == T_OP and peek_tok(&p).op == 40:
+                    next(&p)
+                    skip_group(&p)
+                    break
+                else:
+                    next(&p)
+            skip_attributes(&p)
+            end_stmt(&p)
+            p.mute -= 1
+            drop_from(&p, start)
+            return
+    if p.tok == T_STR:
+        spec = tok_text(&p)
+        next(&p)
+        attr_start = p.ts
+        skip_attributes(&p)
+        if p.esm:
+            spec = "\u{1}" + spec
+            if p.pe > attr_start:
+                spec += " " + p.src[attr_start..p.pe]
+        end_stmt(&p)
+        push_import(&p, Import(dq(spec), "", "", false, true, true, 0, "", false, false, false, [], false, "", [], [], false, false, false))
+        emit_to(&p, start)
+        marker(&p, "I", str(len(p.imports) - 1))
+        skip_pe(&p)
+        return
+    if p.tok == T_NAME and peek_tok(&p).op == 61 and peek_tok(&p).tok == T_OP:
+        import_equals(&p, start, exported, was_module)
+        return
+    default_name = ""
+    ns_name = ""
+    locals: [str] = []
+    remotes: [str] = []
+    pending_src: [str] = []                  # project mode: imported names, for metadata
+    pending_remote: [str] = []
+    deferred = false
+    if p.tok == T_NAME and tok_text(&p) == "defer" and import_defer_ahead(&p):
+        deferred = true                          # import defer * as ns (ES2026; ES module output)
+        next(&p)
+    if p.tok == T_NAME and p.kw != K_FROM or (p.tok == T_NAME and p.kw == K_FROM and peek_tok(&p).kw == K_FROM):
+        default_name = tok_text(&p)
+        next(&p)
+        eat_op(&p, 44)
+    if at_op(&p, 42):
+        next(&p)
+        next(&p)                                 # as
+        ns_name = tok_text(&p)
+        next(&p)
+    elif at_op(&p, 123):
+        next(&p)
+        while not at_op(&p, 125) and p.tok != T_EOF:
+            is_type = false
+            if at_kw(&p, K_TYPE):
+                n = peek_tok(&p)
+                if (n.tok == T_NAME or n.tok == T_STR) and not (n.kw == K_AS and peek2_is_close(&p)):
+                    is_type = true
+                    next(&p)
+            remote = tok_text(&p)
+            next(&p)
+            local = remote
+            if at_kw(&p, K_AS):
+                next(&p)
+                local = tok_text(&p)
+                next(&p)
+            if not is_type and p.file != "" and project_type(&p, remote):
+                is_type = true
+            if p.file != "":
+                pending_src.push(local)
+                pending_remote.push(remote)
+            if not is_type:
+                locals.push(local)
+                remotes.push(remote)
+            else:
+                p.locals[local] = 7
+            if not eat_op(&p, 44):
+                break
+        expect_op(&p, 125)
+    if not at_kw(&p, K_FROM):
+        fail(&p, "expected from")
+        return
+    next(&p)
+    spec = tok_text(&p)
+    next(&p)
+    if p.file != "" and len(spec) >= 2:
+        bare = spec[1..len(spec) - 1]
+        for i in 0..len(pending_src):
+            p.import_src[pending_src[i]] = bare + "\x01" + pending_remote[i]
+        if default_name != "":
+            p.import_src[default_name] = bare + "\x01default"
+        if ns_name != "":
+            p.import_src[ns_name] = bare + "\x01*"
+    attr_start = p.ts
+    skip_attributes(&p)
+    attrs = ""
+    if p.pe > attr_start and p.esm:
+        attrs = " " + p.src[attr_start..p.pe]
+    end_stmt(&p)
+    emit_to(&p, start)
+    skip_pe(&p)
+    if default_name == "" and ns_name == "" and len(locals) == 0:
+        if p.verbatim and p.esm:
+            put(&p, "import {} from " + dq(spec) + attrs + ";")   # verbatimModuleSyntax keeps it
+            p.esm_kept = true
+        return                                   # import {} from "x", or only types
+    idx = len(p.imports)
+    if p.esm:
+        specs: [str] = []
+        for i in 0..len(locals):
+            if remotes[i] == locals[i]:
+                specs.push(locals[i])
+            else:
+                specs.push(remotes[i] + " as " + locals[i])
+        push_import(&p, Import(spec + attrs, ns_name, ns_name, false, false, false, 3, "", false, false, false, [], true, default_name, specs, [false] * len(specs), false, false, deferred))
+        if default_name != "":
+            esm_bind(&p, default_name, idx, -2)
+        if ns_name != "":
+            esm_bind(&p, ns_name, idx, -3)
+        for i in 0..len(locals):
+            esm_bind(&p, locals[i], idx, i)
+        marker(&p, "I", str(idx))
+        return
+    var = ns_name
+    named = default_name != "" or len(locals) > 0
+    if named:
+        var = module_var(&p, spec, idx)
+    push_import(&p, Import(dq(spec), var, ns_name, named, false, false, 0, "", false, false, false, [], false, "", [], [], false, false, false))
+    if default_name != "":
+        p.imports[idx].names.push(default_name)
+    for l in locals:
+        p.imports[idx].names.push(l)
+    if default_name != "":
+        p.imports[idx].def = default_name
+        add_bind_sub(&p, default_name, B_IMPORT, var + ".default", idx, -2)
+    for i in 0..len(locals):
+        r = remotes[i]
+        if r.byte(0) == 34 or r.byte(0) == 39:
+            add_bind(&p, locals[i], B_IMPORT, var + "[" + dq(r) + "]", idx)
+        elif r == "default":
+            add_bind_sub(&p, locals[i], B_IMPORT, var + ".default", idx, -2)
+        else:
+            add_bind(&p, locals[i], B_IMPORT, var + "." + r, idx)
+    if ns_name != "":
+        add_bind(&p, ns_name, B_NSIMPORT, ns_name, idx)
+    marker(&p, "I", str(idx))
+
+fn peek2_is_close(p: mut P) bool:
+    s = save(&p)
+    next(&p)
+    next(&p)
+    next(&p)
+    r = at_op(&p, 44) or at_op(&p, 125)
+    restore(&p, s)
+    return r
+
+# `import type from "x"` imports a default named `type`; `import type from from "x"` doesn't.
+fn is_type_import_from(p: mut P) bool:
+    s = save(&p)
+    next(&p)
+    next(&p)
+    r = at_kw(&p, K_FROM)
+    restore(&p, s)
+    return r
+
+# At `defer` after `import`: the modifier (tsc also parses `defer x`, `defer { x }`), not a default import named defer?
+fn import_defer_ahead(p: mut P) bool:
+    n = peek_tok(&p)
+    if n.tok == T_OP:
+        return n.op == 42 or n.op == 123
+    if n.tok != T_NAME:
+        return false
+    if n.kw != K_FROM:
+        return true
+    s = save(&p)
+    next(&p)
+    next(&p)
+    r = at_kw(&p, K_FROM)
+    restore(&p, s)
+    return r
+
+fn skip_attributes(p: mut P):
+    if (at_kw(&p, K_WITH) or (p.tok == T_NAME and tok_text(&p) == "assert")) and not p.nlb:
+        next(&p)
+        skip_group(&p)
+
+# import x = require("y") / import x = A.B
+fn import_equals(p: mut P, start: int, exported: bool, was_module: bool):
+    name = tok_text(&p)
+    next(&p)
+    next(&p)                                     # =
+    idx = len(p.imports)
+    if at_kw(&p, K_REQUIRE):
+        next(&p)
+        expect_op(&p, 40)
+        spec = tok_text(&p)
+        next(&p)
+        expect_op(&p, 41)
+        end_stmt(&p)
+        emit_to(&p, start)
+        skip_pe(&p)
+        if p.esm and not p.preserve and not p.node_module:
+            return                               # tsc drops it from ES module output (node16+:
+                                                 # const x = __require("m"), through createRequire)
+        xp = exported and not p.esm             # module preserve: const x = require(...) (+ export { x })
+        push_import(&p, Import(dq(spec), name, "", false, xp, false, 1, "", xp, false, false, [], false, "", [], [], false, false, false))
+        if xp:
+            add_bind(&p, name, B_EXPORT, "exports." + name, -1)   # read through exports.x, as tsc
+        else:                                    # (export import x = require(): not in the void 0 list)
+            add_bind(&p, name, B_NSIMPORT, name, idx)
+        marker(&p, "I", str(idx))
+        return
+    if not exported or p.ns_name != "":
+        p.is_module = was_module                 # import x = A.B (no require) doesn't make a module,
+                                                 # nor export import inside a namespace
+    emit_to(&p, start)
+    skip_ts(&p)
+    first = tok_text(&p)
+    rhs = alias_rhs(&p, first, idx, exported)
+    end_stmt(&p)
+    skip_pe(&p)
+    if exported and (p.ns_name != "" or not has_export_equals(p.src)) and alias_types_only(&p, first, rhs):
+        return                                   # an alias of types only: tsc drops it
+    if exported:
+        add_export_name(&p, name)
+        put(&p, export_prefix(&p) + name + " = " + rhs.trim() + ";")
+        if p.ns_name == "":
+            add_bind(&p, name, B_EXPORT, "exports." + name, -1)
+            slot_marker(&p, name)                # (export { a as b }: exports.b = exports.a)
+        else:
+            add_bind(&p, name, B_NSEXPORT, p.ns_name + "." + name, -1)
+        return
+    top = p.ns_name == "" and not alias_types_only(&p, first, rhs)
+    push_import(&p, Import(rhs.trim(), name, "", false, false, false, 2, "", false, false, false, [], false, "", [], [], false, top, false))
+    add_bind(&p, name, B_NSIMPORT, name, idx)
+    marker(&p, "I", str(idx))
+
+fn bit(b: bool) str:
+    if b:
+        return "1"
+    return "0"
+
+# `A.B.C` of `import x = A.B.C`, its first name read as a reference; an import there is used only if the alias is.
+fn alias_rhs(p: mut P, first: str, idx: int, exported: bool) str:
+    kd = find_bind_name(&p, first)
+    if exported or p.mute > 0 or kd < 0 or p.binds[kd].imp < 0 or p.binds[kd].imp >= len(p.imports):
+        return alias_text(&p)
+    dep = p.binds[kd].imp
+    return alias_dep_text(&p, idx, dep)
+
+fn alias_dep_text(p: mut P, idx: int, dep: int) str:
+    u0 = p.imports[dep].used
+    rhs = alias_text(&p)
+    if not u0 and p.imports[dep].used:
+        p.imports[dep].used = false              # (used if the alias is: alias_uses)
+        p.alias_deps += str(idx) + " " + str(dep) + ";"
+    return rhs
+
+fn alias_text(p: mut P) str:
+    saved = begin_capture(&p)
+    ref(&p)
+    while at_op(&p, 46):
+        next(&p)
+        next(&p)
+    emit_pe(&p)
+    return end_capture(&p, saved)
+
+# Is `name` declared as a value (var, let, const, function, class, enum) at the top level? Scanned once, when first asked.
+fn value_declared(p: mut P, name: str) bool:
+    if not p.vd_built:
+        p.vd_built = true
+        q = new_p(p.src, false)
+        q.tsx = p.tsx
+        q.mute += 1
+        next(&q)
+        depth = 0
+        pk = 0
+        while q.tok != T_EOF:
+            if q.tok == T_OP and (q.op == 47 or (q.op == O_ASSIGN and q.src.byte(q.ts) == 47)) and regex_ok_prev(&q):
+                rescan_regex(&q)
+            elif q.tok == T_TPL_HEAD:
+                template(&q)
+                pk = 0
+                continue
+            elif q.tok == T_OP and (q.op == 40 or q.op == 91 or q.op == 123):
+                depth += 1
+            elif q.tok == T_OP and (q.op == 41 or q.op == 93 or q.op == 125):
+                depth -= 1
+            elif q.tok == T_NAME and depth == 0 and (pk == K_VAR or pk == K_LET or pk == K_CONST or pk == K_FUNCTION or pk == K_CLASS or pk == K_ENUM):
+                p.vd_names[tok_text(&q)] = true
+            pk = 0
+            if q.tok == T_NAME:
+                pk = q.kw
+            next(&q)
+    return name in p.vd_names
+
+# import X = A.B.C: is it of types only? tsc looks A up as a namespace (an interface A keeps the alias), C as anything.
+fn alias_types_only(p: mut P, first: str, rhs: str) bool:
+    if ns_types_only(p.src, p.tsx, first, false):
+        return true
+    t = rhs.trim()
+    k = len(t) - 1
+    while k >= 0 and t.byte(k) != 46:
+        k -= 1
+    return k >= 0 and ns_types_only(p.src, p.tsx, t[k + 1..], true)
+
+fn add_export_name(p: mut P, name: str):
+    if p.ns_name == "":
+        p.exported.push(name)
+
+fn export_decl(p: mut P, top: bool, decos: [str]):
+    start = p.ts
+    if p.ns_name == "":
+        p.is_module = true
+    next(&p)                                     # export
+    if at_op(&p, 64) and not p.legacy_decorators and not p.esm:
+        p.pending_deco = tc39_deco_text(&p, start)       # export @dec class C: `@dec class C`
+        export_decl_rest(&p, start, decos)
+        return
+    if at_op(&p, 64):
+        more = decorators(&p)
+        all = decos
+        for d in more:
+            all.push(d)
+        export_decl_rest(&p, start, all)
+        return
+    export_decl_rest(&p, start, decos)
+
+fn export_decl_rest(p: mut P, start: int, decos: [str]):
+    if p.esm and p.ns_name == "":
+        esm_export(&p, start, decos)
+        return
+    prefix = export_prefix(&p)
+    k = p.kw
+    if p.tok == T_NAME:
+        if k == K_DEFAULT:
+            export_default(&p, start, decos)
+            return
+        if k == K_VAR or k == K_LET or k == K_CONST:
+            n = peek_tok(&p)
+            if k == K_CONST and n.kw == K_ENUM:
+                emit_to(&p, start)
+                skip_to(&p, n.ts)
+                next(&p)
+                enum_decl(&p, prefix)
+                return
+            export_vars(&p, start)
+            return
+        if k == K_FUNCTION or (k == K_ASYNC and peek_tok(&p).kw == K_FUNCTION):
+            emit_to(&p, start)
+            skip_ts(&p)
+            is_async = k == K_ASYNC
+            fstart = p.ts
+            if is_async:
+                next(&p)
+            name = function_decl(&p, is_async, "", fstart)
+            if name != "":
+                export_function(&p, name, name)
+            return
+        if k == K_CLASS or (k == K_ABSTRACT and peek_tok(&p).kw == K_CLASS):
+            emit_to(&p, start)
+            if k == K_ABSTRACT:
+                next(&p)
+            skip_ts(&p)
+            name = peek_tok(&p)
+            cname = p.src[name.ts..name.te]
+            export_as = prefix + cname + " = "
+            if p.ns_name != "":
+                export_as = ""
+            idx = class_decl(&p, decos, export_as, "")
+            if p.ns_name == "":
+                add_export_name(&p, cname)
+                add_bind(&p, cname, B_XDECL, "exports." + cname, -1)
+                put(&p, "\n" + prefix + cname + " = " + cname + ";")
+                if p.class_ref != "":
+                    cr = p.class_ref
+                    put(&p, cr)
+                    p.class_ref = ""
+                slot_marker(&p, cname)
+                if idx >= 0:
+                    marker(&p, "D", str(idx))
+            else:
+                if idx >= 0:
+                    marker(&p, "D", str(idx))
+                put(&p, "\n" + prefix + cname + " = " + cname + ";")
+            return
+        if k == K_ENUM:
+            emit_to(&p, start)
+            skip_ts(&p)
+            enum_decl(&p, prefix)
+            return
+        if k == K_NAMESPACE or k == K_MODULE:
+            emit_to(&p, start)
+            skip_ts(&p)
+            namespace_decl(&p, prefix)
+            return
+        if k == K_IMPORT:
+            emit_to(&p, start)
+            skip_ts(&p)
+            import_decl(&p, true)
+            return
+        if k == K_INTERFACE or k == K_TYPE or k == K_DECLARE:
+            if k == K_TYPE and peek_tok(&p).tok == T_OP:
+                # export type { A } / export type * from
+                p.mute += 1
+                next(&p)
+                if at_op(&p, 123):
+                    skip_group(&p)
+                else:
+                    next(&p)
+                    if at_kw(&p, K_AS):
+                        next(&p)
+                        next(&p)
+                if at_kw(&p, K_FROM):
+                    next(&p)
+                    next(&p)
+                    skip_attributes(&p)
+                end_stmt(&p)
+                p.mute -= 1
+            elif k == K_DECLARE:
+                bind_declared_exports(&p)
+                declare_stmt(&p)
+            else:
+                type_decl(&p)
+            drop_from(&p, start)
+            return
+        if k == K_AS:                            # export as namespace X
+            p.mute += 1
+            next(&p)
+            next(&p)
+            next(&p)
+            end_stmt(&p)
+            p.mute -= 1
+            drop_from(&p, start)
+            return
+    if at_op(&p, 42):
+        export_star(&p, start)
+        return
+    if at_op(&p, 123):
+        export_list(&p, start)
+        return
+    if at_op(&p, 61):                             # export = x: tsc moves it to the end
+        emit_to(&p, start)
+        saved = begin_capture(&p)
+        next(&p)
+        skip_ts(&p)
+        put(&p, "module.exports = ")
+        p.export_equals = true
+        assign(&p, false)
+        end_stmt(&p)
+        emit_pe(&p)
+        text = end_capture(&p, saved)
+        if p.esm:
+            put(&p, text)
+        else:
+            if not text.ends_with(";"):
+                text += ";"
+            p.export_eq += "\n" + text
+        return
+    fail(&p, f"unsupported export '{tok_text(&p)}'")
+
+# After `export default function (...)`: was it one with a body (kept), not an overload?
+fn default_fn_has_body(p: mut P, start: int) bool:
+    return p.pe > 0 and p.src.byte(p.pe - 1) == 125
+
+# `export default T;` where T is only a type (an interface, type alias, type import): removed.
+fn default_is_type(p: mut P, start: int) bool:
+    if p.verbatim or p.tok != T_NAME or (p.kw != 0 and p.kw <= K_WITH):
+        return false
+    name = tok_text(&p)
+    if not (name in p.locals):
+        return false
+    kind = p.locals[name]
+    if kind == 6 and (name in p.ns_decl):
+        return false                             # (a namespace with values)
+    if kind != 4 and kind != 5 and kind != 6 and kind != 7 and kind != 8:
+        return false
+    k = find_bind_name(&p, name)
+    if (kind == 4 or kind == 5 or kind == 6) and k >= 0 and (p.binds[k].kind == B_IMPORT or p.binds[k].kind == B_ESMIMPORT):
+        return false                             # an import merged with the type: maybe a value
+    if (kind == 4 or kind == 5 or kind == 6) and value_declared(&p, name):
+        return false                             # a variable of the same name
+    n = peek_tok(&p)
+    if not ((n.tok == T_OP and n.op == 59) or n.nlb or n.tok == T_EOF or (n.tok == T_OP and n.op == 125)):
+        return false
+    next(&p)
+    end_stmt(&p)
+    drop_from(&p, start)
+    return true
+
+fn export_function(p: mut P, name: str, exported: str):
+    emit_pe(&p)
+    if p.ns_name == "":
+        p.fn_exports.push(f"exports.{exported} = {name};")
+        if exported == name:
+            add_bind(&p, name, B_XDECL, "exports." + name, -1)
+    else:
+        put(&p, "\n" + p.ns_name + "." + exported + " = " + name + ";")
+
+fn slot_marker(p: mut P, names: str):
+    if p.has_export_list and p.ns_name == "":
+        marker(&p, "S", names)
+
+fn export_default(p: mut P, start: int, decos: [str]):
+    next(&p)                                     # default
+    if default_is_type(&p, start):
+        return
+    k = p.kw
+    if p.tok == T_NAME and (k == K_FUNCTION or (k == K_ASYNC and peek_tok(&p).kw == K_FUNCTION and not peek_tok(&p).nlb)):
+        emit_to(&p, start)
+        skip_ts(&p)
+        is_async = k == K_ASYNC
+        fstart = p.ts
+        if is_async:
+            next(&p)
+        name = function_decl(&p, is_async, "default_1", fstart)
+        if name != "":
+            export_function(&p, name, "default")
+        return
+    if at_op(&p, 64) and not p.legacy_decorators and not p.esm:
+        p.pending_deco = tc39_deco_text(&p, start)
+        export_default_class(&p, start, decos)
+        return
+    if at_op(&p, 64):
+        more = decorators(&p)
+        all = decos
+        for d in more:
+            all.push(d)
+        export_default_class(&p, start, all)
+        return
+    if p.tok == T_NAME and (k == K_CLASS or (k == K_ABSTRACT and peek_tok(&p).kw == K_CLASS)):
+        export_default_class(&p, start, decos)
+        return
+    if p.tok == T_NAME and k == K_INTERFACE:
+        type_decl(&p)
+        drop_from(&p, start)
+        return
+    emit_to(&p, start)
+    skip_ts(&p)
+    put(&p, "exports.default = ")
+    assign(&p, false)
+    end_stmt(&p)
+
+fn export_default_class(p: mut P, start: int, decos: [str]):
+    emit_to(&p, start)
+    if at_kw(&p, K_ABSTRACT):
+        next(&p)
+    skip_ts(&p)
+    n = peek_tok(&p)
+    name = "default_1"
+    if n.tok == T_NAME and n.kw != K_EXTENDS and n.kw != K_IMPLEMENTS:
+        name = p.src[n.ts..n.te]
+    idx = class_decl(&p, decos, "", "default_1")
+    if len(decos) > 0 or (idx >= 0 and len(p.classes[idx].ctor.deco_text) > 0):
+        if idx >= 0:
+            marker(&p, "D", str(idx))
+        put(&p, "\nexports.default = " + name + ";")
+    else:
+        put(&p, "\nexports.default = " + name + ";")
+        if idx >= 0:
+            marker(&p, "D", str(idx))
+
+# export const a = 1, b = () => 2;
+fn export_vars(p: mut P, start: int):
+    emit_to(&p, start)
+    kwtext = p.src[p.ts..p.te]
+    next(&p)
+    skip_ts(&p)
+    prefix = export_prefix(&p)
+    items: [str] = []
+    pre = ""
+    names: [str] = []
+    while true:
+        if p.tok != T_NAME:
+            pt = parse_pat(&p)
+            if at_op(&p, 58):
+                next(&p)
+                p.bad = false
+                parse_type(&p)
+            skip_pe(&p)
+            expect_op(&p, 61)
+            skip_ts(&p)
+            # a plain name is reused (tsc decides before the name becomes `exports.x`)
+            simple = p.tok == T_NAME and (p.kw == 0 or p.kw > K_WITH) and next_ends_initializer(&p)
+            saved = begin_capture(&p)
+            assign(&p, false)
+            emit_pe(&p)
+            init = trimmed_capture(&p, saved)
+            parts: [str] = []
+            flatten(&p, pt, init, simple, &parts)
+            items.push(", ".join(parts))
+            if not eat_op(&p, 44):
+                break
+            skip_ts(&p)
+            continue
+        name = tok_text(&p)
+        names.push(name)
+        add_export_name(&p, name)
+        if p.ns_name == "":
+            add_bind(&p, name, B_EXPORT, "exports." + name, -1)
+        else:
+            add_bind(&p, name, B_NSEXPORT, p.ns_name + "." + name, -1)
+        next(&p)
+        if at_op(&p, 33):
+            next(&p)
+        if at_op(&p, 58):
+            next(&p)
+            p.bad = false
+            parse_type(&p)
+        skip_pe(&p)
+        if at_op(&p, 61):
+            next(&p)
+            skip_ts(&p)
+            anon = p.ns_name == "" and is_anon_fn_ahead(&p)
+            is_cls = at_kw(&p, K_CLASS)
+            saved = begin_capture(&p)
+            assign(&p, false)
+            emit_pe(&p)
+            init = end_capture(&p, saved)
+            if anon and is_cls and init.trim().starts_with("("):
+                anon = false                     # (lowered into (_a = class {...}, ..., _a): no
+                                                 # longer an anonymous class to tsc's module pass)
+            if anon:
+                pre += kwtext + " " + name + " = " + init.trim() + ";\n"
+                items.push(prefix + name + " = " + name)
+            else:
+                items.push(prefix + name + " = " + init.trim())
+        if not eat_op(&p, 44):
+            break
+        skip_ts(&p)
+    end_stmt(&p)
+    skip_pe(&p)
+    if pre == "" and len(items) == 0:
+        if p.last_asi and continues(&p):
+            put(&p, ";")
+        return
+    put(&p, pre)
+    if len(items) > 0:
+        put(&p, ", ".join(items) + ";")
+    p.last_asi = false
+    slot_marker(&p, ",".join(names))
+
+fn is_anon_fn_ahead(p: mut P) bool:
+    if p.tok == T_NAME:
+        if p.kw == K_FUNCTION or p.kw == K_CLASS:
+            s = save(&p)
+            p.mute += 1
+            primary(&p)
+            p.mute -= 1
+            r = ends_initializer(&p)
+            restore(&p, s)
+            return r
+        if p.kw == K_ASYNC:
+            n = peek_tok(&p)
+            if n.kw == K_FUNCTION and not n.nlb:
+                s = save(&p)
+                next(&p)
+                r = is_anon_fn_ahead(&p)
+                restore(&p, s)
+                return r
+            if n.tok == T_NAME and not n.nlb:
+                s = save(&p)
+                next(&p)
+                next(&p)
+                r = at_op(&p, O_ARROW)
+                restore(&p, s)
+                return r
+            if n.tok == T_OP and (n.op == 40 or n.op == 60):
+                s = save(&p)
+                next(&p)
+                r = is_arrow_ahead(&p)
+                restore(&p, s)
+                return r
+            return false
+        n = peek_tok(&p)
+        return n.tok == T_OP and n.op == O_ARROW and not n.nlb
+    if at_op(&p, 40) or at_op(&p, 60):
+        return is_arrow_ahead(&p)
+    return false
+
+# export * from "x" / export * as ns from "x"
+fn export_star(p: mut P, start: int):
+    next(&p)
+    ns = ""
+    if at_kw(&p, K_AS):
+        next(&p)
+        ns = tok_text(&p)
+        next(&p)
+    next(&p)                                     # from
+    spec = dq(tok_text(&p))
+    next(&p)
+    skip_attributes(&p)
+    end_stmt(&p)
+    emit_to(&p, start)
+    skip_pe(&p)
+    if ns != "":
+        add_export_name(&p, ns)
+        if ns == "default":
+            p.list_default = true                # (export * as default: in the void 0 list)
+        if p.interop:
+            here = p.ts
+            need_star(&p, here)
+            put(&p, "exports" + xname(ns) + " = __importStar(require(" + spec + "));")
+        else:
+            put(&p, "exports" + xname(ns) + " = require(" + spec + ");")
+    else:
+        p.helpers = p.helpers | H_EXPORT_STAR | H_CREATE_BINDING
+        if p.xstar_at < 0:
+            p.xstar_at = p.ts
+        put(&p, "__exportStar(require(" + spec + "), exports);")
+
+# export { a, b as c } [from "x"]
+fn export_list(p: mut P, start: int):
+    next(&p)
+    locals: [str] = []
+    names: [str] = []
+    while not at_op(&p, 125) and p.tok != T_EOF:
+        is_type = false
+        if at_kw(&p, K_TYPE):
+            n = peek_tok(&p)
+            if (n.tok == T_NAME or n.tok == T_STR) and not (n.kw == K_AS and peek2_is_close(&p)):
+                is_type = true
+                next(&p)
+        local = tok_text(&p)
+        next(&p)
+        exported = local
+        if at_kw(&p, K_AS):
+            next(&p)
+            exported = tok_text(&p)
+            next(&p)
+        if not is_type:
+            locals.push(local)
+            names.push(exported)
+        if not eat_op(&p, 44):
+            break
+    expect_op(&p, 125)
+    spec = ""
+    if at_kw(&p, K_FROM):
+        next(&p)
+        raw = tok_text(&p)
+        spec = dq(raw)
+        next(&p)
+        skip_attributes(&p)
+        if p.file != "" and not p.verbatim and len(raw) >= 2:
+            # project mode: a re-exported type goes, as in a whole-program tsc build
+            bare = raw[1..len(raw) - 1]
+            keep_l: [str] = []
+            keep_n: [str] = []
+            for i in 0..len(locals):
+                if export_kind(p.project, p.file, bare, locals[i], 0) != 1:
+                    keep_l.push(locals[i])
+                    keep_n.push(names[i])
+            locals = keep_l
+            names = keep_n
+    end_stmt(&p)
+    emit_to(&p, start)
+    skip_pe(&p)
+    if spec == "" and p.ns_name == "" and not p.esm:
+        chains: {str: str} = {}
+        order: [str] = []
+        for i in 0..len(locals):
+            kind = p.locals.get(locals[i], 0)
+            if (locals[i] in p.top_vars) or kind == 1 or kind == 2:
+                if not (locals[i] in chains):
+                    chains[locals[i]] = ""
+                    order.push(locals[i])
+                chains[locals[i]] = "exports" + xname(names[i]) + " = " + chains[locals[i]]
+            elif names[i] != locals[i]:
+                kb = find_bind_name(&p, locals[i])
+                if kb >= 0 and p.binds[kb].kind == B_EXPORT:
+                    if not (locals[i] in chains):   # (`export let x` exported again: marked \x01)
+                        chains[locals[i]] = "\x01"
+                        order.push(locals[i])
+                    chains[locals[i]] = "\x01exports." + names[i] + " = " + chains[locals[i]][1..]
+        if len(p.for_vars) > 0:
+            for l in locals:
+                if l in p.for_vars and not has_hint(&p, l, H_FORVAR):
+                    p.retry = true               # (a for head's var: exported from the loop)
+                    p.new_hints.push(Hint(-2, l, H_FORVAR, "", -1, -1))
+        for l in order:
+            c = chains[l]
+            chain = c[..len(c) - 3]
+            kb = find_bind_name(&p, l)
+            if chain.starts_with("\x01") or kb < 0 or p.binds[kb].kind == B_XLIST:
+                # assigned anywhere? checked at the end with every list's names (xlist_check)
+                p.xlist_names.push(l)
+                p.xlist_chains.push(chain)
+            if not chain.starts_with("\x01") and (l in p.assigned) and kb < 0:
+                add_bind(&p, l, B_XLIST, chain, -1)
+    if spec != "":
+        if len(locals) == 0:
+            if p.last_asi and continues(&p):
+                put(&p, ";")
+            return
+        var = module_var(&p, spec, -1)
+        text = "var " + var + " = require(" + spec + ");"
+        for i in 0..len(locals):
+            add_export_name(&p, names[i])
+            if names[i] == "default":
+                p.list_default = true            # export { default } from: in the void 0 list too
+            if locals[i] == "default" and p.interop:
+                p.helpers = p.helpers | H_IMPORT_DEFAULT
+                text += "\n" + getter(names[i], "__importDefault(" + var + ").default")
+            else:
+                text += "\n" + getter(names[i], var + xname(locals[i]))
+        put(&p, text)
+        p.last_asi = false
+        return
+    if not p.has_export_list and len(locals) > 0:
+        # declarations above needed a place for `exports.x = x`: parse again with one
+        p.retry = true
+        p.want_slots = true
+    for i in 0..len(locals):
+        p.export_items.push(ExportItem(locals[i], names[i], len(p.exported), len(p.fn_exports)))
+        p.fn_exports.push("")
+        p.exported.push(names[i])
+        if names[i] == "default":
+            p.list_default = true
+    if p.last_asi and continues(&p):
+        put(&p, ";")
+
+fn getter(name: str, value: str) str:
+    return "Object.defineProperty(exports, " + js_name(name) + ", { enumerable: true, get: function () { return " + value + "; } });"
+
+# ---------------------------------------------------------------- exported destructuring
+
+struct Pat:
+    kind: int           # 0 a name, 1 object pattern, 2 array pattern, 3 hole
+    name: str
+    key: str            # object element: ".a", "[\"a-b\"]" or "[expr]"
+    keyname: str        # for __rest: "\"a\"" ("" when computed)
+    def: str            # default value text, or ""
+    rest: bool
+    elems: [Pat]
+
+fn pat(kind: int) Pat:
+    return Pat(kind, "", "", "", "", false, [])
+
+# A pattern being exported; its names become bindings to `exports.x`.
+fn parse_pat(p: mut P) Pat:
+    if p.tok == T_NAME:
+        r = pat(0)
+        r.name = tok_text(&p)
+        add_export_name(&p, r.name)
+        add_bind(&p, r.name, B_EXPORT, export_prefix(&p) + r.name, -1)
+        next(&p)
+        return r
+    if at_op(&p, 123):
+        r = pat(1)
+        next(&p)
+        while not at_op(&p, 125) and p.tok != T_EOF:
+            if eat_op(&p, O_DOTS):
+                e = parse_pat(&p)
+                e.rest = true
+                r.elems.push(e)
+            else:
+                key = ""
+                keyname = ""
+                n = peek_tok(&p)
+                shorthand = p.tok == T_NAME and n.tok == T_OP and (n.op == 44 or n.op == 125 or n.op == 61)
+                if at_op(&p, 91):
+                    next(&p)
+                    skip_ts(&p)
+                    saved = begin_capture(&p)
+                    assign(&p, false)
+                    emit_pe(&p)
+                    key = "[" + trimmed_capture(&p, saved) + "]"
+                    expect_op(&p, 93)
+                elif p.tok == T_STR or p.tok == T_NUM:
+                    t = tok_text(&p)
+                    key = "[" + t + "]"
+                    keyname = dq_any(t)
+                    next(&p)
+                else:
+                    key = "." + tok_text(&p)
+                    keyname = "\"" + tok_text(&p) + "\""
+                    if not shorthand:
+                        next(&p)
+                e = pat(0)
+                if shorthand:
+                    e = parse_pat(&p)
+                else:
+                    expect_op(&p, 58)
+                    e = parse_pat(&p)
+                e.key = key
+                e.keyname = keyname
+                if at_op(&p, 61):
+                    e.def = pat_default(&p)
+                r.elems.push(e)
+            if not eat_op(&p, 44):
+                break
+        expect_op(&p, 125)
+        return r
+    if at_op(&p, 91):
+        r = pat(2)
+        next(&p)
+        while not at_op(&p, 93) and p.tok != T_EOF:
+            if at_op(&p, 44):
+                next(&p)
+                r.elems.push(pat(3))
+                continue
+            rest = eat_op(&p, O_DOTS)
+            e = parse_pat(&p)
+            e.rest = rest
+            if at_op(&p, 61):
+                e.def = pat_default(&p)
+            r.elems.push(e)
+            if not eat_op(&p, 44):
+                break
+        expect_op(&p, 93)
+        return r
+    fail(&p, "bad exported pattern")
+    next(&p)
+    return pat(0)
+
+fn pat_default(p: mut P) str:
+    next(&p)
+    skip_ts(&p)
+    saved = begin_capture(&p)
+    assign(&p, false)
+    emit_pe(&p)
+    return trimmed_capture(&p, saved)
+
+fn dq_any(t: str) str:
+    if t.byte(0) == 39 or t.byte(0) == 34:
+        return dq(t)
+    return "\"" + t + "\""
+
+fn is_simple_name(s: str) bool:
+    return is_ident_name(s)
+
+# tsc's flattening: `_a = value, exports.a = _a.a, exports.b = _a.b`.
+# Digits only: a member access after it needs a second "." (1..x).
+fn is_int_literal(v: str) bool:
+    if len(v) == 0:
+        return false
+    for k in 0..len(v):
+        if not is_digit(v.byte(k)):
+            return false
+    return true
+
+fn flatten(p: mut P, t: Pat, value: str, simple: bool, parts: mut [str]):
+    v = value
+    if t.def != "":
+        if not simple and not is_simple_name(v):
+            tmp = parse_temp(&p)
+            parts.push(tmp + " = " + v)
+            v = tmp
+        v = v + " === void 0 ? " + t.def + " : " + v
+    if t.kind == 0:
+        parts.push(export_prefix(&p) + t.name + " = " + v)
+        return
+    count = 0
+    for e in t.elems:
+        if e.kind != 3:
+            count += 1
+    if count != 1 and (count == 0 or (not simple and not is_simple_name(v))):
+        tmp = parse_temp(&p)
+        parts.push(tmp + " = " + v)
+        v = tmp
+    if t.kind == 1:
+        names: [str] = []
+        for e in t.elems:
+            if e.rest:
+                want_rest(&p)
+                flatten(&p, e, "__rest(" + v + ", [" + ", ".join(names) + "])", false, &parts)
+            else:
+                base = v
+                if e.key.starts_with(".") and is_int_literal(v):
+                    base = v + "."                   # 1..toString, as tsc prints it
+                flatten(&p, e, base + e.key, false, &parts)
+                if e.keyname != "":
+                    names.push(e.keyname)
+        return
+    for i in 0..len(t.elems):
+        e = t.elems[i]
+        if e.kind == 3:
+            continue
+        if e.rest:
+            flatten(&p, e, v + ".slice(" + str(i) + ")", false, &parts)
+        else:
+            flatten(&p, e, v + "[" + str(i) + "]", false, &parts)
+
+fn next_ends_initializer(p: mut P) bool:
+    s = save(&p)
+    next(&p)
+    r = ends_initializer(&p)
+    restore(&p, s)
+    return r
+
+fn ends_initializer(p: mut P) bool:
+    if p.tok == T_EOF or p.nlb:
+        return true
+    return p.tok == T_OP and (p.op == 44 or p.op == 59 or p.op == 41 or p.op == 125)
+
+fn esm_bind(p: mut P, name: str, imp: int, sub: int):
+    add_bind_sub(&p, name, B_ESMIMPORT, "", imp, sub)
+
+# ---------------------------------------------------------------- ESM output
+
+struct EsmList:
+    locals: [str]
+    names: [str]
+    origin: str
+    attrs: str          # ` with { ... }` after the origin, as written
+
+# `export ...` at the top level when the output stays an ES module.
+fn esm_export(p: mut P, start: int, decos: [str]):
+    k = p.kw
+    if p.tok == T_NAME:
+        if k == K_DEFAULT:
+            next(&p)
+            k2 = p.kw
+            if p.tok == T_NAME and (k2 == K_FUNCTION or (k2 == K_ASYNC and peek_tok(&p).kw == K_FUNCTION and not peek_tok(&p).nlb)):
+                is_async = k2 == K_ASYNC
+                if is_async:
+                    next(&p)
+                if function_decl(&p, is_async, "", start) != "" or default_fn_has_body(&p, start):
+                    p.esm_kept = true
+                return
+            all = decos
+            if at_op(&p, 64):
+                for d in decorators(&p):
+                    all.push(d)
+            if p.tok == T_NAME and (p.kw == K_CLASS or (p.kw == K_ABSTRACT and peek_tok(&p).kw == K_CLASS)):
+                esm_class(&p, start, all, true)
+                return
+            if p.tok == T_NAME and p.kw == K_INTERFACE:
+                type_decl(&p)
+                drop_from(&p, start)
+                return
+            if default_is_type(&p, start):
+                return
+            p.esm_kept = true
+            assign(&p, false)
+            end_stmt(&p)
+            return
+        if k == K_VAR or k == K_LET or k == K_CONST:
+            n = peek_tok(&p)
+            if k == K_CONST and n.kw == K_ENUM:
+                emit_to(&p, start)
+                skip_to(&p, n.ts)
+                next(&p)
+                enum_decl(&p, "esm")
+                return
+            p.esm_kept = true
+            var_stmt(&p)
+            end_stmt(&p)
+            return
+        if k == K_FUNCTION or (k == K_ASYNC and peek_tok(&p).kw == K_FUNCTION):
+            is_async = k == K_ASYNC
+            if is_async:
+                next(&p)
+            if function_decl(&p, is_async, "", start) != "":
+                p.esm_kept = true
+            return
+        if k == K_CLASS or (k == K_ABSTRACT and peek_tok(&p).kw == K_CLASS):
+            esm_class(&p, start, decos, false)
+            return
+        if k == K_ENUM:
+            emit_to(&p, start)
+            skip_ts(&p)
+            enum_decl(&p, "esm")
+            return
+        if k == K_NAMESPACE or k == K_MODULE:
+            emit_to(&p, start)
+            skip_ts(&p)
+            namespace_decl(&p, "esm")
+            return
+        if k == K_IMPORT and (p.preserve or p.node_module) and peek_tok(&p).tok == T_NAME:
+            s0 = save(&p)
+            next(&p)
+            name = tok_text(&p)
+            next(&p)
+            next(&p)
+            is_req = at_kw(&p, K_REQUIRE)
+            restore(&p, s0)
+            if is_req:                          # export import x = require("m"), module preserve / node16+
+                emit_to(&p, start)
+                skip_ts(&p)
+                p.esm_kept = true
+                import_decl(&p, false)
+                put(&p, "\nexport { " + name + " };")
+                for i in 0..len(p.imports):
+                    if p.imports[i].var == name and p.imports[i].kind == 1:
+                        p.imports[i].used = true
+                return
+        if k == K_IMPORT:                       # export import X = A.B
+            emit_to(&p, start)
+            next(&p)
+            name = tok_text(&p)
+            next(&p)
+            next(&p)                             # =
+            skip_ts(&p)
+            first = tok_text(&p)
+            if at_kw(&p, K_REQUIRE) and peek_tok(&p).tok == T_OP and peek_tok(&p).op == 40:
+                p.mute += 1                      # export import x = require() in ES module output:
+                next(&p)                         # tsc writes nothing (it reports it)
+                skip_group(&p)
+                p.mute -= 1
+                end_stmt(&p)
+                skip_pe(&p)
+                return
+            saved = begin_capture(&p)
+            ref(&p)
+            while at_op(&p, 46):
+                next(&p)
+                next(&p)
+            emit_pe(&p)
+            rhs = trimmed_capture(&p, saved)
+            end_stmt(&p)
+            skip_pe(&p)
+            if alias_types_only(&p, first, rhs):
+                return                           # an alias of types only: tsc drops it
+            put(&p, "export var " + name + " = " + rhs + ";")
+            p.esm_kept = true
+            return
+        if k == K_INTERFACE or k == K_TYPE or k == K_DECLARE or k == K_AS:
+            export_decl_rest_types(&p, start, k)
+            return
+    if at_op(&p, 42):                            # export * [as ns] from "x"
+        p.esm_kept = true
+        next(&p)
+        if at_kw(&p, K_AS) and p.es2015_module and (peek_tok(&p).tok == T_NAME or peek_tok(&p).tok == T_STR):
+            # module es2015 hasn't `export * as ns` (ES2020): import * as ns_1; export { ns_1 as ns }
+            next(&p)
+            ns = tok_text(&p)
+            next(&p)
+            next(&p)                             # from
+            spec = tok_text(&p)
+            next(&p)
+            attr_start = p.ts
+            skip_attributes(&p)
+            attrs = ""
+            if p.pe > attr_start:
+                attrs = " " + p.src[attr_start..p.pe]
+            end_stmt(&p)
+            emit_to(&p, start)
+            skip_pe(&p)
+            local = ""
+            if ns.byte(0) == 34 or ns.byte(0) == 39:
+                local = file_unique(&p, "_a")    # (export * as "a-b": a generated name)
+                p.gen_names[local] = true
+            else:
+                local = unique_ident(p.src, ns)
+            if ns == "default":
+                put(&p, "import * as " + local + " from " + spec + attrs + ";\nexport default " + local + ";")
+            else:
+                put(&p, "import * as " + local + " from " + spec + attrs + ";\nexport { " + local + " as " + ns + " };")
+            return
+        if at_kw(&p, K_AS):
+            next(&p)
+            next(&p)
+        next(&p)
+        next(&p)
+        skip_attributes(&p)
+        end_stmt(&p)
+        return
+    if at_op(&p, 123):
+        esm_export_list(&p, start)
+        return
+    if at_op(&p, 61) and p.preserve:             # export = x, module preserve: module.exports = x
+        emit_to(&p, start)
+        next(&p)
+        skip_ts(&p)
+        put(&p, "module.exports = ")
+        p.esm_kept = true
+        assign(&p, false)
+        end_stmt(&p)
+        return
+    if at_op(&p, 61):                            # export = x: dropped from ES module output
+        p.mute += 1
+        next(&p)
+        assign(&p, false)
+        end_stmt(&p)
+        p.mute -= 1
+        drop_from(&p, start)
+        return
+    fail(&p, f"unsupported export '{tok_text(&p)}'")
+
+# export class C / export default class C: kept, or (decorated) `let C = class C`
+# with `export { C }` / `export default C` after the decorators.
+fn esm_class(p: mut P, start: int, decos: [str], is_default: bool):
+    cls = p.ts
+    if at_kw(&p, K_ABSTRACT):
+        cls = peek_tok(&p).ts
+    n = save(&p)
+    if at_kw(&p, K_ABSTRACT):
+        next(&p)
+    next(&p)
+    name = ""
+    if p.tok == T_NAME and p.kw != K_EXTENDS and p.kw != K_IMPLEMENTS:
+        name = tok_text(&p)
+    restore(&p, n)
+    decorated = len(decos) > 0 or is_hinted_class(&p, cls)
+    moved = is_default and name == "" and is_hinted(&p, cls, 14)    # (statics after it: tsc's
+    if is_default and name != "" and is_hinted(&p, cls, 15):         # export default default_1;)
+        moved = true                             # (named, statements after it: class C ... export default C)
+    if decorated or moved or (is_default and name != "" and is_hinted(&p, cls, 10)):
+        # (a default class read through a temp is exported after `_a = C;`)
+        emit_to(&p, start)
+        skip_to(&p, cls)
+        if at_kw(&p, K_ABSTRACT):
+            next(&p)
+        default_name = ""
+        if name == "":
+            name = "default_1"
+            default_name = "default_1"
+        idx = class_decl(&p, decos, "", default_name)
+        if idx >= 0:
+            marker(&p, "D", str(idx))
+        if is_default:
+            put(&p, "\nexport default " + name + ";")
+        else:
+            put(&p, "\nexport { " + name + " };")
+        p.esm_kept = true
+        return
+    if at_kw(&p, K_ABSTRACT):
+        emit_ts(&p)
+        skip_to(&p, peek_tok(&p).ts)
+        next(&p)
+    dn = ""
+    if is_default and name == "" and is_hinted(&p, cls, 13):
+        dn = "default_1"                         # (needed by its decorated members or statics)
+    if is_default and name != "":
+        p.esm_default_at = cls                   # (class.tn: does anything follow the class?)
+    idx = class_decl(&p, decos, "", dn)
+    p.esm_default_at = -1
+    p.esm_kept = true
+    if idx >= 0:
+        marker(&p, "D", str(idx))
+
+fn export_decl_rest_types(p: mut P, start: int, k: int):
+    if k == K_TYPE and peek_tok(&p).tok == T_OP:
+        p.mute += 1
+        next(&p)
+        if at_op(&p, 123):
+            skip_group(&p)
+        else:
+            next(&p)
+            if at_kw(&p, K_AS):
+                next(&p)
+                next(&p)
+        if at_kw(&p, K_FROM):
+            next(&p)
+            next(&p)
+            skip_attributes(&p)                  # (with { } / assert { })
+        end_stmt(&p)
+        p.mute -= 1
+    elif k == K_DECLARE:
+        declare_stmt(&p)
+    elif k == K_AS:
+        p.mute += 1
+        next(&p)
+        next(&p)
+        next(&p)
+        end_stmt(&p)
+        p.mute -= 1
+    else:
+        type_decl(&p)
+    drop_from(&p, start)
+
+# At `declare` after `export`: `export declare let a` writes nothing, but reads of a go through exports.a (or NS.a), as tsc's.
+fn bind_declared_exports(p: mut P):
+    n = peek_tok(&p)
+    if not (n.tok == T_NAME and (n.kw == K_VAR or n.kw == K_LET or n.kw == K_CONST)):
+        return
+    s = save(&p)
+    next(&p)
+    if at_kw(&p, K_CONST) and peek_tok(&p).kw == K_ENUM:
+        restore(&p, s)
+        return
+    names = var_names_ahead(&p, false)
+    restore(&p, s)
+    for name in names.split(","):
+        if name == "":
+            continue
+        if p.ns_name == "":
+            add_bind(&p, name, B_EXPORT, "exports." + name, -1)
+        else:
+            add_bind(&p, name, B_NSEXPORT, p.ns_name + "." + name, -1)
+
+# export { a, b as c } [from "x"]: printed at the end, without the types.
+fn esm_export_list(p: mut P, start: int):
+    next(&p)
+    list = EsmList([], [], "", "")
+    while not at_op(&p, 125) and p.tok != T_EOF:
+        is_type = false
+        if at_kw(&p, K_TYPE):
+            n = peek_tok(&p)
+            if (n.tok == T_NAME or n.tok == T_STR) and not (n.kw == K_AS and peek2_is_close(&p)):
+                is_type = true
+                next(&p)
+        local = tok_text(&p)
+        next(&p)
+        exported = local
+        if at_kw(&p, K_AS):
+            next(&p)
+            exported = tok_text(&p)
+            next(&p)
+        if not is_type:
+            list.locals.push(local)
+            list.names.push(exported)
+        if not eat_op(&p, 44):
+            break
+    expect_op(&p, 125)
+    if at_kw(&p, K_FROM):
+        next(&p)
+        list.origin = tok_text(&p)
+        next(&p)
+        attr_start = p.ts
+        skip_attributes(&p)
+        if p.pe > attr_start:
+            list.attrs = " " + p.src[attr_start..p.pe]
+    end_stmt(&p)
+    emit_to(&p, start)
+    skip_pe(&p)
+    p.esm_lists.push(list)
+    marker(&p, "E", str(len(p.esm_lists) - 1))
+
+fn esm_list_text(p: mut P, idx: int) str:
+    list = p.esm_lists[idx]
+    parts: [str] = []
+    for i in 0..len(list.locals):
+        local = list.locals[i]
+        if list.origin == "":
+            kind = 0
+            if (local in p.locals):
+                kind = p.locals[local]
+            k = find_bind_name(&p, local)
+            merged = (kind == 4 or kind == 5 or kind == 6) and ((k >= 0 and p.binds[k].kind == B_ESMIMPORT) or value_declared(&p, local))
+            if not merged and (kind == 4 or kind == 5 or kind == 7 or kind == 8 or (kind == 6 and not (local in p.ns_decl))):
+                continue                         # (a namespace without values isn't one either; an
+                                                 # import merged with a type may be a value)
+            if k >= 0 and p.binds[k].kind == B_ESMIMPORT and not top_declared(&p, local):
+                p.imports[p.binds[k].imp].used = true
+                mark_esm_use(&p, k)
+            elif k >= 0 and p.binds[k].kind == B_NSIMPORT and p.binds[k].imp >= 0:
+                p.imports[p.binds[k].imp].used = true      # import x = require() (module preserve)
+        elif p.file != "" and not p.verbatim and len(list.origin) >= 2:
+            # project mode: a re-exported type goes, as in a whole-program tsc build
+            if export_kind(p.project, p.file, list.origin[1..len(list.origin) - 1], local, 0) == 1:
+                continue
+        if local == list.names[i]:
+            parts.push(local)
+        else:
+            parts.push(local + " as " + list.names[i])
+    if len(parts) == 0:
+        if p.verbatim and p.preserve and list.origin == "" and len(list.locals) == 0:
+            p.esm_kept = true
+            return "export {};"                  # module preserve + verbatimModuleSyntax: as written
+        if p.verbatim and list.origin != "":
+            p.esm_kept = true
+            return "export {} from " + list.origin + list.attrs + ";"      # verbatimModuleSyntax keeps it
+        return ""
+    p.esm_kept = true
+    if list.origin != "":
+        return "export { " + ", ".join(parts) + " } from " + list.origin + list.attrs + ";"
+    return "export { " + ", ".join(parts) + " };"
+
+# Project mode: does the module this import names (the next string after `from`) export `name` as a type?
+fn project_type(p: mut P, name: str) bool:
+    s = save(&p)
+    while p.tok != T_EOF and not at_kw(&p, K_FROM):
+        if at_op(&p, 59):
+            break
+        next(&p)
+    spec = ""
+    if at_kw(&p, K_FROM):
+        next(&p)
+        if p.tok == T_STR:
+            t = tok_text(&p)
+            spec = t[1..len(t) - 1]
+    restore(&p, s)
+    return spec != "" and export_kind(p.project, p.file, spec, name, 0) == 1
+
+# Project mode, at `type` of `import type ...`: records each imported name's module and remote name in p.import_src.
+# The tokens are read ahead and put back.
+fn record_type_import(p: mut P):
+    s0 = save(&p)
+    p.mute += 1
+    next(&p)                                     # type
+    names: [str] = []
+    remotes: [str] = []
+    if p.tok == T_NAME and p.kw != K_FROM:
+        names.push(tok_text(&p))
+        remotes.push("default")
+        next(&p)
+        eat_op(&p, 44)
+    if at_op(&p, 42):
+        next(&p)
+        if at_kw(&p, K_AS):
+            next(&p)
+            names.push(tok_text(&p))
+            remotes.push("*")
+            next(&p)
+    elif at_op(&p, 123):
+        next(&p)
+        while not at_op(&p, 125) and p.tok != T_EOF:
+            remote = tok_text(&p)
+            next(&p)
+            local = remote
+            if at_kw(&p, K_AS):
+                next(&p)
+                local = tok_text(&p)
+                next(&p)
+            names.push(local)
+            remotes.push(remote)
+            if not eat_op(&p, 44):
+                break
+        eat_op(&p, 125)
+    if at_kw(&p, K_FROM):
+        next(&p)
+        if p.tok == T_STR:
+            t = tok_text(&p)
+            for i in 0..len(names):
+                p.import_src[names[i]] = t[1..len(t) - 1] + "\x01" + remotes[i]
+    p.mute -= 1
+    restore(&p, s0)

@@ -1,0 +1,10 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.ns = exports.b = exports.a = void 0;
+var _0_1 = require("./0");
+Object.defineProperty(exports, "a", { enumerable: true, get: function () { return _0_1.a; } });
+Object.defineProperty(exports, "b", { enumerable: true, get: function () { return _0_1.b; } });
+exports.ns = require("./0");
+const lazy = require("./lazy.js");
+const named_defer_js_1 = require("./named-defer.js");
+lazy.go(named_defer_js_1.default);

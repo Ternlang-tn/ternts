@@ -1,0 +1,731 @@
+# The lowering passes over expression trees (ir.tn), in tsc's order: #private (ES2022), logical
+# assignment (ES2021), optional chains and ?? (ES2020), ** (ES2016).
+
+fn ir_lower(p: mut P, n: int, unused: bool) int:
+    p.ir_root_n = n
+    p.ir_root_unused = unused
+    return lw(&p, n, false)
+
+# The tree below n, lowered (del: n is `delete`'s operand).
+fn lw(p: mut P, n: int, del: bool) int:
+    d = p.ir[n]
+    k = d.k
+    if k == X_RAW or k == X_NAME or k == X_THIS or k == X_SUPER:
+        return n
+    if (k == X_DOT or k == X_INDEX) and ss_member(&p, n):
+        return ir_raw(&p, ss_get(&p, n), XP_LHS)
+    if k == X_CALL and ss_member(&p, d.a):     # super.f(a) -> Reflect.get(_b, "f", _a).call(_a, a)
+        a = lw_args(&p, n)
+        c = static_this(&p)
+        g = ss_get(&p, d.a)
+        if a == "":
+            return ir_raw(&p, g + ".call(" + c + ")", XP_LHS)
+        return ir_raw(&p, g + ".call(" + c + ", " + a + ")", XP_LHS)
+    if k == X_TAG and ss_member(&p, d.a):      # super.f`...`: called with the class as `this`
+        return ir_raw(&p, ss_get(&p, d.a) + ".bind(" + static_this(&p) + ")" + p.out[d.oa..d.ob].trim(), XP_LHS)
+    if k == X_ASSIGN and ss_member(&p, unparen(&p, d.a)):
+        return ss_assign(&p, n)
+    if k == X_UPDATE and ss_member(&p, unparen(&p, d.a)):
+        return ss_update(&p, n)
+    if k == X_DOT or k == X_INDEX or k == X_PRIV or k == X_CALL:
+        if p.target < 2020 and chain_has_opt(&p, n):
+            return oc_lower(&p, n, del)
+        if k == X_PRIV and priv_lowered(&p, n):
+            return pv_read(&p, n)
+        if k == X_CALL and priv_lowered(&p, d.a):
+            return pv_call(&p, n)
+        return lw_children(&p, n)
+    if k == X_TAG and priv_lowered(&p, d.a):
+        return pv_tag(&p, n)
+    if k == X_NEW and priv_lowered(&p, d.a):
+        da = d.a
+        recv = lw(&p, ir_a(&p, da), false)
+        g = pv_get(&p, d.a, ir_print(&p, recv, XP_LHS))
+        c = ir_raw(&p, "(" + g + ")", XP_PRIMARY)
+        n2 = lw_children(&p, n)
+        p.ir[n2].a = c                           # (new (get(recv))(...), as tsc writes it)
+        return n2
+    if k == X_UNARY and d.f & XF_WORD != 0 and ir_s(&p, n) == "delete" and p.target < 2020:
+        a = d.a
+        if (p.ir[a].k == X_DOT or p.ir[a].k == X_INDEX or p.ir[a].k == X_CALL) and chain_has_opt(&p, a):
+            return oc_lower(&p, a, true)         # delete a?.b: the chain takes the delete
+    if k == X_UPDATE and priv_lowered(&p, unparen(&p, d.a)):
+        return pv_update(&p, n)
+    if k == X_UPDATE and d.f & XF_PREFIX != 0 and p.ir[d.a].k == X_NAME:
+        nm = ir_leaf_text(&p, d.a)               # ++x of an export list's variable: exports.x = ++x
+        kb = find_bind_name(&p, nm)              # (expr.tn xlist_update writes it when not reprinted)
+        if kb >= 0 and p.binds[kb].kind == B_XLIST:
+            op = ir_s(&p, n)
+            t = p.binds[kb].repl + " = " + op + nm
+            return ir_raw(&p, t, XP_ASSIGN)
+        if kb >= 0 and p.binds[kb].kind == B_EXPORT and p.has_xalias:
+            chain = hint_repl(p.hints, nm, H_XALIAS)   # (`export let x` exported again: the same)
+            if chain != "\x00":
+                op = ir_s(&p, n)
+                return ir_raw(&p, chain + " = " + op + p.binds[kb].repl, XP_ASSIGN)
+    if k == X_BINARY:
+        if ir_s(&p, n) == "in" and p.ir[d.a].k == X_PRIVNAME:
+            return pv_in(&p, n)
+        n2 = lw_children(&p, n)
+        d2 = p.ir[n2]
+        op2 = ir_s(&p, n2)
+        if op2 == "??" and p.target < 2020:
+            return nc_lower(&p, d2.a, d2.b)
+        if op2 == "**" and p.target < 2016:
+            return ir_raw(&p, "Math.pow(" + ir_print(&p, d2.a, XP_ASSIGN) + ", " + ir_print(&p, d2.b, XP_ASSIGN) + ")", XP_LHS)
+        return n2
+    if k == X_ASSIGN:
+        if priv_lowered(&p, unparen(&p, d.a)):
+            return pv_assign(&p, n)
+        op = ir_s(&p, n)
+        if (op == "||=" or op == "&&=" or op == "??=") and p.target < 2021:
+            return la_lower(&p, n)
+        if op == "**=" and p.target < 2016:
+            return pow_lower(&p, n)
+        return lw_children(&p, n)
+    return lw_children(&p, n)
+
+# n with its children lowered (a new node only when one changed).
+fn lw_children(p: mut P, n: int) int:
+    d = p.ir[n]
+    a = d.a
+    b = d.b
+    c = d.c
+    if a >= 0:
+        a = lw(&p, a, false)
+    if b >= 0:
+        b = lw(&p, b, false)
+    if c >= 0:
+        c = lw(&p, c, false)
+    same = a == d.a and b == d.b and c == d.c
+    if d.kn == 0:
+        if same:
+            return n                             # (nothing below changed)
+        return ir_copy(&p, n, a, b, c)
+    xs: [int] = []
+    for i in 0..d.kn:
+        x = p.ir_kids[d.k0 + i]
+        y = lw(&p, x, false)
+        if y != x:
+            same = false
+        xs.push(y)
+    if same:
+        return n
+    m = ir_copy(&p, n, a, b, c)
+    k0 = len(p.ir_kids)
+    for y in xs:
+        p.ir_kids.push(y)
+    p.ir[m].k0 = k0
+    return m
+
+fn ir_a(p: mut P, n: int) int:
+    return p.ir[n].a
+
+# A copy of node n with other children.
+fn ir_copy(p: mut P, n: int, a: int, b: int, c: int) int:
+    d = p.ir[n]
+    p.ir.push(Nd(d.k, a, b, c, d.f, d.oa, d.ob, d.sa, d.sb, d.k0, d.kn))
+    return len(p.ir) - 1
+
+# A target through its parentheses (tsc allows (this.#x) = v).
+fn unparen(p: mut P, n0: int) int:
+    n = n0
+    while p.ir[n].k == X_PAREN or p.ir[n].k == X_GROUP:
+        n = p.ir[n].a
+    return n
+
+# What tsc copies without a temp (isSimpleCopiableExpression): a name, `this`, a literal,
+# a name the module transform rewrote; never a parenthesized expression.
+# (Sees through a type assertion's parentheses, as tsc's optional chains do: node_simple_strict doesn't.)
+fn node_simple(p: mut P, n: int) bool:
+    d = p.ir[n]
+    if d.k == X_GROUP:
+        return node_simple(&p, d.a)
+    return node_simple_strict(&p, n)
+
+fn node_simple_strict(p: mut P, n: int) bool:
+    d = p.ir[n]
+    if d.c == -2:                                # (an instantiation expression, ir.tn)
+        return false
+    if d.k == X_NAME or d.k == X_THIS:
+        return true
+    if d.k == X_RAW:
+        return simple_ref(ir_leaf_text(&p, n))
+    return false
+
+# ---- ES2022: super in static initializers and blocks, through the base's and the class's temps:
+#   super.x -> Reflect.get(_b, "x", _a)          super.f(a) -> Reflect.get(_b, "f", _a).call(_a, a)
+
+# Is n `super.x` / `super[k]` in a lowered static?
+fn ss_member(p: mut P, n: int) bool:
+    if n < 0:
+        return false
+    d = p.ir[n]
+    if (d.k != X_DOT and d.k != X_INDEX) or d.f & XF_OPT != 0:
+        return false
+    return p.ir[d.a].k == X_SUPER and p.ir[d.a].f & XF_STATIC != 0
+
+# Its key: "x" for super.x, the expression for super[k].
+fn ss_key(p: mut P, n: int) str:
+    d = p.ir[n]
+    if d.k == X_DOT:
+        return "\"" + ir_s(&p, n) + "\""
+    db = d.b
+    return ir_print(&p, lw(&p, db, false), XP_ASSIGN)
+
+fn ss_get(p: mut P, n: int) str:
+    c = static_this(&p)
+    k = ss_key(&p, n)
+    return "Reflect.get(" + p.st_super + ", " + k + ", " + c + ")"
+
+fn ss_assign(p: mut P, n: int) int:
+    d = p.ir[n]
+    t = unparen(&p, d.a)
+    op = ir_s(&p, n)
+    if op == "&&=" or op == "||=" or op == "??=":
+        fail(&p, "`super.x " + op + "` in a static initializer below ES2022 isn't supported yet")
+        return n
+    c = static_this(&p)
+    key = ss_key(&p, t)
+    v = lw(&p, d.b, false)
+    rhs = ir_print(&p, v, XP_ASSIGN)
+    if op != "=":
+        o = op[..len(op) - 1]
+        ss = p.st_super
+        rv = ir_print(&p, v, rhs_prec(o))
+        rhs = "Reflect.get(" + ss + ", " + key + ", " + c + ") " + o + " " + rv
+    if n == p.ir_root_n and p.ir_root_unused:
+        return ir_raw(&p, "Reflect.set(" + p.st_super + ", " + key + ", " + rhs + ", " + c + ")", XP_LHS)
+    tmp = field_temp(&p)
+    return ir_raw(&p, "(Reflect.set(" + p.st_super + ", " + key + ", " + tmp + " = " + rhs + ", " + c + "), " + tmp + ")", XP_PRIMARY)
+
+# super.x++ -> Reflect.set(_b, "x", (_d = Reflect.get(_b, "x", _a), _c = _d++, _d), _a), _c
+# (one temp when the value isn't used: a statement); a computed key reads once, through a temp
+fn ss_update(p: mut P, n: int) int:
+    d = p.ir[n]
+    t = unparen(&p, d.a)
+    op = ir_s(&p, n)
+    prefix = d.f & XF_PREFIX != 0
+    stmt = n == p.ir_root_n and p.ir_root_unused
+    c = static_this(&p)
+    base = p.st_super
+    key = ss_key(&p, t)
+    skey = key
+    if not (key.starts_with("\"") or key.starts_with("'") or is_digit(key.byte(0))):
+        kt = ""
+        if stmt:
+            kt = parse_temp(&p)
+        else:
+            kt = field_temp(&p)
+        skey = kt + " = " + key
+        key = kt
+    get = "Reflect.get(" + base + ", " + key + ", " + c + ")"
+    if stmt:
+        v = parse_temp(&p)
+        inner = "(" + v + " = " + get + ", " + op + v + ")"
+        if not prefix:
+            inner = "(" + v + " = " + get + ", " + v + op + ", " + v + ")"
+        return ir_raw(&p, "Reflect.set(" + base + ", " + skey + ", " + inner + ", " + c + ")", XP_LHS)
+    r = field_temp(&p)                           # (with the class's temps, as tsc declares them)
+    v = field_temp(&p)
+    inner = "(" + v + " = " + get + ", " + r + " = " + op + v + ")"
+    if not prefix:
+        inner = "(" + v + " = " + get + ", " + r + " = " + v + op + ", " + v + ")"
+    return ir_raw(&p, "(Reflect.set(" + base + ", " + skey + ", " + inner + ", " + c + "), " + r + ")", XP_PRIMARY)
+
+# In a destructuring pattern: a root that is super.x (or super.x = default)?
+fn ss_pattern_target(p: mut P, n: int) bool:
+    t = n
+    if p.ir[t].k == X_ASSIGN and ir_s(&p, t) == "=":
+        t = p.ir[t].a
+    return ss_member(&p, unparen(&p, t))
+
+# [super.x] = v -> [({ set value(_a) { Reflect.set(_c, "x", _a, _b); } }).value] = v
+fn ss_setter_target(p: mut P, n: int) int:
+    t = n
+    dflt = -1
+    if p.ir[t].k == X_ASSIGN:
+        tb = p.ir[t].b
+        dflt = lw(&p, tb, false)
+        t = p.ir[t].a
+    m = unparen(&p, t)
+    c = static_this(&p)
+    key = ss_key(&p, m)
+    v = fresh_temp(&p)
+    s = "({ set value(" + v + ") { Reflect.set(" + p.st_super + ", " + key + ", " + v + ", " + c + "); } }).value"
+    if dflt >= 0:
+        s += " = " + ir_print(&p, dflt, XP_ASSIGN)
+    return ir_raw(&p, s, XP_ASSIGN)
+
+# ---- ES2022: #private names (the class fields transform's private parts)
+
+# Is n `recv.#name` for a #private member lowered here (a class of ours below ES2022)?
+fn priv_lowered(p: mut P, n: int) bool:
+    if n < 0 or p.ir[n].k != X_PRIV or not p.priv_low or len(p.privs) == 0:
+        return false
+    return priv_find(&p, ir_s(&p, n)[1..], false)[0] >= 0
+
+fn pv_get(p: mut P, n: int, recv: str) str:
+    rd = priv_find(&p, ir_s(&p, n)[1..], false)
+    return priv_get(&p, recv, rd[0], rd[1])
+
+fn pv_set(p: mut P, n: int, recv: str, value: str) str:
+    wr = priv_find(&p, ir_s(&p, n)[1..], true)
+    return priv_set(&p, recv, wr[0], wr[1], value)
+
+# recv.#x -> __classPrivateFieldGet(recv, _C_x, "f")
+fn pv_read(p: mut P, n: int) int:
+    recv = lw(&p, ir_a(&p, n), false)
+    return ir_raw(&p, pv_get(&p, n, ir_print(&p, recv, XP_LHS)), XP_LHS)
+
+# recv.#m(args) -> __classPrivateFieldGet(recv, ...).call(recv, args) (recv through a temp
+# unless it is simple); recv.#f?.(args) -> ...?.call(recv, args)
+fn pv_call(p: mut P, n: int) int:
+    d = p.ir[n]
+    pn = d.a
+    recv = lw(&p, ir_a(&p, pn), false)
+    r = ir_print(&p, recv, XP_LHS)
+    rx = r
+    if not simple_copy(r):
+        t = field_temp(&p)
+        rx = "(" + t + " = " + r + ")"
+        r = t
+    g = pv_get(&p, pn, rx)
+    a = lw_args(&p, n)
+    q = ""
+    if d.f & XF_OPT != 0:
+        q = "?"
+    if a == "":
+        return ir_raw(&p, g + q + ".call(" + r + ")", XP_LHS)
+    return ir_raw(&p, g + q + ".call(" + r + ", " + a + ")", XP_LHS)
+
+# recv.#f`...` -> __classPrivateFieldGet(recv, ...).bind(recv)`...`
+fn pv_tag(p: mut P, n: int) int:
+    d = p.ir[n]
+    pn = d.a
+    recv = lw(&p, ir_a(&p, pn), false)
+    r = ir_print(&p, recv, XP_LHS)
+    rx = r
+    if not simple_copy(r):
+        t = field_temp(&p)
+        rx = "(" + t + " = " + r + ")"
+        r = t
+    return ir_raw(&p, pv_get(&p, pn, rx) + ".bind(" + r + ")" + p.out[d.oa..d.ob].trim(), XP_LHS)
+
+# recv.#x = v -> __classPrivateFieldSet(recv, _C_x, v, "f"); recv.#x += v -> ...(recv, ..., get + v)
+fn pv_assign(p: mut P, n: int) int:
+    d = p.ir[n]
+    pn = unparen(&p, d.a)
+    recv = lw(&p, ir_a(&p, pn), false)
+    r = ir_print(&p, recv, XP_LHS)
+    op = ir_s(&p, n)
+    v = lw(&p, d.b, false)
+    vt = ir_print(&p, v, XP_ASSIGN)
+    if op == "=":
+        return ir_raw(&p, pv_set(&p, pn, r, vt), XP_LHS)
+    o = op[..len(op) - 1]
+    r1 = r
+    r2 = r
+    if not inline_literal(r):                    # tsc's createCopiableReceiverExpr: a temp except
+        t = field_temp(&p)                       # for this and literals
+        r1 = t + " = " + r
+        r2 = t
+    g = pv_get(&p, pn, r2)
+    val = g + " " + o + " " + ir_print(&p, v, rhs_prec(o))   # (x.#a *= b + c: get * (b + c))
+    if o == "??" and p.target < 2020:
+        val = nullish(&p, g, vt)
+    elif o == "**" and p.target < 2016:
+        val = "Math.pow(" + g + ", " + vt + ")"
+    return ir_raw(&p, pv_set(&p, pn, r1, val), XP_LHS)
+
+# The least precedence the right operand of `o` (a compound assignment's operator, without
+# (left-associative: one above its own; ** is right-associative; ?? doesn't mix with || &&)
+fn rhs_prec(o: str) int:
+    if o == "*" or o == "/" or o == "%":
+        return XP_MUL + 1
+    if o == "+" or o == "-":
+        return XP_ADD + 1
+    if o == "<<" or o == ">>" or o == ">>>":
+        return XP_SHIFT + 1
+    if o == "&":
+        return XP_BAND + 1
+    if o == "^":
+        return XP_BXOR + 1
+    if o == "|":
+        return XP_BOR + 1
+    if o == "**":
+        return XP_POW
+    if o == "&&":
+        return XP_AND + 1
+    if o == "||":
+        return XP_OR + 1
+    if o == "??":
+        return XP_BOR
+    return XP_ASSIGN
+
+# recv.#x++ -> __classPrivateFieldSet(recv, ..., (_a = get, _a++, _a)) (another temp when its value is used)
+fn pv_update(p: mut P, n: int) int:
+    d = p.ir[n]
+    pn = unparen(&p, d.a)
+    recv = lw(&p, ir_a(&p, pn), false)
+    r = ir_print(&p, recv, XP_LHS)
+    op = ir_s(&p, n)
+    r1 = r
+    if not inline_literal(r):                    # (the receiver once, through a temp)
+        t0 = field_temp(&p)
+        r1 = t0 + " = " + r
+        r = t0
+    g = pv_get(&p, pn, r)
+    if d.f & XF_PREFIX != 0:
+        t = field_temp(&p)
+        return ir_raw(&p, pv_set(&p, pn, r1, "(" + t + " = " + g + ", " + op + t + ")"), XP_LHS)
+    if n == p.ir_root_n and p.ir_root_unused:
+        t = field_temp(&p)
+        return ir_raw(&p, pv_set(&p, pn, r1, "(" + t + " = " + g + ", " + t + op + ", " + t + ")"), XP_LHS)
+    t1 = field_temp(&p)
+    t2 = field_temp(&p)
+    return ir_raw(&p, "(" + pv_set(&p, pn, r1, "(" + t2 + " = " + g + ", " + t1 + " = " + t2 + op + ", " + t2 + ")") + ", " + t1 + ")", XP_PRIMARY)
+
+# #x in o -> __classPrivateFieldIn(_C_x, o)
+fn pv_in(p: mut P, n: int) int:
+    d = p.ir[n]
+    rd = priv_find(&p, ir_s(&p, d.a)[1..], false)
+    c = p.privs[rd[0]]
+    m = c.members[rd[1]]
+    state = m.var
+    if m.is_static:
+        state = c.alias
+    elif m.kind != PK_FIELD:
+        state = c.inst
+    o = lw(&p, d.b, false)
+    priv_helper(&p, H_PRIV_IN)
+    return ir_raw(&p, "__classPrivateFieldIn(" + state + ", " + ir_print(&p, o, XP_ASSIGN) + ")", XP_LHS)
+
+# A call's arguments, lowered and written.
+fn lw_args(p: mut P, n: int) str:
+    d = p.ir[n]
+    parts: [str] = []
+    for i in 0..d.kn:
+        kid = p.ir_kids[d.k0 + i]
+        parts.push(ir_print(&p, lw(&p, kid, false), XP_ASSIGN))
+    return ", ".join(parts)
+
+# ---- ES2020: optional chains
+
+# Is there a `?.` in the chain ending at n (before a parenthesized or other non-member node)?
+fn chain_has_opt(p: mut P, n0: int) bool:
+    n = n0
+    while n >= 0:
+        d = p.ir[n]
+        if not (d.k == X_DOT or d.k == X_INDEX or d.k == X_PRIV or d.k == X_CALL):
+            return false
+        if d.f & XF_OPT != 0:
+            return true
+        n = d.a
+    return false
+
+fn is_member_link(p: mut P, n: int) bool:
+    k = p.ir[n].k
+    return k == X_DOT or k == X_INDEX or k == X_PRIV
+
+# A member access inside (type assertion) parentheses, or -1.
+fn group_member(p: mut P, n0: int) int:
+    n = n0
+    while p.ir[n].k == X_GROUP or p.ir[n].k == X_PAREN:
+        n = p.ir[n].a
+    if n != n0 and is_member_link(&p, n) and not chain_has_opt(&p, n):
+        return n
+    return -1
+
+# The chain ending at n0, lowered (tsc's flattened chain):
+#   a?.b.c        -> a === null || a === void 0 ? void 0 : a.b.c
+#   f()?.x        -> (_a = f()) === null || _a === void 0 ? void 0 : _a.x
+#   a.m?.(x)      -> (_a = a.m) === null || _a === void 0 ? void 0 : _a.call(a, x)
+# What follows the pending `?.` is a template, \x01 standing for its object (the object or a temp).
+fn oc_lower(p: mut P, n0: int, del: bool) int:
+    links: [int] = []
+    n = n0
+    while p.ir[n].k == X_DOT or p.ir[n].k == X_INDEX or p.ir[n].k == X_PRIV or p.ir[n].k == X_CALL:
+        links.push(n)
+        n = p.ir[n].a
+    ordered: [int] = []                          # the links, in source order
+    i = len(links) - 1
+    while i >= 0:
+        ordered.push(links[i])
+        i -= 1
+    first = 0                                    # the first `?.` (before it: an ordinary expression)
+    while p.ir[ordered[first]].f & XF_OPT == 0:
+        first += 1
+    pre = p.ir[ordered[first]].a                 # what the first `?.` applies to
+    x = ""                                       # the pending link's object
+    xs0 = false                                  # (simple)
+    this_obj = ""                                # a first optional call's `this`, when pre is a member
+    this_key = ""
+    fl = p.ir[ordered[first]]
+    if fl.k == X_CALL and is_member_link(&p, pre) and not chain_has_opt(&p, pre):
+        # a.m?.(): this is a; (recv.#m)?.(): its receiver
+        pd = p.ir[pre]
+        obj = lw(&p, pd.a, false)
+        ot = ir_print(&p, obj, XP_LHS)
+        if pd.k == X_PRIV and priv_lowered(&p, pre):
+            if simple_copy(ot):
+                x = pv_get(&p, pre, ot)
+                this_obj = ot
+            else:
+                t = parse_temp(&p)
+                x = pv_get(&p, pre, "(" + t + " = " + ot + ")")
+                this_obj = t
+        elif ot == "super":
+            x = ot + link_text(&p, lw_link(&p, pre))
+            this_obj = "this"
+        elif node_simple_strict(&p, obj) and p.ir[obj].f & XF_ASSERT == 0:   # (o!.m?.(): a temp)
+            x = ot + link_text(&p, lw_link(&p, pre))
+            this_obj = ot
+        else:
+            tmp = low_temp(&p, 2020)
+            x = "(" + tmp + " = " + ot + ")" + link_text(&p, lw_link(&p, pre))
+            this_obj = tmp
+        xs0 = false
+        if pd.k != X_PRIV:
+            xs0 = import_ref(&p, x)              # (mod_1.f is simple to tsc; o.f and C_1.f aren't)
+        this_key = "-"
+    elif fl.k == X_CALL and group_member(&p, pre) >= 0:
+        # (foo.m as any)?.(): through the parentheses, this is the member's object
+        m = group_member(&p, pre)
+        ma = lw(&p, ir_a(&p, m), false)
+        ot = ir_print(&p, ma, XP_LHS)
+        key = link_text(&p, lw_link(&p, m))
+        if ot == "super":
+            x = ot + key
+            this_obj = "this"
+        elif node_simple(&p, ma):
+            x = ot + key
+            this_obj = ot
+        else:
+            tmp = low_temp(&p, 2020)
+            x = "(" + tmp + " = " + ot + ")" + key
+            this_obj = tmp
+        this_key = "-"
+    else:
+        pl = lw(&p, pre, false)
+        x = ir_print(&p, pl, XP_LHS)
+        xs0 = node_simple(&p, pl)
+        if fl.k == X_CALL and p.ir[pl].k == X_RAW and p.sup_name != "" and (x.starts_with(p.sup_name + ".") or x.starts_with(p.sup_index_name + "(")):
+            this_obj = "this"                    # super.m?.() in a lowered async method: _super.m,
+            this_key = "-"                       # called with this
+    rest = ""                                    # what follows the pending `?.` (template)
+    prev = ""                                    # rest before its last link
+    last = 0                                     # its last link: 1 a member, 2 a #private one, 3 a call
+    pending = false
+    for j in first..len(ordered):
+        l0 = ordered[j]
+        d = p.ir[l0]
+        if d.f & XF_OPT != 0:
+            if d.k == X_CALL:
+                this_arg = ""
+                if pending:
+                    # the callee is the pending chain; this is its last member's object
+                    if last == 1 and prev == "\x01":
+                        x = oc_cond(&p, x, rest, false, xs0)
+                        this_arg = p.oc_ref
+                    elif last == 1:
+                        ref = x
+                        head = x
+                        if not xs0:
+                            ref = low_temp(&p, 2020)
+                            head = "(" + ref + " = " + x + ")"
+                        tmp = low_temp(&p, 2020)
+                        key = rest[len(prev)..]
+                        x = head + " === null || " + ref + " === void 0 ? void 0 : (" + tmp + " = " + prev.replace("\x01", ref) + ")" + key
+                        this_arg = tmp
+                    else:
+                        x = oc_cond(&p, x, rest, false, xs0)
+                    xs0 = false
+                elif this_key != "":
+                    this_arg = this_obj
+                l = lw_link(&p, l0)
+                a = ir_args(&p, l)
+                call = "(" + a + ")"
+                if this_arg != "":
+                    if a == "":
+                        call = ".call(" + this_arg + ")"
+                    else:
+                        call = ".call(" + this_arg + ", " + a + ")"
+                rest = "\x01" + call
+                prev = ""
+                last = 3
+                pending = true
+                continue
+            if pending:
+                x = oc_cond(&p, x, rest, false, xs0)
+                xs0 = false                      # (a conditional now)
+            l = lw_link(&p, l0)
+            prev = "\x01"
+            if d.k == X_PRIV and priv_lowered(&p, l0):
+                rest = pv_get(&p, l0, "\x01")
+                last = 2
+            else:
+                rest = "\x01" + link_text(&p, l)
+                last = 1
+            pending = true
+            continue
+        l = lw_link(&p, l0)
+        if d.k == X_PRIV and priv_lowered(&p, l0):
+            prev = rest
+            rest = pv_get(&p, l0, rest)
+            last = 2
+        elif d.k == X_CALL and last == 2:
+            # a #private method of the pending chain: recv through a temp unless it is the chain's reference
+            recv = prev
+            g = rest
+            if recv != "\x01":
+                t = parse_temp(&p)
+                g = rest.replace(recv, "(" + t + " = " + recv + ")")
+                recv = t
+            a = ir_args(&p, l)
+            if a == "":
+                rest = g + ".call(" + recv + ")"
+            else:
+                rest = g + ".call(" + recv + ", " + a + ")"
+            prev = ""
+            last = 3
+        else:
+            prev = rest
+            rest = rest + link_text(&p, l)
+            last = 1
+            if d.k == X_CALL:
+                last = 3
+    return ir_raw(&p, oc_cond(&p, x, rest, del, xs0), XP_COND)
+
+# One link's text without its `?.` (".b", "[k]", "(args)").
+fn link_text(p: mut P, n: int) str:
+    d = p.ir[n]
+    if d.k == X_DOT or d.k == X_PRIV:
+        return "." + ir_s(&p, n)
+    if d.k == X_INDEX:
+        return "[" + ir_print(&p, d.b, XP_SEQ) + "]"
+    return "(" + ir_args(&p, n) + ")"
+
+# A link with its key or arguments lowered.
+fn lw_link(p: mut P, l: int) int:
+    d = p.ir[l]
+    if d.k == X_INDEX:
+        b = lw(&p, d.b, false)
+        return ir_copy(&p, l, -1, b, -1)
+    if d.k == X_CALL:
+        xs: [int] = []
+        for i in 0..d.kn:
+            kid = p.ir_kids[d.k0 + i]
+            xs.push(lw(&p, kid, false))
+        m = ir_copy(&p, l, -1, -1, -1)
+        k0 = len(p.ir_kids)
+        for y in xs:
+            p.ir_kids.push(y)
+        p.ir[m].k0 = k0
+        return m
+    return l
+
+# `x?.rest` as a conditional (x in a temp unless simple; p.oc_ref holds x); \x01 in rest stands for x.
+fn oc_cond(p: mut P, x: str, rest: str, del: bool, simple: bool) str:
+    alt = "void 0"
+    pre = ""
+    if del:
+        alt = "true"
+        pre = "delete "
+    ref = x
+    head = x
+    if not simple:
+        ref = low_temp(&p, 2020)
+        head = "(" + ref + " = " + x + ")"
+    p.oc_ref = ref
+    return head + " === null || " + ref + " === void 0 ? " + alt + " : " + pre + rest.replace("\x01", ref)
+
+# a ?? b -> a !== null && a !== void 0 ? a : b (a through a temp unless it is simple)
+fn nc_lower(p: mut P, a: int, b: int) int:
+    l = ir_print(&p, a, XP_ASSIGN)
+    r = ir_print(&p, b, XP_ASSIGN)
+    if node_simple_strict(&p, a) and p.ir[a].f & XF_ASSERT == 0:   # ((x as T), x! ?? y: a temp, unlike ?.)
+        return ir_raw(&p, l + " !== null && " + l + " !== void 0 ? " + l + " : " + r, XP_COND)
+    tmp = low_temp(&p, 2020)
+    return ir_raw(&p, "(" + tmp + " = " + l + ") !== null && " + tmp + " !== void 0 ? " + tmp + " : " + r, XP_COND)
+
+# ---- ES2021: logical assignment
+
+# The target's object and key, read and written through temps where tsc makes them.
+struct Tgt:
+    read: str
+    write: str
+
+fn la_target(p: mut P, t: int, year: int, always_obj: bool) Tgt:
+    d = p.ir[t]
+    if d.k == X_DOT or d.k == X_INDEX:
+        obj = ir_print(&p, d.a, XP_LHS)
+        obj_r = obj
+        obj_w = obj
+        if always_obj or not node_simple(&p, d.a):
+            tmp = low_temp(&p, year)
+            obj_r = "(" + tmp + " = " + obj + ")"
+            obj_w = tmp
+        if d.k == X_DOT:
+            nm = ir_s(&p, t)
+            return Tgt(obj_r + "." + nm, obj_w + "." + nm)
+        key = ir_print(&p, d.b, XP_SEQ)
+        if always_obj or not (node_simple(&p, d.b) and simple_copy(key)):
+            tmp2 = low_temp(&p, year)
+            return Tgt(obj_r + "[" + tmp2 + " = " + key + "]", obj_w + "[" + tmp2 + "]")
+        return Tgt(obj_r + "[" + key + "]", obj_w + "[" + key + "]")
+    x = ir_print(&p, t, XP_LHS)
+    return Tgt(x, x)
+
+# a ||= b -> a || (a = b); o.x &&= b -> o.x && (o.x = b); f().x ??= b -> (_a = f()).x ?? (_a.x = b)
+fn la_lower(p: mut P, n: int) int:
+    d = p.ir[n]
+    t = lw_target(&p, d.a)
+    op = ir_s(&p, n)[..2]
+    g = la_target(&p, t, 2021, false)
+    v = lw(&p, d.b, false)
+    assigned = "(" + g.write + " = " + ir_print(&p, v, XP_ASSIGN) + ")"
+    if op == "??" and p.target < 2020:
+        tk = p.ir[t].k
+        if (tk == X_NAME or tk == X_RAW) and simple_ref(g.read):   # (a.b ??= c reads a.b once: a temp)
+            return ir_raw(&p, g.read + " !== null && " + g.read + " !== void 0 ? " + g.read + " : " + assigned, XP_COND)
+        tmp = low_temp(&p, 2020)
+        return ir_raw(&p, "(" + tmp + " = " + g.read + ") !== null && " + tmp + " !== void 0 ? " + tmp + " : " + assigned, XP_COND)
+    return ir_raw(&p, g.read + " " + op + " " + assigned, binop_prec(op))
+
+# An assignment target with its object and key lowered (not the access itself).
+fn lw_target(p: mut P, t: int) int:
+    d = p.ir[t]
+    if d.k == X_DOT:
+        a = lw(&p, d.a, false)
+        return ir_copy(&p, t, a, -1, -1)
+    if d.k == X_INDEX:
+        a = lw(&p, d.a, false)
+        b = lw(&p, d.b, false)
+        return ir_copy(&p, t, a, b, -1)
+    return t
+
+# ---- ES2016: exponentiation
+
+# a **= b -> a = Math.pow(a, b); o.x **= b -> (_a = o).x = Math.pow(_a.x, b)
+fn pow_lower(p: mut P, n: int) int:
+    d = p.ir[n]
+    t = lw_target(&p, d.a)
+    td = p.ir[t]
+    if td.k != X_DOT and td.k != X_INDEX:
+        x = ir_print(&p, t, XP_LHS)
+        v = lw(&p, d.b, false)
+        return ir_raw(&p, x + " = Math.pow(" + x + ", " + ir_print(&p, v, XP_ASSIGN) + ")", XP_ASSIGN)
+    obj = ir_print(&p, td.a, XP_LHS)
+    o = low_temp(&p, 2016)
+    wkey = ""
+    rkey = ""
+    if td.k == X_DOT:
+        wkey = "." + ir_s(&p, t)
+        rkey = wkey
+    else:
+        k = low_temp(&p, 2016)
+        wkey = "[" + k + " = " + ir_print(&p, td.b, XP_SEQ) + "]"
+        rkey = "[" + k + "]"
+    v = lw(&p, d.b, false)
+    return ir_raw(&p, "(" + o + " = " + obj + ")" + wkey + " = Math.pow(" + o + rkey + ", " + ir_print(&p, v, XP_ASSIGN) + ")", XP_ASSIGN)

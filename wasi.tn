@@ -1,0 +1,15 @@
+# The ternts command as WASI, for platforms without a native binary (no dev, --watch, --serve).
+# js/cli.cjs runs it under Node with the working directory in TERNTS_PWD.
+import cli
+import os
+
+fn main():
+    pwd = os.env("TERNTS_PWD", "")
+    if pwd != "" and not os.chdir(pwd):
+        os.eprint("ternts: can't use " + pwd + " as the working directory")
+        os.exit(1)
+    a = cli.parse(os.args())
+    if cli.is_async(a):
+        os.eprint("ternts: " + a.rest[0] + " needs the native ternts binary; this platform runs the WebAssembly build (build, single files, --outdir, --bench)")
+        os.exit(1)
+    cli.run(a)

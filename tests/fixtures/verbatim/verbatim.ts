@@ -1,0 +1,12 @@
+import { type A, b } from "./a";
+import type { C } from "./c";
+import D, { e } from "./d";
+import * as F from "./f";
+import "./side-effect";
+export type { C };
+export { type A, b };
+export * from "./star";
+export * as nsStar from "./star2";
+const x: A = b as any;
+export default x;
+export const used = [e, F];

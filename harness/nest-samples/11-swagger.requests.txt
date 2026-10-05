@@ -1,0 +1,3 @@
+GET /api-json
+POST /cats {"name":"Tom","age":3,"breed":"tabby"}
+GET /cats/1

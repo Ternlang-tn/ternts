@@ -1,0 +1,856 @@
+# Expression trees for lowering below ES2022: a root expression is written as usual and parsed into
+# nodes; only a root that needs lowering (`?.`, `??`, `**`, ...) is rewritten (irlower.tn) and reprinted.
+
+const X_RAW = 1         # a leaf: out[oa..ob] (XF_GEN: p.ir_strs[oa]); f >> 8: its precedence
+const X_NAME = 2        # a leaf that is an identifier
+const X_THIS = 3        # (leaf text)
+const X_SUPER = 4       # (leaf text)
+const X_DOT = 5         # a.name    (src[sa..sb]: name; XF_OPT: a?.name)
+const X_INDEX = 6       # a[b]      (XF_OPT: a?.[b])
+const X_PRIV = 7        # a.#name   (XF_OPT: a?.#name)
+const X_CALL = 8        # a(kids)   (XF_OPT: a?.(kids))
+const X_NEW = 9         # new a(kids) (XF_NOARGS: new a)
+const X_TAG = 10        # a`...`    (out[oa..ob]: the template)
+const X_SPREAD = 11     # ...a
+const X_UPDATE = 12     # a++ / ++a (src[sa..sb]: the operator; XF_PREFIX)
+const X_UNARY = 13      # op a      (src[sa..sb]: !, -, typeof, void, delete, await)
+const X_BINARY = 14     # a op b
+const X_COND = 15       # a ? b : c
+const X_ASSIGN = 16     # a op b    (=, +=, ||=, >>=, ...)
+const X_SEQ = 17        # kids, with ", "
+const X_PAREN = 18      # (a), as written
+const X_GROUP = 19      # (a) around a type assertion: written without them (tsc), still a chain boundary
+const X_YIELD = 20      # `await a` lowered: yield a (XF_AWAIT: yield __await(a), in async generators)
+const X_PRIVNAME = 21   # #name before `in` (src[sa..sb])
+
+const XF_OPT = 1
+const XF_PREFIX = 2
+const XF_NOARGS = 4
+const XF_GEN = 8        # a RAW with generated text (p.ir_strs[oa])
+const XF_AWAIT = 16
+const XF_WORD = 32      # an operator that is a word (typeof, delete, ...): a space after it
+const XF_STATIC = 64    # X_SUPER in a static initializer or block lowered below ES2022
+const XF_ASSERT = 128   # went through x! or x as T (tsc's partially emitted node: `??` takes a temp)
+
+# Precedence (higher binds tighter).
+const XP_SEQ = 1
+const XP_ASSIGN = 2
+const XP_COND = 3
+const XP_NULLISH = 4
+const XP_OR = 5
+const XP_AND = 6
+const XP_BOR = 7
+const XP_BXOR = 8
+const XP_BAND = 9
+const XP_EQ = 10
+const XP_REL = 11
+const XP_SHIFT = 12
+const XP_ADD = 13
+const XP_MUL = 14
+const XP_POW = 15
+const XP_UNARY = 16
+const XP_POSTFIX = 17
+const XP_LHS = 18
+const XP_PRIMARY = 19
+
+struct Nd:
+    k: int
+    a: int
+    b: int
+    c: int
+    f: int
+    oa: int             # a leaf's text in the output (or a generated text's index)
+    ob: int
+    sa: int             # a name's or an operator's text in the source
+    sb: int
+    k0: int             # a list's children: p.ir_kids[k0..k0 + kn]
+    kn: int
+
+fn ir_node(p: mut P, k: int, a: int, b: int, c: int, f: int, sa: int, sb: int) int:
+    p.ir.push(Nd(k, a, b, c, f, 0, 0, sa, sb, 0, 0))
+    return len(p.ir) - 1
+
+fn ir_leaf(p: mut P, k: int, oa: int, ob: int, prec: int) int:
+    p.ir.push(Nd(k, -1, -1, -1, prec << 8, oa, ob, 0, 0, 0, 0))
+    return len(p.ir) - 1
+
+# A leaf with generated text (the transforms' output).
+fn ir_raw(p: mut P, s: str, prec: int) int:
+    p.ir_strs.push(s)
+    p.ir.push(Nd(X_RAW, -1, -1, -1, XF_GEN | (prec << 8), len(p.ir_strs) - 1, 0, 0, 0, 0, 0))
+    return len(p.ir) - 1
+
+fn ir_list(p: mut P, k: int, a: int, kids: [int], f: int) int:
+    k0 = len(p.ir_kids)
+    for x in kids:
+        p.ir_kids.push(x)
+    p.ir.push(Nd(k, a, -1, -1, f, 0, 0, 0, 0, k0, len(kids)))
+    return len(p.ir) - 1
+
+fn ir_kids_of(p: mut P, n: int) [int]:
+    d = p.ir[n]
+    out: [int] = []
+    for i in 0..d.kn:
+        out.push(p.ir_kids[d.k0 + i])
+    return out
+
+# A node's name or operator (source text).
+fn ir_s(p: mut P, n: int) str:
+    d = p.ir[n]
+    return p.src[d.sa..d.sb]
+
+# A leaf's text.
+fn ir_leaf_text(p: mut P, n: int) str:
+    d = p.ir[n]
+    if d.f & XF_GEN != 0:
+        return p.ir_strs[d.oa]
+    return p.out[d.oa..d.ob].trim()
+
+fn binop_prec(op: str) int:
+    if op == "??":
+        return XP_NULLISH
+    if op == "||":
+        return XP_OR
+    if op == "&&":
+        return XP_AND
+    if op == "|":
+        return XP_BOR
+    if op == "^":
+        return XP_BXOR
+    if op == "&":
+        return XP_BAND
+    if op == "==" or op == "!=" or op == "===" or op == "!==":
+        return XP_EQ
+    if op == "<" or op == ">" or op == "<=" or op == ">=" or op == "instanceof" or op == "in":
+        return XP_REL
+    if op == "<<" or op == ">>" or op == ">>>":
+        return XP_SHIFT
+    if op == "+" or op == "-":
+        return XP_ADD
+    if op == "*" or op == "/" or op == "%":
+        return XP_MUL
+    if op == "**":
+        return XP_POW
+    return 0
+
+fn ir_prec(p: mut P, n: int) int:
+    d = p.ir[n]
+    k = d.k
+    if k == X_RAW:
+        return d.f >> 8
+    if k == X_NAME or k == X_THIS or k == X_SUPER or k == X_PAREN or k == X_PRIVNAME:
+        return XP_PRIMARY
+    if k == X_DOT or k == X_INDEX or k == X_PRIV or k == X_CALL or k == X_NEW or k == X_TAG:
+        return XP_LHS
+    if k == X_UPDATE:
+        if d.f & XF_PREFIX != 0:
+            return XP_UNARY
+        return XP_POSTFIX
+    if k == X_UNARY:
+        return XP_UNARY
+    if k == X_GROUP:
+        return ir_prec(&p, d.a)
+    if k == X_BINARY:
+        return binop_prec(ir_s(&p, n))
+    if k == X_COND:
+        return XP_COND
+    if k == X_ASSIGN or k == X_SPREAD or k == X_YIELD:
+        return XP_ASSIGN
+    if k == X_SEQ:
+        return XP_SEQ
+    return XP_PRIMARY
+
+# ---- the printer (for a root that was lowered)
+
+fn ir_print(p: mut P, n: int, min: int) str:
+    t = ir_text(&p, n)
+    if ir_prec(&p, n) < min:
+        return "(" + t + ")"
+    return t
+
+fn ir_text(p: mut P, n: int) str:
+    d = p.ir[n]
+    k = d.k
+    if k == X_RAW or k == X_NAME or k == X_THIS or k == X_SUPER:
+        return ir_leaf_text(&p, n)
+    if k == X_DOT:
+        return ir_print(&p, d.a, XP_LHS) + opt_dot(d.f) + ir_s(&p, n)
+    if k == X_INDEX:
+        o = "["
+        if d.f & XF_OPT != 0:
+            o = "?.["
+        return ir_print(&p, d.a, XP_LHS) + o + ir_print(&p, d.b, XP_SEQ) + "]"
+    if k == X_PRIV:
+        return ir_print(&p, d.a, XP_LHS) + opt_dot(d.f) + ir_s(&p, n)
+    if k == X_CALL:
+        o = "("
+        if d.f & XF_OPT != 0:
+            o = "?.("
+        return ir_print(&p, d.a, XP_LHS) + o + ir_args(&p, n) + ")"
+    if k == X_NEW:
+        c = ir_print(&p, d.a, XP_LHS)
+        if ir_has_call(&p, d.a):
+            c = "(" + c + ")"                    # new (f())(): the callee isn't called
+        if d.f & XF_NOARGS != 0:
+            return "new " + c
+        return "new " + c + "(" + ir_args(&p, n) + ")"
+    if k == X_TAG:
+        return ir_print(&p, d.a, XP_LHS) + p.out[d.oa..d.ob].trim()
+    if k == X_SPREAD:
+        return "..." + ir_print(&p, d.a, XP_ASSIGN)
+    if k == X_UPDATE:
+        if d.f & XF_PREFIX != 0:
+            return ir_s(&p, n) + ir_print(&p, d.a, XP_UNARY)
+        return ir_print(&p, d.a, XP_LHS) + ir_s(&p, n)
+    if k == X_UNARY:
+        x = ir_print(&p, d.a, XP_UNARY)
+        op = ir_s(&p, n)
+        if d.f & XF_WORD != 0:
+            return op + " " + x
+        if (op == "-" and x.starts_with("-")) or (op == "+" and x.starts_with("+")):
+            return op + " " + x                  # - -x, + +x
+        return op + x
+    if k == X_BINARY:
+        op = ir_s(&p, n)
+        pr = binop_prec(op)
+        lmin = pr
+        rmin = pr + 1
+        if op == "**":
+            lmin = XP_POW + 1                    # right to left; a unary left needs parentheses
+            rmin = XP_POW
+        l = ir_print(&p, d.a, lmin)
+        r = ir_print(&p, d.b, rmin)
+        if op == "??" or op == "||" or op == "&&":
+            l = ir_mixed(&p, d.a, op, l)         # ?? doesn't mix with || / && unparenthesized
+            r = ir_mixed(&p, d.b, op, r)
+        return l + " " + op + " " + r
+    if k == X_COND:
+        return ir_print(&p, d.a, XP_NULLISH) + " ? " + ir_print(&p, d.b, XP_ASSIGN) + " : " + ir_print(&p, d.c, XP_ASSIGN)
+    if k == X_ASSIGN:
+        return ir_print(&p, d.a, XP_LHS) + " " + ir_s(&p, n) + " " + ir_print(&p, d.b, XP_ASSIGN)
+    if k == X_SEQ:
+        parts: [str] = []
+        for i in 0..d.kn:
+            kid = p.ir_kids[d.k0 + i]
+            parts.push(ir_print(&p, kid, XP_ASSIGN))
+        return ", ".join(parts)
+    if k == X_PAREN:
+        return "(" + ir_print(&p, d.a, XP_SEQ) + ")"
+    if k == X_GROUP:
+        return ir_text(&p, d.a)
+    if k == X_PRIVNAME:
+        return ir_s(&p, n)
+    if k == X_YIELD:
+        if d.f & XF_AWAIT != 0:
+            return "yield __await(" + ir_print(&p, d.a, XP_ASSIGN) + ")"
+        return "yield " + ir_print(&p, d.a, XP_ASSIGN)
+    return ""
+
+fn opt_dot(f: int) str:
+    if f & XF_OPT != 0:
+        return "?."
+    return "."
+
+fn ir_args(p: mut P, n: int) str:
+    d = p.ir[n]
+    parts: [str] = []
+    for i in 0..d.kn:
+        kid = p.ir_kids[d.k0 + i]
+        parts.push(ir_print(&p, kid, XP_ASSIGN))
+    return ", ".join(parts)
+
+fn ir_mixed(p: mut P, n: int, op: str, t: str) str:
+    d = p.ir[n]
+    if d.k != X_BINARY or t.starts_with("("):
+        return t
+    s = ir_s(&p, n)
+    if (op == "??" and (s == "||" or s == "&&")) or ((op == "||" or op == "&&") and s == "??"):
+        return "(" + t + ")"
+    return t
+
+# Does a callee contain a call (not inside parentheses)? `new` would take it as its own.
+fn ir_has_call(p: mut P, n: int) bool:
+    d = p.ir[n]
+    if d.k == X_CALL:
+        return true
+    if d.k == X_DOT or d.k == X_INDEX or d.k == X_PRIV or d.k == X_TAG:
+        return ir_has_call(&p, d.a)
+    return false
+
+# ---- the parser: the token-copying parser's expression levels, building nodes
+
+fn ir_expr(p: mut P, no_in: bool) int:
+    n = ir_assign(&p, no_in)
+    if not at_op(&p, 44):
+        return n
+    xs: [int] = [n]
+    while eat_op(&p, 44):
+        xs.push(ir_assign(&p, no_in))
+    return ir_list(&p, X_SEQ, -1, xs, 0)
+
+# A leaf written by the token-copying parser: its output span.
+fn ir_span_begin(p: mut P) int:
+    emit_ts(&p)
+    return len(p.out)
+
+fn ir_span_end(p: mut P, k: int, oa: int, prec: int) int:
+    emit_pe(&p)
+    return ir_leaf(&p, k, oa, len(p.out), prec)
+
+# The forms the token-copying parser writes itself (arrows, yield, some patterns): a leaf.
+fn ir_assign(p: mut P, no_in: bool) int:
+    if ir_leaf_assign(&p):
+        oa = ir_span_begin(&p)
+        p.ir_skip = true                         # (this assign() is the old parser's)
+        assign(&p, no_in)
+        return ir_span_end(&p, X_RAW, oa, XP_ASSIGN)
+    n = ir_conditional(&p, no_in)
+    if p.tok == T_OP:
+        if p.op == 61 or p.op == O_ASSIGN:
+            sa = p.ts
+            sb = p.te
+            if p.op == O_ASSIGN and p.target < 2021 and (p.src.byte(sa) == 38 or p.src.byte(sa) == 124 or p.src.byte(sa) == 63) and sb - sa == 3:
+                p.ir_need = true                 # ||= &&= ??=
+            if p.op == O_ASSIGN and p.target < 2016 and sb - sa == 3 and p.src.byte(sa) == 42 and p.src.byte(sa + 1) == 42:
+                p.ir_need = true                 # **=
+            next(&p)
+            v = ir_assign(&p, no_in)
+            return ir_node(&p, X_ASSIGN, n, v, -1, 0, sa, sb)
+        if p.op == 62:
+            w = 0
+            op = gt_op(&p, &w)
+            if op == O_ASSIGN:                   # >>= >>>= (lexed as >)
+                sa = p.ts
+                take_gt(&p, w)
+                next(&p)
+                v = ir_assign(&p, no_in)
+                return ir_node(&p, X_ASSIGN, n, v, -1, 0, sa, sa + w)
+    return n
+
+# At an assignment expression: one the token-copying parser writes as a whole?
+fn ir_leaf_assign(p: mut P) bool:
+    if p.tok == T_NAME:
+        if p.kw == K_ASYNC:
+            k = peek_tok(&p)
+            if not k.nlb and ((k.tok == T_NAME and k.kw != K_FUNCTION) or (k.tok == T_OP and (k.op == 40 or k.op == 60))):
+                return true                      # (maybe an async arrow: assign() decides)
+        if p.kw == K_YIELD and p.in_gen > 0:
+            return true
+        if p.kw == 0 or p.kw > K_WITH:
+            k = peek_tok(&p)
+            if k.tok == T_OP and k.op == O_ARROW and not k.nlb:
+                return true
+        return false
+    if p.tok == T_OP:
+        o = p.op
+        if (o == 40 or o == 60) and is_arrow_ahead(&p):
+            return true
+        if (o == 123 or o == 91) and p.priv_low and len(p.privs) > 0 and not p.ppat and priv_pattern_ahead(&p):
+            return true                          # #private targets in a destructuring assignment
+        if (o == 123 or o == 91) and p.target < 2018 and ir_pattern_ahead(&p):
+            return true                          # a destructuring assignment with rest lowered
+    return false
+
+# At "{" / "[": a destructuring assignment's pattern (followed by `=`)?
+fn ir_pattern_ahead(p: mut P) bool:
+    s = save(&p)
+    p.mute += 1
+    skip_group(&p)
+    r = at_op(&p, 61) and not p.bad
+    p.mute -= 1
+    restore(&p, s)
+    p.bad = false
+    return r
+
+fn ir_conditional(p: mut P, no_in: bool) int:
+    st = p.ts
+    n = ir_binary(&p, 0, no_in)
+    if not at_op(&p, 63):
+        return n
+    restricted = st == p.cond_at
+    next(&p)
+    ca = p.cond_at
+    p.cond_at = p.ts
+    a = ir_assign(&p, false)
+    p.cond_at = ca
+    expect_op(&p, 58)
+    if restricted:
+        p.cond_at = p.ts
+    b = ir_assign(&p, no_in)
+    return ir_node(&p, X_COND, n, a, b, 0, 0, 0)
+
+# The width of the binary operator at the current token, or 0 (`>`-led ones are lexed one `>` at a time).
+fn ir_binop(p: mut P, no_in: bool) int:
+    if p.tok == T_OP:
+        o = p.op
+        if o == 62:
+            w = 0
+            op = gt_op(&p, &w)
+            if op == O_ASSIGN:
+                return 0
+            return w
+        if is_binop(o):
+            return p.te - p.ts
+        return 0
+    if p.tok == T_NAME:
+        if p.kw == K_INSTANCEOF:
+            return 10
+        if p.kw == K_IN and not no_in:
+            return 2
+    return 0
+
+fn ir_is_lhs(p: mut P, n: int) bool:
+    k = p.ir[n].k
+    return k == X_NAME or k == X_THIS or k == X_SUPER or k == X_DOT or k == X_INDEX or k == X_PRIV or k == X_CALL or k == X_NEW or k == X_TAG or k == X_PAREN or k == X_GROUP or (k == X_RAW and p.ir[n].f >> 8 >= XP_LHS)
+
+# Precedence climbing: operators binding tighter than `min`.
+fn ir_binary(p: mut P, min: int, no_in: bool) int:
+    left = ir_unary(&p)
+    ops = 0
+    while true:
+        if p.tok == T_NAME and (p.kw == K_AS or p.kw == K_SATISFIES) and not p.nlb:
+            if XP_REL <= min:
+                return left
+            if p.mute == 0:
+                p.ts_syntax += 1
+            emit_pe(&p)                          # x as T: the type goes
+            next(&p)
+            if at_kw(&p, K_CONST):
+                next(&p)
+            else:
+                p.bad = false
+                parse_type(&p)
+                if p.bad:
+                    fail(&p, "bad type after as")
+            skip_pe(&p)
+            p.assert_end = p.pe                  # (as the token-copying parser marks it)
+            p.assert_lhs = ops == 0 and ir_is_lhs(&p, left)
+            p.ir_asserted = left                 # ((x as T)): the parentheses go (ir_primary)
+            p.ir[left].f = p.ir[left].f | XF_ASSERT
+            continue
+        w = ir_binop(&p, no_in)
+        if w == 0:
+            return left
+        sa = p.ts
+        op = p.src[sa..sa + w]
+        pr = binop_prec(op)
+        if pr <= min and not (op == "**" and pr == min):
+            return left
+        if (op == "??" and p.target < 2020) or (op == "**" and p.target < 2016):
+            p.ir_need = true
+        if p.tok == T_OP and p.op == 62:
+            take_gt(&p, w)
+        next(&p)
+        rmin = pr
+        if op == "**":
+            rmin = pr - 1                        # right to left
+        right = ir_binary(&p, rmin, no_in)
+        left = ir_node(&p, X_BINARY, left, right, -1, 0, sa, sa + w)
+        ops += 1
+    return left
+
+# Is name leaf n a variable an export list exports (B_XLIST, or a re-exported `export let x`: H_XALIAS)?
+fn xlist_name(p: mut P, n: int) bool:
+    nm = ir_leaf_text(&p, n)
+    k = find_bind_name(&p, nm)
+    if k >= 0 and p.binds[k].kind == B_EXPORT and p.has_xalias:
+        return hint_repl(p.hints, nm, H_XALIAS) != "\x00"
+    return k >= 0 and p.binds[k].kind == B_XLIST
+
+fn ir_unary(p: mut P) int:
+    if p.tok == T_OP:
+        o = p.op
+        if o == O_INC or o == O_DEC or o == 33 or o == 126 or o == 43 or o == 45:
+            sa = p.ts
+            sb = p.te
+            next(&p)
+            a = ir_unary(&p)
+            if o == O_INC or o == O_DEC:
+                if p.ir[a].k == X_NAME and p.mute == 0 and xlist_name(&p, a):
+                    p.ir_need = true             # (++x re-exported: irlower writes exports.x = ++x)
+                return ir_node(&p, X_UPDATE, a, -1, -1, XF_PREFIX, sa, sb)
+            return ir_node(&p, X_UNARY, a, -1, -1, 0, sa, sb)
+        if o == 60 and not p.tsx:                    # <T>expr: the type goes
+            emit_ts(&p)
+            next(&p)
+            p.bad = false
+            parse_type(&p)
+            if not at_op(&p, 62):
+                fail(&p, "bad type assertion")
+            next(&p)
+            skip_pe(&p)
+            x = ir_unary(&p)
+            p.assert_end = p.pe
+            p.assert_lhs = ir_is_lhs(&p, x)
+            p.ir_asserted = x
+            return x
+    elif p.tok == T_NAME:
+        k = p.kw
+        if k == K_TYPEOF or k == K_VOID or k == K_DELETE:
+            sa = p.ts
+            sb = p.te
+            next(&p)
+            a = ir_unary(&p)
+            return ir_node(&p, X_UNARY, a, -1, -1, XF_WORD, sa, sb)
+        if k == K_AWAIT:
+            n = peek_tok(&p)
+            if not n.nlb or p.in_async > 0:
+                if not (n.tok == T_OP and (n.op == 41 or n.op == 44 or n.op == 59 or n.op == 61 or n.op == 58 or n.op == 93 or n.op == 125 or n.op == O_ARROW or n.op == 46)) and n.tok != T_EOF:
+                    if len(p.aw) > 0 and async_top(&p) >= 0:
+                        next(&p)                 # below ES2017: yield (lower.tn await_to_yield)
+                        a = ir_unary(&p)
+                        f = 0
+                        if in_agen(&p):
+                            agen_req(&p, H_AWAIT)
+                            f = XF_AWAIT
+                        p.ir_need = true
+                        return ir_node(&p, X_YIELD, a, -1, -1, f, 0, 0)
+                    sa = p.ts
+                    sb = p.te
+                    next(&p)
+                    a = ir_unary(&p)
+                    return ir_node(&p, X_UNARY, a, -1, -1, XF_WORD, sa, sb)
+    n = ir_lhs(&p)
+    if p.tok == T_OP and (p.op == O_INC or p.op == O_DEC) and not p.nlb:
+        sa = p.ts
+        sb = p.te
+        next(&p)
+        return ir_node(&p, X_UPDATE, n, -1, -1, 0, sa, sb)
+    return n
+
+# A primary expression, then its member accesses, calls and templates.
+fn ir_lhs(p: mut P) int:
+    n = -1
+    if at_kw(&p, K_NEW):
+        n = ir_new(&p)
+    else:
+        n = ir_primary(&p)
+    return ir_tail(&p, n)
+
+fn ir_primary(p: mut P) int:
+    if p.tok == T_OP and p.op == 40:             # (e) (arrow functions were taken by ir_assign)
+        emit_ts(&p)
+        opos = len(p.out)
+        next(&p)
+        p.ir_asserted = -1
+        nw = p.no_wrap
+        p.no_wrap = false                        # (new (f().C)(): f is called as it is written)
+        a = ir_expr(&p, false)
+        p.no_wrap = nw
+        asserted = p.ir_asserted == a
+        if at_op(&p, 41) and p.assert_end == p.pe and p.assert_lhs and p.mute == 0:
+            # the token-copying parser drops parentheses around a type assertion before `?.`
+            nt = peek_tok(&p)
+            if nt.tok == T_OP and nt.op == O_QDOT and len(p.out) > opos and p.out.byte(opos) == 40:
+                j = opos + 1
+                while j < len(p.out) and (p.out.byte(j) == 32 or p.out.byte(j) == 9 or p.out.byte(j) == 10 or p.out.byte(j) == 13):
+                    j += 1
+                ir_shift(&p, opos, j - opos)     # (the leaves after it move back)
+                p.out = p.out[..opos] + p.out[j..]
+                emit_ts(&p)
+                skip_te(&p)
+        expect_op(&p, 41)
+        if asserted:                             # parentheses around a type assertion: tsc drops
+            p.ir_asserted = -1                   # them (the printer adds what precedence needs)
+            return ir_node(&p, X_GROUP, a, -1, -1, 0, 0, 0)
+        return ir_node(&p, X_PAREN, a, -1, -1, 0, 0, 0)
+    if p.tok == T_PRIV and p.priv_low and len(p.privs) > 0 and peek_tok(&p).kw == K_IN and priv_find(&p, p.src[p.ts + 1..p.te], false)[0] >= 0:
+        sa = p.ts                                # #x in o: lowered (irlower.tn pv_in)
+        sb = p.te
+        next(&p)
+        p.ir_need = true
+        return ir_node(&p, X_PRIVNAME, -1, -1, -1, 0, sa, sb)
+    if p.tok == T_NAME and p.kw == K_SUPER and p.st_on and p.st_kind != ST_DECORATED and p.mute == 0 and not (len(p.aw) > 0 and async_top(&p) >= 0):
+        nt = peek_tok(&p)
+        if nt.tok == T_OP and (nt.op == 46 or nt.op == 91):
+            if p.st_super == "":
+                static_super_hint(&p)            # (the class learns it needs temps: parsed again)
+            else:
+                oa = ir_span_begin(&p)           # super.x in a lowered static (irlower.tn ss_*)
+                next(&p)
+                n = ir_span_end(&p, X_SUPER, oa, XP_PRIMARY)
+                p.ir[n].f = p.ir[n].f | XF_STATIC
+                p.ir_need = true
+                return n
+    oa = ir_span_begin(&p)
+    kind = X_RAW
+    if p.tok == T_NAME and (p.kw == 0 or p.kw > K_WITH) and not (p.kw == K_ASYNC and peek_tok(&p).kw == K_FUNCTION):
+        kind = X_NAME
+    elif p.tok == T_NAME and p.kw == K_THIS and not (len(p.aw) > 0 and async_top(&p) >= 0) and not p.st_on:
+        kind = X_THIS
+    elif p.tok == T_NAME and p.kw == K_SUPER and not p.st_on and not (len(p.aw) > 0 and async_top(&p) >= 0):
+        kind = X_SUPER
+    primary(&p)
+    n = ir_span_end(&p, kind, oa, XP_PRIMARY)
+    if kind == X_NAME and not simple_copy(p.out[oa..len(p.out)].trim()):
+        p.ir[n].k = X_RAW                        # (a name the module transform rewrote: mod_1.x)
+    return n
+
+# At a #name after `.`: a root with a lowered #private access needs lowering.
+fn ir_priv_need(p: mut P):
+    if p.priv_low and len(p.privs) > 0 and priv_find(&p, p.src[p.ts + 1..p.te], false)[0] >= 0:
+        p.ir_need = true
+
+# Moves the current root's leaves at or after output offset `at` by -d (not an enclosing root's).
+fn ir_shift(p: mut P, at: int, d: int):
+    for i in p.ir_base..len(p.ir):
+        if p.ir[i].f & XF_GEN == 0 and p.ir[i].oa >= at and (p.ir[i].k == X_RAW or p.ir[i].k == X_NAME or p.ir[i].k == X_THIS or p.ir[i].k == X_SUPER or p.ir[i].k == X_TAG):
+            p.ir[i].oa -= d
+            p.ir[i].ob -= d
+
+fn ir_new(p: mut P) int:
+    oa = ir_span_begin(&p)
+    next(&p)                                     # new
+    if at_op(&p, 46):                            # new.target
+        next(&p)
+        next(&p)
+        return ir_span_end(&p, X_RAW, oa, XP_PRIMARY)
+    c = -1
+    if at_kw(&p, K_NEW):
+        c = ir_new(&p)
+    else:
+        w = p.no_wrap
+        p.no_wrap = true
+        c = ir_primary(&p)
+        p.no_wrap = w
+    while true:                                  # the callee: members (no calls)
+        if at_op(&p, 46):
+            next(&p)
+            sa = p.ts
+            sb = p.te
+            if p.tok == T_PRIV:
+                ir_priv_need(&p)
+                next(&p)
+                c = ir_node(&p, X_PRIV, c, -1, -1, 0, sa, sb)
+            else:
+                next(&p)
+                c = ir_node(&p, X_DOT, c, -1, -1, 0, sa, sb)
+        elif at_op(&p, 91):
+            next(&p)
+            k = ir_expr(&p, false)
+            expect_op(&p, 93)
+            c = ir_node(&p, X_INDEX, c, k, -1, 0, 0, 0)
+        elif at_op(&p, 60) and try_type_args(&p):
+            pass
+        elif p.tok == T_TPL or p.tok == T_TPL_HEAD:
+            ta = ir_span_begin(&p)
+            template(&p)
+            emit_pe(&p)
+            c = ir_node(&p, X_TAG, c, -1, -1, 0, 0, 0)
+            p.ir[c].oa = ta
+            p.ir[c].ob = len(p.out)
+        else:
+            break
+    if not at_op(&p, 40):
+        return ir_node(&p, X_NEW, c, -1, -1, XF_NOARGS, 0, 0)
+    xs = ir_call_args(&p)
+    return ir_list(&p, X_NEW, c, xs, 0)
+
+fn ir_call_args(p: mut P) [int]:
+    next(&p)                                     # (
+    xs: [int] = []
+    while not at_op(&p, 41) and p.tok != T_EOF:
+        if eat_op(&p, O_DOTS):
+            xs.push(ir_node(&p, X_SPREAD, ir_assign(&p, false), -1, -1, 0, 0, 0))
+        else:
+            xs.push(ir_assign(&p, false))
+        if not eat_op(&p, 44):
+            break
+    expect_op(&p, 41)
+    return xs
+
+fn ir_tail(p: mut P, n0: int) int:
+    n = n0
+    while true:
+        if p.tok == T_OP:
+            o = p.op
+            if o == 46:
+                next(&p)
+                sa = p.ts
+                sb = p.te
+                k = X_DOT
+                if p.tok == T_PRIV:
+                    k = X_PRIV
+                    ir_priv_need(&p)
+                next(&p)
+                n = ir_node(&p, k, n, -1, -1, 0, sa, sb)
+                continue
+            if o == O_QDOT:
+                if p.target < 2020:
+                    p.ir_need = true
+                next(&p)
+                if at_op(&p, 60):
+                    if not try_type_args(&p):        # a?.<T>(): the type arguments go
+                        fail(&p, "bad ?.<")
+                if at_op(&p, 40):
+                    xs = ir_call_args(&p)
+                    n = ir_list(&p, X_CALL, n, xs, XF_OPT)
+                elif at_op(&p, 91):
+                    next(&p)
+                    k = ir_expr(&p, false)
+                    expect_op(&p, 93)
+                    n = ir_node(&p, X_INDEX, n, k, -1, XF_OPT, 0, 0)
+                else:
+                    sa = p.ts
+                    sb = p.te
+                    kk = X_DOT
+                    if p.tok == T_PRIV:
+                        kk = X_PRIV
+                        ir_priv_need(&p)
+                    next(&p)
+                    n = ir_node(&p, kk, n, -1, -1, XF_OPT, sa, sb)
+                continue
+            if o == 91:
+                next(&p)
+                k = ir_expr(&p, false)
+                expect_op(&p, 93)
+                n = ir_node(&p, X_INDEX, n, k, -1, 0, 0, 0)
+                continue
+            if o == 40:
+                xs = ir_call_args(&p)
+                n = ir_list(&p, X_CALL, n, xs, 0)
+                continue
+            if o == 33 and not p.nlb and p.mute == 0:
+                p.ts_syntax += 1
+            if o == 33 and not p.nlb:               # x!: the assertion goes
+                emit_ts(&p)
+                skip_te(&p)
+                next(&p)
+                p.assert_end = p.pe
+                p.assert_lhs = true
+                p.ir_asserted = n
+                p.ir[n].f = p.ir[n].f | XF_ASSERT
+                continue
+            if o == 60 or o == O_SHL:
+                if o == 60 and try_type_args(&p):
+                    kk = p.ir[n].k
+                    if not at_op(&p, 40) and p.tok != T_TPL and p.tok != T_TPL_HEAD and (kk == X_NAME or kk == X_DOT or kk == X_INDEX or kk == X_RAW):
+                        p.ir[n].c = -2           # f<T> alone (an instantiation expression): not a name
+                    continue
+                if o == O_SHL and try_shl_type_args(&p):
+                    continue
+                break
+            break
+        if p.tok == T_TPL or p.tok == T_TPL_HEAD:
+            ta = ir_span_begin(&p)
+            template(&p)
+            emit_pe(&p)
+            n = ir_node(&p, X_TAG, n, -1, -1, 0, 0, 0)
+            p.ir[n].oa = ta
+            p.ir[n].ob = len(p.out)
+            continue
+        break
+    return n
+
+# ---- roots
+
+# assign() at a root expression below ES2022: parsed (and written) as usual, into a tree;
+# lowered and written again only when it needs to be.
+fn ir_root(p: mut P, no_in: bool):
+    ir_root_at(&p, no_in, false)
+
+# The same for a left-hand-side expression (a class's heritage, a for-await target).
+fn ir_root_lhs(p: mut P):
+    ir_root_at(&p, false, true)
+
+fn ir_root_at(p: mut P, no_in: bool, lhs_only: bool):
+    base = len(p.ir)
+    kbase = len(p.ir_kids)
+    sbase = len(p.ir_strs)
+    asserted = p.ir_asserted                     # (a nested root's node numbers are reused after it)
+    need = p.ir_need
+    obase = p.ir_base
+    p.ir_base = base
+    p.ir_asserted = -1
+    p.ir_need = false
+    emit_ts(&p)
+    start = p.ts
+    ostart = len(p.out)
+    n = -1
+    if lhs_only:
+        n = ir_lhs(&p)
+    else:
+        n = ir_assign(&p, no_in)
+    if p.ppat and p.priv_low and len(p.privs) > 0 and ir_pattern_target(&p, n):
+        p.ir_need = true                         # (a #private target in a destructuring pattern)
+    super_tgt = p.ir_need and ss_pattern_target(&p, n) and super_target_ahead(&p)
+    if p.ir_need:
+        emit_pe(&p)
+        unused = ir_unused(&p, start)
+        if p.ppat and ir_pattern_target(&p, n):
+            n = ir_setter_target(&p, n)          # [this.#x] = v, { a: this.#x = 1 } = o
+        elif super_tgt:
+            n = ss_setter_target(&p, n)          # [super.x] = v in a lowered static
+        else:
+            n = ir_lower(&p, n, unused)
+        t = ir_print(&p, n, XP_ASSIGN)
+        if p.src.byte(start) == 40 and not t.starts_with("(") and (t.starts_with("{") or t.starts_with("function") or t.starts_with("class") or t.starts_with("async function")):
+            t = "(" + t + ")"                    # (({ } satisfies T)): what it starts with needs them
+        p.out = p.out[..ostart] + t
+    while len(p.ir) > base:
+        p.ir.pop()
+    while len(p.ir_kids) > kbase:
+        p.ir_kids.pop()
+    while len(p.ir_strs) > sbase:
+        p.ir_strs.pop()
+    p.ir_asserted = asserted
+    p.ir_need = need
+    p.ir_base = obase
+
+# In a destructuring pattern (p.ppat): is the root a #private target, or one with a default?
+fn ir_pattern_target(p: mut P, n: int) bool:
+    t = n
+    if p.ir[t].k == X_ASSIGN and ir_s(&p, t) == "=":
+        t = p.ir[t].a
+    if not priv_lowered(&p, unparen(&p, t)):
+        return false
+    return at_op(&p, 44) or at_op(&p, 125) or at_op(&p, 93) or at_op(&p, 61) or at_op(&p, 41)
+
+# A #private target in a pattern: a setter object, its receiver in a temp (`this` there is the object):
+#   [this.#x] = v -> (_a = this, [({ set value(_b) { __classPrivateFieldSet(_a, ...); } }).value] = v)
+fn ir_setter_target(p: mut P, n: int) int:
+    t = n
+    dflt = -1
+    if p.ir[t].k == X_ASSIGN:
+        tb = p.ir[t].b
+        dflt = lw(&p, tb, false)
+        t = p.ir[t].a
+    pn = unparen(&p, t)
+    recv = lw(&p, ir_a(&p, pn), false)
+    rt = ir_print(&p, recv, XP_LHS)
+    r = rt
+    if rt == "this" or not simple_copy(rt):
+        r = parse_temp(&p)
+        p.ppat_pre.push(r + " = " + rt)
+    v = fresh_temp(&p)
+    s = "({ set value(" + v + ") { " + pv_set(&p, pn, r, v) + "; } }).value"
+    if dflt >= 0:
+        s += " = " + ir_print(&p, dflt, XP_ASSIGN)
+    return ir_raw(&p, s, XP_ASSIGN)
+
+# Is a root's value unused (an expression statement)?
+fn ir_unused(p: mut P, start: int) bool:
+    n = -1
+    if p.expr_stmt >= 0 and p.expr_stmt <= start:
+        n = 0
+        for k in p.expr_stmt..start:
+            c = p.src.byte(k)
+            if c == 40:
+                n += 1
+            elif not (c == 32 or c == 9 or c == 10 or c == 13):
+                n = -1
+                break
+    if n < 0:
+        if p.for_inc and at_op(&p, 41):          # for (...; ...; this.#x++)
+            k = back_space(p.src, start)
+            return k >= 0 and p.src.byte(k) == 59
+        return false
+    s = save(&p)
+    p.mute += 1
+    while n > 0 and at_op(&p, 41):
+        next(&p)
+        n -= 1
+    r = n == 0 and (p.tok == T_EOF or p.nlb or at_op(&p, 59) or at_op(&p, 125))
+    p.mute -= 1
+    restore(&p, s)
+    return r

@@ -1,0 +1,1273 @@
+import math
+
+# Enums and namespaces become IIFEs over a variable, as tsc emits them.
+
+struct EV:
+    kind: int           # 0 not constant, 1 number, 2 string
+    num: float
+    s: str
+
+fn ev_none() EV:
+    return EV(0, 0.0, "")
+
+fn js_number(x: float) str:
+    if x != x:
+        return "NaN"
+    if x > 1.7976931348623157e308:
+        return "Infinity"
+    if x < -1.7976931348623157e308:
+        return "-Infinity"
+    if x < 9e18 and x > -9e18 and x == float(int(x)):       # (int() only holds 64 bits)
+        return str(int(x))
+    if x == math.floor(x) and x < 1e21 and x > -1e21:
+        return int_text(x)
+    return str(x)
+
+# An integer-valued float beyond 64 bits (below 1e21), in digits.
+fn int_text(x: float) str:
+    neg = x < 0.0
+    v = x
+    if neg:
+        v = -x
+    hi = math.floor(v / 1e9)
+    lo = int(v - hi * 1e9)
+    t = str(lo)
+    while len(t) < 9:
+        t = "0" + t
+    t = str(int(hi)) + t
+    if neg:
+        return "-" + t
+    return t
+
+# JavaScript's % (fmod, exact, the sign of x): NaN as 0/0 for an infinite x.
+fn js_mod(x: float, y: float) float:
+    if x != x or y != y or x > 1.7976931348623157e308 or x < -1.7976931348623157e308:
+        return 0.0 / 0.0
+    m = y
+    if m < 0.0:
+        m = -m
+    if m > 1.7976931348623157e308:
+        return x
+    r = x
+    if r < 0.0:
+        r = -r
+    while r >= m:                                # take the largest m * 2^k from r (exact)
+        d = m
+        while d <= r / 2.0:
+            d = d * 2.0
+        r = r - d
+    if x < 0.0:
+        return -r
+    return r
+
+# ECMAScript's ToUint32: the integer part modulo 2^32 (any size).
+fn to_u32(x: float) int:
+    if x != x or x > 1.7976931348623157e308 or x < -1.7976931348623157e308:
+        return 0
+    t = x
+    if t < 0.0:
+        t = math.ceil(t)
+    else:
+        t = math.floor(t)
+    q = math.floor(t / 4294967296.0)             # (exact: dividing by a power of 2)
+    return int(t - q * 4294967296.0)
+
+fn to_i32(x: float) int:
+    v = to_u32(x)
+    if v >= 0x80000000:
+        v -= 0x100000000
+    return v
+
+# At the top level of CommonJS, an enum or namespace exported by a list or a merged declaration is
+# exported inside its IIFE: `E || (exports.E = E = {})`. A marker decided at the end ("" if not exported).
+fn fold_marker(p: mut P, name: str) str:
+    if p.esm or p.ns_name != "" or len(p.sc_start) > 0:
+        return ""
+    if not p.has_export_list and not (name in p.ns_xdecl):
+        return ""
+    p.ns_folded[name] = true
+    p.markers = true
+    return "\x00N" + name + "\x00"
+
+# `var E;` at the top level, `let E;` in a namespace or function, nothing if the name is already declared.
+fn mark_declared(p: mut P, name: str):
+    key = name
+    if len(p.sc_start) > 0:
+        key = name + "@" + str(p.sc_start[len(p.sc_start) - 1])
+    p.ns_decl[key] = true
+
+fn decl_keyword(p: mut P, name: str) str:
+    key = name
+    if len(p.sc_start) > 0:
+        key = name + "@" + str(p.sc_start[len(p.sc_start) - 1])
+    if (key in p.ns_decl):
+        return ""
+    p.ns_decl[key] = true
+    if len(p.sc_start) == 0 or p.embed_var:
+        return "var " + name + ";\n"
+    return "let " + name + ";\n"
+
+fn enum_decl(p: mut P, export_arg: str):
+    export_prefix = export_arg
+    start = p.ts
+    emit_to(&p, start)
+    next(&p)                                     # enum
+    name = tok_text(&p)
+    declare_tok(&p, false)                       # (it shadows an import of the name)
+    next(&p)
+    p.locals[name] = 3
+    expect_op(&p, 123)
+    lines = ""
+    auto = 0.0
+    auto_ok = true
+    has_num = false
+    has_str = false
+    bind_base = len(p.binds)
+    so_cur = p.enum_cur                          # (a member not declared yet reads as 0: ev_*)
+    so_at = p.enum_body_at
+    so_names = p.enum_later
+    p.enum_cur = name
+    p.enum_body_at = save(&p)
+    p.enum_later = []
+    p.enum_later_done = false
+    so_seen = p.enum_seen
+    p.enum_seen = []
+    while not at_op(&p, 125) and p.tok != T_EOF and p.err == "":
+        mname = ""
+        if p.tok == T_STR:
+            mname = decode_string(tok_text(&p))
+            next(&p)
+        elif at_op(&p, 91):
+            next(&p)
+            mname = decode_string(tok_text(&p))
+            next(&p)
+            expect_op(&p, 93)
+        else:
+            mname = tok_text(&p)
+            next(&p)
+        key = json_quote(mname)
+        if is_ident_name(mname):
+            add_bind(&p, mname, B_ENUM, name + "." + mname, -1)   # (A = A: itself is E.A)
+        p.enum_member = mname
+        p.enum_seen.push(mname)
+        if at_op(&p, 61):
+            next(&p)
+            s = save(&p)
+            v = eval_const(&p, name)
+            if v.kind != 0 and (at_op(&p, 44) or at_op(&p, 125)):
+                if v.kind == 1:
+                    lines += f"    {name}[{name}[{key}] = {js_number(v.num)}] = {key};\n"
+                    auto = v.num + 1.0
+                    auto_ok = true
+                    has_num = true
+                else:
+                    lines += f"    {name}[{key}] = {json_quote(v.s)};\n"
+                    auto_ok = false
+                    has_str = true
+                set_enum_val(&p, name, mname, v)
+            else:
+                restore(&p, s)
+                is_str = init_is_string(&p, name)
+                skip_ts(&p)
+                saved = begin_capture(&p)
+                assign(&p, false)
+                emit_pe(&p)
+                text = end_capture(&p, saved)
+                if is_str:
+                    lines += f"    {name}[{key}] = {text.trim()};\n"     # a string: no reverse mapping
+                    has_str = true
+                    p.enum_strs[name + "." + mname] = true
+                else:
+                    lines += f"    {name}[{name}[{key}] = {text.trim()}] = {key};\n"
+                    has_num = true
+                auto_ok = false
+        else:
+            if auto_ok:
+                lines += f"    {name}[{name}[{key}] = {js_number(auto)}] = {key};\n"
+                set_enum_val(&p, name, mname, EV(1, auto, ""))
+                auto += 1.0
+            else:
+                lines += f"    {name}[{name}[{key}] = void 0] = {key};\n"
+            has_num = true
+        if not eat_op(&p, 44):
+            break
+    deactivate_from(&p, bind_base)
+    p.enum_cur = so_cur
+    p.enum_body_at = so_at
+    p.enum_later = so_names
+    p.enum_later_done = true
+    p.enum_seen = so_seen
+    expect_op(&p, 125)
+    skip_pe(&p)
+    kind = 1
+    if has_str and has_num:
+        kind = 3
+    elif has_str:
+        kind = 2
+    p.enum_kind[name] = kind
+    target = name + " = {}"
+    esm_export = export_prefix == "esm"
+    if esm_export:
+        export_prefix = ""
+        p.esm_kept = true
+    if export_prefix != "":
+        if p.ns_name != "":
+            target = name + " = " + export_prefix + name + " || (" + export_prefix + name + " = {})"
+        else:
+            target = export_prefix + name + " = " + name + " = {}"
+            p.ns_xdecl[name] = true
+            if p.has_export_list:                # (export { E as E1 }: exports.E1 = exports.E = E = {})
+                m = fold_marker(&p, name)
+                if m != "":
+                    target = m + name + " = {}"
+        add_export_name(&p, name)
+    elif not esm_export:
+        target = fold_marker(&p, name) + target
+    arg = name + " || (" + target + ")"
+    if export_prefix != "" and p.ns_name != "":
+        arg = target
+    decl = decl_keyword(&p, name)
+    if esm_export and decl != "":
+        decl = "export " + decl
+    text = decl + "(function (" + name + ") {\n" + lines + "})(" + arg + ");"
+    if p.last_asi and text_continues(text):
+        text = ";" + text
+    put(&p, text)
+    p.last_asi = false
+    slot_marker(&p, name)
+
+# At an enum member's initializer: is it a string by syntax alone (tsc's isSyntacticallyString)?
+fn init_is_string(p: mut P, en: str) bool:
+    s = save(&p)
+    p.mute += 1
+    any_str = false
+    only_plus = true
+    operand = true                               # expecting an operand
+    while p.tok != T_EOF and not at_op(&p, 44) and not at_op(&p, 125):
+        if operand:
+            if p.tok == T_STR or p.tok == T_TPL:
+                any_str = true
+                next(&p)
+            elif p.tok == T_TPL_HEAD:
+                any_str = true
+                template(&p)
+            elif at_op(&p, 40):
+                next(&p)
+                if (p.tok == T_STR or p.tok == T_TPL) and peek_tok(&p).tok == T_OP and peek_tok(&p).op == 41:
+                    any_str = true
+                    next(&p)
+                    next(&p)
+                elif p.tok == T_TPL_HEAD:        # (`${x}`)
+                    template(&p)
+                    if not at_op(&p, 41):
+                        only_plus = false
+                        break
+                    any_str = true
+                    next(&p)
+                else:
+                    only_plus = false
+                    break
+            elif p.tok == T_NAME:
+                nm = tok_text(&p)                # a string member of this enum: A, or E.A
+                next(&p)
+                if nm == en and at_op(&p, 46):
+                    next(&p)
+                    nm = tok_text(&p)
+                    next(&p)
+                k = en + "." + nm
+                if (k in p.enum_strs) or ((k in p.enum_vals) and p.enum_vals[k].kind == 2):
+                    any_str = true
+            elif p.tok == T_NUM:
+                next(&p)
+            else:
+                only_plus = false
+                break
+            operand = false
+        elif at_op(&p, 43):
+            next(&p)
+            operand = true
+        else:
+            only_plus = false
+            break
+    p.mute -= 1
+    restore(&p, s)
+    return any_str and only_plus and not operand
+
+fn is_ident_name(s: str) bool:
+    if len(s) == 0 or not is_id_start(s.byte(0)):
+        return false
+    for k in 0..len(s):
+        if not is_id(s.byte(k)):
+            return false
+    return true
+
+fn decode_string(t: str) str:
+    if len(t) < 2:
+        return t
+    inner = t[1..len(t) - 1]
+    if not inner.contains("\\"):
+        return inner
+    out = ""
+    k = 0
+    while k < len(inner):
+        c = inner.byte(k)
+        if c != 92 or k + 1 >= len(inner):
+            out += inner[k..k + 1]
+            k += 1
+            continue
+        d = inner.byte(k + 1)
+        k += 2
+        if d == 110:
+            out += "\n"
+        elif d == 116:
+            out += "\t"
+        elif d == 114:
+            out += "\r"
+        elif d == 98:
+            out += "\x08"
+        elif d == 102:
+            out += "\x0c"
+        elif d == 118:
+            out += "\x0b"
+        elif d == 48 and (k >= len(inner) or not is_digit(inner.byte(k))):
+            out += "\0"
+        elif d == 120 and k + 2 <= len(inner):
+            out += utf8(hex_value(inner[k..k + 2]))
+            k += 2
+        elif d == 117:
+            if k < len(inner) and inner.byte(k) == 123:
+                e = k
+                while e < len(inner) and inner.byte(e) != 125:
+                    e += 1
+                out += utf8(hex_value(inner[k + 1..e]))
+                k = e + 1
+            elif k + 4 <= len(inner):
+                out += utf8(hex_value(inner[k..k + 4]))
+                k += 4
+        elif d == 10:
+            pass
+        elif d == 13:
+            if k < len(inner) and inner.byte(k) == 10:
+                k += 1
+        else:
+            out += inner[k - 1..k]
+    return out
+
+fn hex_value(s: str) int:
+    v = 0
+    for k in 0..len(s):
+        c = s.byte(k) | 32
+        if c >= 48 and c <= 57:
+            v = v * 16 + c - 48
+        elif c >= 97 and c <= 102:
+            v = v * 16 + c - 87
+    return v
+
+fn utf8(cp: int) str:
+    if cp < 0x80:
+        return chr(cp)
+    if cp < 0x800:
+        return chr(0xc0 | (cp >> 6)) + chr(0x80 | (cp & 63))
+    if cp < 0x10000:
+        return chr(0xe0 | (cp >> 12)) + chr(0x80 | ((cp >> 6) & 63)) + chr(0x80 | (cp & 63))
+    return chr(0xf0 | (cp >> 18)) + chr(0x80 | ((cp >> 12) & 63)) + chr(0x80 | ((cp >> 6) & 63)) + chr(0x80 | (cp & 63))
+
+fn number_value(t: str) float:
+    s = t.replace("_", "")
+    if len(s) > 2 and s.byte(0) == 48:
+        c = s.byte(1) | 32
+        base = 0
+        if c == 120:
+            base = 16
+        elif c == 111:
+            base = 8
+        elif c == 98:
+            base = 2
+        if base != 0:
+            v = 0.0
+            for k in 2..len(s):
+                d = s.byte(k) | 32
+                dv = 0
+                if d >= 48 and d <= 57:
+                    dv = d - 48
+                else:
+                    dv = d - 87
+                v = v * float(base) + float(dv)
+            return v
+    return s.to_float(0.0)
+
+# Constant-evaluate an enum initializer; kind 0 when it isn't constant.
+# An enum member's value, also known by its namespaces' path (M.N.E.x) when it's in one.
+fn set_enum_val(p: mut P, name: str, mname: str, v: EV):
+    p.enum_vals[name + "." + mname] = v
+    if len(p.ns_path) > 0:
+        p.enum_vals[".".join(p.ns_path) + "." + name + "." + mname] = v
+
+# A.B.E.x / A.B.E["x"] (`path` so far: A.B): an enum member through any enclosing namespace (M.N.E.x, N.E.x).
+fn ev_path(p: mut P, path0: str) EV:
+    path = path0
+    while at_op(&p, 46):
+        next(&p)
+        if p.tok != T_NAME:
+            return ev_none()
+        path += "." + tok_text(&p)
+        next(&p)
+    if at_op(&p, 91):
+        next(&p)
+        if p.tok != T_STR and not (p.tok == T_TPL and p.src.byte(p.ts) == 96):
+            return ev_none()
+        path += "." + decode_string(tok_text(&p))
+        next(&p)
+        if not at_op(&p, 93):
+            return ev_none()
+        next(&p)
+    j = len(p.ns_path)
+    while j >= 0:
+        key = path
+        if j > 0:
+            key = ".".join(p.ns_path[..j]) + "." + path
+        if (key in p.enum_vals):
+            return p.enum_vals[key]
+        j -= 1
+    return ev_none()
+
+fn eval_const(p: mut P, enum_name: str) EV:
+    return ev_binary(&p, enum_name, 0)
+
+fn prec_of(p: mut P) int:
+    if p.tok != T_OP:
+        return 0
+    o = p.op
+    if o == 124:
+        return 1
+    if o == 94:
+        return 2
+    if o == 38:
+        return 3
+    if o == O_SHL or o == 62:
+        return 4
+    if o == 43 or o == 45:
+        return 5
+    if o == 42 or o == 47 or o == 37:
+        return 6
+    if o == O_POW:
+        return 7
+    return 0
+
+fn ev_binary(p: mut P, e: str, min_prec: int) EV:
+    left = ev_unary(&p, e)
+    while left.kind != 0:
+        pr = prec_of(&p)
+        if pr == 0 or pr <= min_prec and not (pr == 7 and min_prec == 7):
+            break
+        op = p.op
+        if op == 62:
+            w = 0
+            op = gt_op(&p, &w)
+            if op != O_SHR and op != O_USHR:
+                break
+            take_gt(&p, w)
+        next(&p)
+        nmin = pr
+        if pr == 7:
+            nmin = 6
+        right = ev_binary(&p, e, nmin)
+        if right.kind == 0:
+            return ev_none()
+        left = ev_apply(op, left, right)
+    return left
+
+fn ev_apply(op: int, a: EV, b: EV) EV:
+    if op == 43 and (a.kind == 2 or b.kind == 2):
+        return EV(2, 0.0, ev_str(a) + ev_str(b))
+    if a.kind != 1 or b.kind != 1:
+        return ev_none()
+    x = a.num
+    y = b.num
+    if op == 43:
+        return EV(1, x + y, "")
+    if op == 45:
+        return EV(1, x - y, "")
+    if op == 42:
+        return EV(1, x * y, "")
+    if op == 47:
+        if y == 0.0:
+            return ev_none()
+        return EV(1, x / y, "")
+    if op == 37:
+        if y == 0.0:
+            return ev_none()
+        return EV(1, js_mod(x, y), "")
+    if op == O_POW:
+        r = 1.0
+        if not (y >= 0.0 and y <= 1000.0):       # (int() of a huge y would fail)
+            return ev_none()
+        n = int(y)
+        if float(n) != y:
+            return ev_none()
+        for k in 0..n:
+            r *= x
+        return EV(1, r, "")
+    if op == 124:
+        return EV(1, float(to_i32(x) | to_i32(y)), "")
+    if op == 94:
+        return EV(1, float(to_i32(float(to_i32(x) ^ to_i32(y)))), "")
+    if op == 38:
+        return EV(1, float(to_i32(x) & to_i32(y)), "")
+    if op == O_SHL:
+        return EV(1, float(to_i32(float(to_i32(x) << (to_u32(y) & 31)))), "")
+    if op == O_SHR:
+        return EV(1, float(to_i32(x) >> (to_u32(y) & 31)), "")
+    if op == O_USHR:
+        return EV(1, float(to_u32(x) >> (to_u32(y) & 31)), "")
+    return ev_none()
+
+fn ev_str(v: EV) str:
+    if v.kind == 2:
+        return v.s
+    return js_number(v.num)
+
+fn ev_unary(p: mut P, e: str) EV:
+    if p.tok == T_OP:
+        o = p.op
+        if o == 43 or o == 45 or o == 126:
+            next(&p)
+            v = ev_unary(&p, e)
+            if v.kind != 1:
+                return ev_none()
+            if o == 45:
+                return EV(1, -v.num, "")
+            if o == 126:
+                return EV(1, float(to_i32(float(-1 - to_i32(v.num)))), "")
+            return v
+        if o == 40:
+            next(&p)
+            v = ev_binary(&p, e, 0)
+            if not at_op(&p, 41):
+                return ev_none()
+            next(&p)
+            return v
+        return ev_none()
+    if p.tok == T_NUM:
+        t = tok_text(&p)
+        next(&p)
+        if t.byte(len(t) - 1) == 110:
+            return ev_none()
+        return EV(1, number_value(t), "")
+    if p.tok == T_STR:
+        t = tok_text(&p)
+        next(&p)
+        return EV(2, 0.0, decode_string(t))
+    if p.tok == T_TPL:
+        t = tok_text(&p)
+        next(&p)
+        if t.byte(0) == 125:                     # the tail of a template: handled by the caller
+            return EV(2, 0.0, decode_string("`" + t[1..]))
+        return EV(2, 0.0, decode_string(t))
+    if p.tok == T_TPL_HEAD:
+        out = ""
+        while p.tok == T_TPL_HEAD:
+            t = tok_text(&p)
+            if t.byte(0) == 96:
+                out += decode_string(t[..len(t) - 2] + "`")
+            else:
+                out += decode_string("`" + t[1..len(t) - 2] + "`")
+            next(&p)
+            v = ev_binary(&p, e, 0)
+            if v.kind == 0 or not at_op(&p, 125):
+                return ev_none()
+            out += ev_str(v)
+            rescan_tpl(&p)
+        t = tok_text(&p)
+        out += decode_string("`" + t[1..])
+        next(&p)
+        return EV(2, 0.0, out)
+    if p.tok == T_NAME and p.kw == 0 or (p.tok == T_NAME and p.kw > K_WITH):
+        first = tok_text(&p)
+        next(&p)
+        if at_op(&p, 46):
+            next(&p)
+            member = tok_text(&p)
+            next(&p)
+            if at_op(&p, 46) or at_op(&p, 91):
+                return ev_path(&p, first + "." + member)   # (A.B.E.x: a namespace's enum)
+            if (first + "." + member in p.enum_vals):
+                return p.enum_vals[first + "." + member]
+            if first == e and enum_later_member(&p, member):
+                return EV(1, 0.0, "")
+            return ev_none()
+        if at_op(&p, 91):
+            next(&p)
+            plain_tpl = p.tok == T_TPL and p.src.byte(p.ts) == 96   # (E[`a`]: a whole template)
+            if p.tok != T_STR and not plain_tpl:
+                return ev_none()
+            member = decode_string(tok_text(&p))
+            next(&p)
+            if not at_op(&p, 93):
+                return ev_none()
+            next(&p)
+            if (first + "." + member in p.enum_vals):
+                return p.enum_vals[first + "." + member]
+            if first == e and enum_later_member(&p, member):
+                return EV(1, 0.0, "")
+            return ev_none()
+        if (e + "." + first in p.enum_vals):
+            return p.enum_vals[e + "." + first]
+        if enum_later_member(&p, first):
+            return EV(1, 0.0, "")
+        if (first in p.const_vals):
+            return p.const_vals[first]
+        if first == "Infinity":
+            return EV(1, 1e308 * 10.0, "")
+        if first == "NaN":
+            return EV(1, 0.0 / 0.0, "")
+        return ev_none()
+    return ev_none()
+
+# namespace A.B { ... }
+fn namespace_decl(p: mut P, export_arg: str):
+    export_prefix = export_arg
+    start = p.ts
+    emit_to(&p, start)
+    next(&p)                                     # namespace / module
+    if p.tok == T_STR:                           # module "x" { } outside `declare`
+        p.mute += 1
+        next(&p)
+        if at_op(&p, 123):
+            skip_group(&p)
+        p.mute -= 1
+        drop_from(&p, start)
+        return
+    names: [str] = []
+    names.push(tok_text(&p))
+    if len(p.sc_start) == 0 and find_bind_name(&p, names[0]) >= 0 and ns_has_values(&p):
+        declare_tok(&p, false)                   # (it shadows an import of the name: import declarations)
+    next(&p)
+    while eat_op(&p, 46):
+        names.push(tok_text(&p))
+        next(&p)
+    if not at_op(&p, 123):
+        fail(&p, "expected namespace body")
+        return
+    if not (names[0] in p.locals):
+        p.locals[names[0]] = 6
+    if not p.ns_scanned:
+        # the file's namespace blocks, for merged declarations: scanned once, only in files with namespaces
+        p.ns_scanned = true
+        ns = ns_scan(p.src, p.tsx)
+        p.ns_blocks = ns.blocks
+        p.ns_xmap = ns.exports
+    esm_export = export_prefix == "esm"
+    if esm_export:
+        export_prefix = ""
+    dot_top = p.ns_dot_top
+    p.ns_dot_top = p.ns_name == ""
+    text = ns_body(&p, names, 0, export_prefix)
+    p.ns_dot_top = dot_top
+    if esm_export and text.starts_with("var "):
+        text = "export " + text
+        p.esm_kept = true
+    skip_pe(&p)
+    if text == "":
+        if p.last_asi and continues(&p):
+            put(&p, ";")
+        return
+    if p.last_asi and text_continues(text):
+        text = ";" + text
+    put(&p, text)
+    p.last_asi = false
+    if export_prefix != "" and not ((names[0] in p.locals) and p.locals[names[0]] == 2):
+        add_export_name(&p, names[0])
+    slot_marker(&p, names[0])
+
+# The IIFE for names[i] (and the names nested in it). "" if nothing in it is a value.
+fn ns_body(p: mut P, names: [str], i: int, export_prefix: str) str:
+    p.ns_path.push(names[i])
+    t = ns_body_at(&p, names, i, export_prefix)
+    p.ns_path.pop()
+    return t
+
+fn ns_body_at(p: mut P, names: [str], i: int, export_prefix: str) str:
+    name = names[i]
+    param = name
+    outer_ns = p.ns_name
+    decl = ""
+    inner = ""
+    if i + 1 < len(names):
+        saved_decl = p.ns_decl
+        p.ns_decl = {}
+        s0 = save(&p)
+        next(&p)
+        if ns_binds_name(&p, name):
+            param = ns_param_name(&p, name, i)   # namespace A.B { ... A ... }: A_1, as tsc
+        restore(&p, s0)
+        block = p.ts
+        push_scope_here(&p, true)
+        p.ns_name = param
+        bind_base = len(p.binds)
+        if block in p.ns_blocks:                 # A.B.C: what A.B exports from its other blocks
+            segs = p.ns_blocks[block].split(".")
+            path = ".".join(segs[..len(segs) - (len(names) - 1 - i)])
+            s1 = save(&p)
+            next(&p)
+            bind_path_exports(&p, path, block)
+            restore(&p, s1)
+        inner = ns_body(&p, names, i + 1, param + ".")
+        deactivate_from(&p, bind_base)
+        pop_scope(&p)
+        p.ns_name = outer_ns
+        p.ns_decl = saved_decl
+        if inner == "":
+            return ""
+        inner = "\n" + inner + "\n"
+    else:
+        body_start = p.ts
+        next(&p)
+        skip_pe(&p)
+        saved = begin_capture(&p)
+        saved_decl = p.ns_decl
+        saved_asi = p.last_asi
+        p.ns_decl = {}
+        p.ns_name = name
+        declares_var = ns_declares_var(&p)
+        if ns_binds_name(&p, name):
+            # the body binds the namespace's own name: the IIFE parameter is renamed
+            param = ns_param_name(&p, name, i)
+            p.ns_name = param
+        bind_base = len(p.binds)
+        saved_ns_start = p.ns_start
+        p.ns_start = body_start
+        push_scope(&p, body_start, true)
+        apply_hints(&p, body_start)
+        bind_merged_exports(&p, body_start)
+        p.last_asi = false
+        fn_scope_start(&p)
+        es = p.empty_stmt
+        p.empty_stmt = false
+        if p.has_using and p.target < 9999:      # `using` in the body: all of it in the try, as a block
+            emit_pe(&p)
+            uid = u_open(&p)
+            statements(&p, false)
+            emit_ts(&p)
+            u_close(&p, uid)
+        else:
+            p.u_stack.push(-1)
+            statements(&p, false)
+            p.u_stack.pop()
+        fn_scope_end(&p)
+        emit_ts(&p)
+        pop_scope(&p)
+        deactivate_from(&p, bind_base)
+        p.ns_start = saved_ns_start
+        p.ns_name = outer_ns
+        p.ns_decl = saved_decl
+        p.last_asi = saved_asi
+        inner = end_capture(&p, saved)
+        expect_op(&p, 125)
+        had_empty = p.empty_stmt                 # (`namespace A { ; }`: instantiated, as tsc has it)
+        p.empty_stmt = es
+        if not has_value_text(inner) and not declares_var and not had_empty:
+            return ""
+    decl = decl_keyword(&p, name)
+    if i > 0 and decl.starts_with("let ") and p.ns_dot_top:
+        decl = "var " + decl[4..]                # namespace A.B.C at the top level: tsc declares B
+                                                 # and C with var (inside a namespace, let)
+    target = name + " || (" + name + " = {})"
+    if export_prefix != "":
+        if i > 0 or p.ns_name != "":
+            target = name + " = " + export_prefix + name + " || (" + export_prefix + name + " = {})"
+        else:
+            target = name + " || (" + export_prefix + name + " = " + name + " = {})"
+            p.ns_xdecl[name] = true
+            if p.has_export_list:                # (export { M as M1 }: in the IIFE too)
+                m = fold_marker(&p, name)
+                if m != "":
+                    target = name + " || (" + m + name + " = {})"
+    elif i == 0:
+        target = name + " || (" + fold_marker(&p, name) + name + " = {})"
+    return decl + "(function (" + param + ") {" + inner + "})(" + target + ");"
+
+# The renamed IIFE parameter of the block at p.ts: unique in the file (M_1, M_2), stable when parsed again.
+fn ns_param_name(p: mut P, name: str, i: int) str:
+    key = str(p.ts) + "." + str(i)               # (A.B: one block, a parameter for each name)
+    if key in p.ns_params:
+        return p.ns_params[key]
+    r = unique_name(&p, name)
+    p.ns_params[key] = r
+    return r
+
+# Just inside a namespace body's "{": does the body declare `name` among its own statements?
+fn ns_redeclares(p: mut P, name: str) bool:
+    s = save(&p)
+    found = false
+    depth = 1
+    tpl: [int] = []
+    while p.tok != T_EOF and not found:
+        if p.tok == T_OP:
+            o = p.op
+            if o == 40 or o == 91 or o == 123:
+                depth += 1
+            elif o == 41 or o == 93 or o == 125:
+                if o == 125 and len(tpl) > 0 and tpl[len(tpl) - 1] == depth:
+                    rescan_tpl(&p)
+                    if p.tok == T_TPL:
+                        tpl.pop()
+                    next(&p)
+                    continue
+                depth -= 1
+                if depth == 0:
+                    break
+        elif p.tok == T_TPL_HEAD:
+            tpl.push(depth)
+        elif depth == 1 and p.tok == T_NAME:
+            k = p.kw
+            if k == K_CLASS or k == K_FUNCTION or k == K_CONST or k == K_LET or k == K_VAR or k == K_ENUM or k == K_NAMESPACE or k == K_MODULE:
+                n = peek_tok(&p)
+                found = n.tok == T_NAME and same_text(p.src, n.ts, n.te - n.ts, name)
+        next(&p)
+        if p.tok == T_OP and (p.op == 47 or (p.op == O_ASSIGN and p.src.byte(p.ts) == 47)) and regex_ok_prev(&p):
+            rescan_regex(&p)
+    restore(&p, s)
+    return found
+
+# Inside a namespace body: is `name` bound as a value anywhere in it, at any depth? tsc then renames
+# the IIFE parameter (name_1). Interfaces and type parameters don't count.
+fn ns_binds_name(p: mut P, name: str) bool:
+    s = save(&p)
+    found = false
+    kinds: [int] = [0]                           # open groups: 0 other, 1 parameters, 2 a pattern
+    tpl: [int] = []
+    pt = 0                                       # the previous token: tok, op, kw
+    po = 0
+    pk = 0
+    ppk = 0                                      # and the keyword before it
+    while p.tok != T_EOF and not found:
+        top = kinds[len(kinds) - 1]
+        if p.tok == T_OP:
+            o = p.op
+            if o == 40 or o == 91 or o == 123:
+                k = 0
+                in_pat = (top == 1 or top == 2) and (pt == T_OP and (po == 40 or po == 44 or po == O_DOTS or po == 91 or po == 123))
+                if o == 40:
+                    if pt == T_NAME and pk == K_CATCH:
+                        k = 1
+                    elif not (pt == T_NAME and (pk == K_IF or pk == K_WHILE or pk == K_FOR or pk == K_SWITCH or pk == K_WITH)):
+                        s2 = save(&p)
+                        skip_group(&p)
+                        if p.tok == T_OP and (p.op == O_ARROW or p.op == 123 or p.op == 58):
+                            k = 1
+                            if p.op == 58 and pt == T_OP and po == 63:
+                                k = 0                # c ? (x) : y: the conditional's ':', not a return type
+                        restore(&p, s2)
+                elif in_pat or (pt == T_NAME and (pk == K_VAR or pk == K_LET or pk == K_CONST)):
+                    k = 2
+                kinds.push(k)
+            elif o == 41 or o == 93 or o == 125:
+                if o == 125 and len(tpl) > 0 and tpl[len(tpl) - 1] == len(kinds):
+                    rescan_tpl(&p)
+                    if p.tok == T_TPL:           # the template's end: its group closes too
+                        tpl.pop()
+                        kinds.pop()
+                    pt = T_OP
+                    po = 0
+                    next(&p)
+                    continue
+                if len(kinds) == 1:
+                    break
+                kinds.pop()
+        elif p.tok == T_TPL_HEAD:
+            kinds.push(0)
+            tpl.push(len(kinds))
+        elif p.tok == T_NAME and same_text(p.src, p.ts, p.te - p.ts, name):
+            if pt == T_NAME and (pk == K_VAR or pk == K_LET or pk == K_CONST or pk == K_FUNCTION or pk == K_CLASS or pk == K_ENUM or (pk == K_IMPORT and ppk != K_EXPORT)):
+                found = true                     # (export import A = ...: an export, not a local)
+            elif pt == T_NAME and (pk == K_NAMESPACE or pk == K_MODULE):
+                found = ns_has_values(&p)        # an uninstantiated namespace isn't a value
+            elif top == 2 and pt == T_OP and po == 58:
+                found = true                     # { key: A } in a declaration's pattern
+            elif top == 1 and pt == T_NAME and (pk == K_PRIVATE or pk == K_PROTECTED or pk == K_PUBLIC or pk == K_READONLY or pk == K_OVERRIDE):
+                found = true                     # constructor(private A): a parameter property
+            elif (top == 1 or top == 2) and pt == T_OP and (po == 40 or po == 44 or po == O_DOTS or po == 91 or po == 123):
+                n = peek_tok(&p)
+                found = not (n.tok == T_OP and n.op == 58 and top == 2)
+            else:
+                n = peek_tok(&p)
+                # A => ... (not `x: vscode.Range =>` or `): Range =>`, a type before the arrow)
+                found = n.tok == T_OP and n.op == O_ARROW and not n.nlb and not (pt == T_OP and (po == 46 or po == 58))
+        ppk = pk
+        pt = p.tok
+        po = p.op
+        pk = p.kw
+        if p.tok != T_NAME:
+            pk = 0
+        next(&p)
+        if p.tok == T_OP and (p.op == 47 or (p.op == O_ASSIGN and p.src.byte(p.ts) == 47)) and regex_ok_prev(&p):
+            rescan_regex(&p)
+    restore(&p, s)
+    return found
+
+# At a nested namespace's name: does its body hold a value declaration (so it's instantiated)?
+fn ns_has_values(p: mut P) bool:
+    s = save(&p)
+    while p.tok != T_EOF and not at_op(&p, 123):
+        next(&p)
+    found = false
+    depth = 0
+    while p.tok != T_EOF and not found:
+        if at_op(&p, 123):
+            depth += 1
+        elif at_op(&p, 125):
+            depth -= 1
+            if depth == 0:
+                break
+        elif p.tok == T_NAME and (p.kw == K_VAR or p.kw == K_LET or p.kw == K_CONST or p.kw == K_FUNCTION or p.kw == K_CLASS or p.kw == K_ENUM):
+            found = true
+        next(&p)
+    restore(&p, s)
+    return found
+
+# At a namespace's name: does its body have an `export { }` list (tsc's reExportAliasMakesInstantiated)?
+fn ns_reexports(p: mut P) bool:
+    s = save(&p)
+    while p.tok != T_EOF and not at_op(&p, 123):
+        next(&p)
+    found = false
+    depth = 0
+    while p.tok != T_EOF and not found:
+        if at_op(&p, 123):
+            depth += 1
+        elif at_op(&p, 125):
+            depth -= 1
+            if depth == 0:
+                break
+        elif p.tok == T_NAME and p.kw == K_EXPORT and peek_tok(&p).tok == T_OP and peek_tok(&p).op == 123:
+            found = true
+        next(&p)
+    restore(&p, s)
+    return found
+
+# Is `name` only a namespace without values here (with `types`, also an interface or type alias),
+# so an alias of it is of types only?
+fn ns_types_only(src: str, tsx: bool, name: str, types: bool) bool:
+    if not has_ident(src, name):
+        return false
+    p = new_p(src, false)
+    p.tsx = tsx
+    p.mute += 1
+    next(&p)
+    seen = false
+    pk = 0
+    while p.tok != T_EOF:
+        if p.tok == T_OP and (p.op == 47 or (p.op == O_ASSIGN and p.src.byte(p.ts) == 47)) and regex_ok_prev(&p):
+            rescan_regex(&p)
+        elif p.tok == T_TPL_HEAD:
+            template(&p)
+            pk = 0
+            continue
+        elif p.tok == T_NAME and same_text(p.src, p.ts, p.te - p.ts, name):
+            if pk == K_NAMESPACE or pk == K_MODULE:
+                if ns_has_values(&p) or ns_reexports(&p):
+                    return false
+                seen = true
+            elif types and (pk == K_INTERFACE or pk == K_TYPE):
+                seen = true
+            elif pk == K_VAR or pk == K_LET or pk == K_CONST or pk == K_FUNCTION or pk == K_CLASS or pk == K_ENUM or pk == K_IMPORT:
+                return false
+        pk = 0
+        if p.tok == T_NAME:
+            pk = p.kw
+        next(&p)
+    return seen
+
+# ---- names a namespace gets from its other declarations
+# namespace A { export var x = 1 } ... namespace A { x }: tsc reads x as A.x (the declarations merge).
+# ns_scan finds every namespace block (by its "{" position) and the values each exports, by path ("A.B").
+
+struct NsScan:
+    blocks: {int: str}      # a namespace body's "{" position -> its path
+    exports: {str: [str]}   # path -> "name \x01 position of the block that exports it"
+
+fn ns_scan(src: str, tsx: bool) NsScan:
+    r = NsScan({}, {})
+    p = new_p(src, false)
+    p.tsx = tsx
+    p.mute += 1
+    next(&p)
+    paths: [str] = []
+    depths: [int] = []                           # the brace depth outside each open block
+    depth = 0
+    exported = false                             # `export namespace`
+    while p.tok != T_EOF:
+        if at_op(&p, 40) or at_op(&p, 91):
+            skip_group(&p)
+            continue
+        if p.tok == T_TPL_HEAD:
+            template(&p)
+            continue
+        if p.tok == T_OP and (p.op == 47 or (p.op == O_ASSIGN and p.src.byte(p.ts) == 47)) and regex_ok_prev(&p):
+            rescan_regex(&p)
+            next(&p)
+            continue
+        if at_op(&p, 123):
+            depth += 1
+            next(&p)
+            continue
+        if at_op(&p, 125):
+            depth -= 1
+            if len(depths) > 0 and depths[len(depths) - 1] == depth:
+                paths.pop()
+                depths.pop()
+            next(&p)
+            continue
+        if p.tok != T_NAME:
+            exported = false
+            next(&p)
+            continue
+        k = p.kw
+        in_block = len(paths) > 0 and depth == depths[len(depths) - 1] + 1
+        if k == K_NAMESPACE or k == K_MODULE:
+            n = peek_tok(&p)
+            if n.tok == T_NAME and not n.nlb:
+                parent = ""
+                if len(paths) > 0:
+                    parent = paths[len(paths) - 1]
+                was_exported = exported and in_block
+                exported = false
+                next(&p)
+                segs: [str] = [tok_text(&p)]
+                next(&p)
+                while at_op(&p, 46):
+                    next(&p)
+                    segs.push(tok_text(&p))
+                    next(&p)
+                if not at_op(&p, 123):
+                    continue
+                at = p.ts
+                path = parent
+                for i in 0..len(segs):
+                    if (i == 0 and was_exported and parent != "") or i > 0:
+                        ns_add(&r, path, segs[i], at)
+                    if path == "":
+                        path = segs[i]
+                    else:
+                        path = path + "." + segs[i]
+                r.blocks[at] = path
+                paths.push(path)
+                depths.push(depth)
+                depth += 1
+                next(&p)
+                continue
+        if k == K_EXPORT and in_block:
+            next(&p)
+            while p.tok == T_NAME and (p.kw == K_DECLARE or p.kw == K_ABSTRACT or p.kw == K_ASYNC):
+                next(&p)
+            k2 = p.kw
+            if p.tok == T_NAME and (k2 == K_NAMESPACE or k2 == K_MODULE):
+                exported = true
+                continue
+            if p.tok == T_NAME and (k2 == K_VAR or k2 == K_LET or k2 == K_CONST or k2 == K_FUNCTION or k2 == K_CLASS or k2 == K_ENUM or k2 == K_IMPORT):
+                next(&p)
+                if k2 == K_CONST and at_kw(&p, K_ENUM):
+                    next(&p)
+                if at_op(&p, 42):
+                    next(&p)                     # function*
+                if p.tok == T_NAME:
+                    ns_add(&r, paths[len(paths) - 1], tok_text(&p), block_of(r, paths[len(paths) - 1], depths[len(depths) - 1]))
+            continue
+        exported = false
+        next(&p)
+    return r
+
+fn ns_add(r: mut NsScan, path: str, name: str, block: int):
+    if not (path in r.exports):
+        r.exports[path] = []
+    r.exports[path].push(name + "\x01" + str(block))
+
+# The position of the innermost open block of `path` (the one being scanned).
+fn block_of(r: NsScan, path: str, depth: int) int:
+    best = -1
+    for at in r.blocks.keys():
+        if r.blocks[at] == path and at > best:
+            best = at
+    return best
+
+# Inside a namespace body: `NS.x` bindings for values its other declarations export, unless it declares the name.
+fn bind_merged_exports(p: mut P, body_start: int):
+    if not (body_start in p.ns_blocks):
+        return
+    path = p.ns_blocks[body_start]
+    bind_path_exports(&p, path, body_start)
+
+# The names namespace `path` exports from blocks other than the one at `body_start`.
+fn bind_path_exports(p: mut P, path: str, body_start: int):
+    if not (path in p.ns_xmap):
+        return
+    seen: {str: bool} = {}
+    entries = p.ns_xmap[path]
+    for e in entries:
+        cut = e.find("\x01")
+        name = e[..cut]
+        if e[cut + 1..].to_int(0) == body_start or (name in seen):
+            continue
+        seen[name] = true
+        if ns_redeclares(&p, name):
+            continue
+        p.binds.push(Bind(name, hash_of(name), B_NSEXPORT, p.ns_name + "." + name, -1, len(p.dh), true, -1, -1))
+        slot_bind(&p, len(p.binds) - 1)
+
+# Just inside a namespace body: does it declare a variable (even `declare`d)? tsc then writes its IIFE,
+# even an empty one (export var n: number).
+fn ns_declares_var(p: mut P) bool:
+    s = save(&p)
+    found = false
+    depth = 1
+    tpl: [int] = []
+    amb: [int] = []                              # depths of ambient namespace bodies
+    amb_next = false
+    while p.tok != T_EOF and not found:
+        if p.tok == T_OP:
+            o = p.op
+            if o == 40 or o == 91 or o == 123:
+                depth += 1
+                if o == 123 and amb_next:
+                    amb.push(depth)
+                    amb_next = false
+            elif o == 41 or o == 93 or o == 125:
+                if o == 125 and len(tpl) > 0 and tpl[len(tpl) - 1] == depth:
+                    rescan_tpl(&p)
+                    if p.tok == T_TPL:
+                        tpl.pop()
+                    next(&p)
+                    continue
+                if len(amb) > 0 and amb[len(amb) - 1] == depth:
+                    amb.pop()
+                depth -= 1
+                if depth == 0:
+                    break
+            elif o == 59:
+                amb_next = false
+        elif p.tok == T_TPL_HEAD:
+            tpl.push(depth)
+        elif p.tok == T_NAME and (depth == 1 or (len(amb) > 0 and amb[len(amb) - 1] == depth)):
+            k = p.kw
+            in_amb = depth > 1
+            if k == K_VAR or k == K_LET or k == K_CONST:
+                n = peek_tok(&p)
+                found = (n.kw != K_ENUM or in_amb) and (n.tok == T_NAME or (n.tok == T_OP and (n.op == 91 or n.op == 123)))
+            elif k == K_FUNCTION:
+                found = true                     # even an overload signature (function foo();)
+            elif k == K_EXPORT and not in_amb:
+                found = peek_tok(&p).kw == K_IMPORT  # export import A = B: instantiated, even when dropped
+            elif in_amb and (k == K_CLASS or k == K_ENUM or k == K_ABSTRACT):
+                found = true
+            elif k == K_DECLARE or in_amb:
+                # tsc counts ambient values as instantiating: `declare class C {}`, `declare enum E {}`, a `declare namespace` with one
+                n = peek_tok(&p)
+                if k == K_DECLARE:
+                    found = n.kw == K_CLASS or n.kw == K_ENUM or n.kw == K_ABSTRACT or n.kw == K_CONST
+                    if n.kw == K_NAMESPACE or n.kw == K_MODULE:
+                        amb_next = n.tok == T_NAME
+                elif (k == K_NAMESPACE or k == K_MODULE) and n.tok == T_NAME and not n.nlb:
+                    amb_next = true
+        next(&p)
+        if p.tok == T_OP and (p.op == 47 or (p.op == O_ASSIGN and p.src.byte(p.ts) == 47)) and regex_ok_prev(&p):
+            rescan_regex(&p)
+    restore(&p, s)
+    return found
+
+# Is `m` a member of this enum declared later (in this body or a later block)? tsc evaluates those as 0.
+fn enum_later_member(p: mut P, m: str) bool:
+    if p.enum_cur == "" or m == p.enum_member:
+        return false
+    for x in p.enum_seen:
+        if x == m:
+            return false                         # (declared above, with a value that isn't constant)
+    if not p.enum_later_done:
+        p.enum_later_done = true
+        s = save(&p)
+        at = p.enum_body_at
+        cur = p.enum_cur
+        restore(&p, at)
+        p.enum_later = enum_forward_names(&p, cur)
+        restore(&p, s)
+    for x in p.enum_later:
+        if x == m:
+            return true
+    return false
+
+# At the first member of an enum body: the member names of this body.
+fn enum_body_names(p: mut P) [str]:
+    s = save(&p)
+    p.mute += 1
+    out: [str] = []
+    while not at_op(&p, 125) and p.tok != T_EOF:
+        if p.tok == T_STR:
+            out.push(decode_string(tok_text(&p)))
+            next(&p)
+        elif p.tok == T_NAME:
+            out.push(tok_text(&p))
+            next(&p)
+        elif at_op(&p, 91):
+            next(&p)
+            if p.tok == T_STR:
+                out.push(decode_string(tok_text(&p)))
+            while p.tok != T_EOF and not at_op(&p, 93):
+                next(&p)
+            next(&p)
+        else:
+            break
+        if at_op(&p, 61):
+            next(&p)
+            depth = 0
+            while p.tok != T_EOF and not (depth == 0 and (at_op(&p, 44) or at_op(&p, 125))):
+                if at_op(&p, 40) or at_op(&p, 91) or at_op(&p, 123):
+                    depth += 1
+                elif at_op(&p, 41) or at_op(&p, 93) or at_op(&p, 125):
+                    depth -= 1
+                next(&p)
+        if not eat_op(&p, 44):
+            break
+    p.mute -= 1
+    restore(&p, s)
+    return out
+
+# The members this enum declares from here on: this body's and later `enum name {}` blocks'.
+fn enum_forward_names(p: mut P, name: str) [str]:
+    out = enum_body_names(&p)
+    k = p.src.find_from("enum " + name, p.ts)
+    while k >= 0:
+        e = k + 5 + len(name)
+        j = e
+        while j < p.n and (p.src.byte(j) == 32 or p.src.byte(j) == 9 or p.src.byte(j) == 10 or p.src.byte(j) == 13):
+            j += 1
+        if (k == 0 or not is_id(p.src.byte(k - 1))) and j < p.n and p.src.byte(j) == 123 and not (e < p.n and is_id(p.src.byte(e))):
+            s = save(&p)
+            p.mute += 1
+            p.pos = j + 1
+            next(&p)
+            for x in enum_body_names(&p):
+                out.push(x)
+            p.mute -= 1
+            restore(&p, s)
+        k = p.src.find_from("enum " + name, k + 1)
+    return out
+
+# name_1, or the first name_N that isn't an identifier in the source.
+fn unique_ident(src: str, name: str) str:
+    n = 1
+    while has_ident(src, gen_name(name, n)):
+        n += 1
+    return gen_name(name, n)
+
+fn has_value_text(s: str) bool:
+    k = 0
+    while k < len(s):
+        c = s.byte(k)
+        if c == 0 and k + 1 < len(s) and (s.byte(k + 1) == 86 or s.byte(k + 1) == 73):   # a function-scope or alias marker
+            k += 2
+            while k < len(s) and s.byte(k) != 0:
+                k += 1
+        elif c != 32 and c != 10 and c != 9 and c != 13 and c != 59:
+            return true
+        k += 1
+    return false

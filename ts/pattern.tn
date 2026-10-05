@@ -1,0 +1,354 @@
+# Lowers destructuring with object rest below ES2018 as tsc's flattenDestructuring does:
+# nested patterns and computed keys through temps, the rest through __rest.
+
+const PN_OBJ = 1
+const PN_ARR = 2
+const PN_ELEM = 3
+
+struct PN:
+    k: int
+    text: str           # an element's text as written (key, target, default)
+    key: str            # an object element's key ("a", "'s'", "1", or "[expr]" when computed)
+    computed: bool
+    rest: bool          # ...target
+    hole: bool          # an array pattern's empty slot
+    target: str         # the target's text (a name, a member, or a nested pattern)
+    sub: int            # the nested pattern, or -1
+    dflt: str           # the default's text, or ""
+    kids: [int]         # a pattern's elements
+
+struct PT:
+    nodes: [PN]
+
+# The pattern in `text`, or a tree without nodes when it isn't one.
+fn pat_tree(text: str) PT:
+    t = PT([])
+    q = new_p(text, false)
+    q.mute += 1
+    next(&q)
+    if not (at_op(&q, 123) or at_op(&q, 91)):
+        return t
+    pp_pattern(&q, &t)
+    if q.bad or q.err != "" or q.tok != T_EOF:
+        return PT([])
+    return t
+
+fn pp_pattern(q: mut P, t: mut PT) int:
+    obj = at_op(&q, 123)
+    t.nodes.push(PN(PN_OBJ, "", "", false, false, false, "", -1, "", []))
+    me = len(t.nodes) - 1
+    if not obj:
+        t.nodes[me].k = PN_ARR
+    close = 125
+    if not obj:
+        close = 93
+    next(&q)
+    kids: [int] = []
+    while not at_op(&q, close) and q.tok != T_EOF:
+        if not obj and at_op(&q, 44):            # a hole
+            t.nodes.push(PN(PN_ELEM, "", "", false, false, true, "", -1, "", []))
+            kids.push(len(t.nodes) - 1)
+            next(&q)
+            continue
+        start = q.ts
+        e = PN(PN_ELEM, "", "", false, false, false, "", -1, "", [])
+        if eat_op(&q, O_DOTS):
+            e.rest = true
+        if obj and not e.rest:
+            if at_op(&q, 91):
+                ka = q.ts
+                skip_group(&q)
+                e.key = q.src[ka..q.pe]
+                e.computed = true
+            else:
+                e.key = q.src[q.ts..q.te]
+                next(&q)
+            if eat_op(&q, 58):
+                pp_target(&q, &t, &e)
+            else:
+                e.target = e.key                 # shorthand
+        else:
+            pp_target(&q, &t, &e)
+        if at_op(&q, 61):
+            next(&q)
+            da = q.ts
+            pp_skip(&q, false)
+            e.dflt = q.src[da..q.pe].trim()
+        e.text = q.src[start..q.pe].trim()
+        t.nodes.push(e)
+        kids.push(len(t.nodes) - 1)
+        if not eat_op(&q, 44):
+            break
+    if not at_op(&q, close):
+        q.bad = true
+        return me
+    next(&q)
+    t.nodes[me].kids = kids
+    return me
+
+fn pp_target(q: mut P, t: mut PT, e: mut PN):
+    a = q.ts
+    if at_op(&q, 123) or at_op(&q, 91):
+        e.sub = pp_pattern(&q, &t)
+    else:
+        pp_skip(&q, true)
+    e.target = q.src[a..q.pe].trim()
+
+# Past an expression: to a `,`, `}` or `]` at its level (and `=` too for a target).
+fn pp_skip(q: mut P, stop_eq: bool):
+    depth = 0
+    tpl: [int] = []
+    while q.tok != T_EOF:
+        if q.tok == T_OP:
+            o = q.op
+            if depth == 0 and (o == 44 or o == 125 or o == 93 or o == 41 or (stop_eq and o == 61)):
+                return
+            if o == 40 or o == 91 or o == 123:
+                depth += 1
+            elif o == 41 or o == 93 or o == 125:
+                if o == 125 and len(tpl) > 0 and tpl[len(tpl) - 1] == depth:
+                    rescan_tpl(&q)
+                    if q.tok == T_TPL:
+                        tpl.pop()
+                    next(&q)
+                    continue
+                depth -= 1
+        elif q.tok == T_TPL_HEAD:
+            tpl.push(depth)
+        next(&q)
+        if q.tok == T_OP and (q.op == 47 or (q.op == O_ASSIGN and q.src.byte(q.ts) == 47)) and regex_ok_prev(&q):
+            rescan_regex(&q)
+
+# ---- what the tree says
+
+# Is there an object rest in pattern n (at any depth; a default doesn't count)?
+fn pn_needs_rest(t: PT, n: int) bool:
+    d = t.nodes[n]
+    for k in d.kids:
+        e = t.nodes[k]
+        if e.rest and d.k == PN_OBJ:
+            return true
+        if e.sub >= 0 and pn_needs_rest(t, e.sub):
+            return true
+    return false
+
+# An object pattern with a computed key at its top level.
+fn pn_computed(t: PT, n: int) bool:
+    if n < 0 or t.nodes[n].k != PN_OBJ:
+        return false
+    for k in t.nodes[n].kids:
+        if t.nodes[k].computed:
+            return true
+    return false
+
+# An element flattened on its own: its target, or a destructuring assignment in its default, has object rest.
+fn pn_special(t: PT, e: PN) bool:
+    if e.sub >= 0 and pn_needs_rest(t, e.sub):
+        return true
+    if e.dflt == "":
+        return false
+    return e.dflt.contains("__rest(") and not e.dflt.contains("=>") and not e.dflt.contains("function")
+
+# tsc's isSimpleBindingOrAssignmentElement: names only, no evaluated defaults or computed keys.
+fn pn_simple(t: PT, e: PN) bool:
+    if e.hole:
+        return true
+    if e.dflt != "" and not inline_literal(e.dflt):
+        return false
+    if e.sub >= 0:
+        for k in t.nodes[e.sub].kids:
+            x = t.nodes[k]
+            if x.computed or not pn_simple(t, x):
+                return false
+        return true
+    return plain_ident(e.target)
+
+# ---- flattening
+
+fn needs_rest(pat: str) bool:
+    t = pat_tree(pat.trim())
+    return len(t.nodes) > 0 and pn_needs_rest(t, 0)
+
+fn rest_flatten(p: mut P, pat: str, src: str, src_simple: bool, decl: bool, out: mut [str]):
+    t = pat_tree(pat.trim())
+    if len(t.nodes) == 0:
+        out.push(pat + " = " + src)
+        return
+    pn_flatten(&p, t, 0, src, src_simple, decl, true, &out)
+
+fn rest_parts(p: mut P, pat: str, src: str, src_simple: bool, decl: bool) str:
+    out: [str] = []
+    rest_flatten(&p, pat, src, src_simple, decl, &out)
+    return ", ".join(out)
+
+fn rest_temp(p: mut P, decl: bool) str:
+    if decl:
+        return name_temp(&p)
+    return low_temp(&p, 2018)
+
+# Pattern n from src. At the top, src gets a temp even when it's a name if a key is computed.
+fn pn_flatten(p: mut P, t: PT, n: int, src: str, src_simple: bool, decl: bool, top: bool, out: mut [str]):
+    d = t.nodes[n]
+    if d.k == PN_ARR:
+        elems: [str] = []
+        later_tmp: [str] = []
+        later_el: [int] = []
+        prior = false                            # (tsc: hasTransformedPriorElement)
+        for k in d.kids:
+            e = t.nodes[k]
+            if not e.rest and not e.hole and ((e.sub >= 0 and pn_needs_rest(t, e.sub)) or (prior and not pn_simple(t, e))):
+                prior = true
+                tmp = rest_temp(&p, decl)
+                elems.push(tmp)
+                later_tmp.push(tmp)
+                later_el.push(k)
+            else:
+                elems.push(e.text)
+        out.push("[" + ", ".join(elems) + "] = " + src)
+        for i in 0..len(later_tmp):
+            pn_elem_flatten(&p, t, later_el[i], later_tmp[i], decl, &out)
+        return
+    items: [int] = []
+    rest = ""
+    computed = false
+    for k in d.kids:
+        e = t.nodes[k]
+        if e.rest:
+            rest = e.target
+        else:
+            items.push(k)
+            if e.computed:
+                computed = true
+    # how many times the source is read
+    reads = 0
+    run = false
+    for k in items:
+        if pn_special(t, t.nodes[k]):
+            reads += 1
+            run = false
+        elif not run:
+            reads += 1
+            run = true
+    if rest != "":
+        reads += 1
+    s = src
+    if (reads > 1 and not src_simple) or (computed and rest != "" and (top or not plain_ident(src))):
+        s = rest_temp(&p, decl)
+        out.push(s + " = " + src)
+    pending: [str] = []
+    keys: [str] = []
+    for k in items:
+        e = t.nodes[k]
+        if e.computed:
+            if len(pending) > 0:
+                out.push("{ " + ", ".join(pending) + " } = " + s)
+                pending = []
+            kt = rest_temp(&p, decl)
+            out.push(kt + " = " + e.key[1..len(e.key) - 1].trim())
+            keys.push("typeof " + kt + " === \"symbol\" ? " + kt + " : " + kt + " + \"\"")
+            pn_elem_flatten(&p, t, k, s + "[" + kt + "]", decl, &out)
+            continue
+        q = e.key
+        if q.byte(0) == 34 or q.byte(0) == 39:
+            q = q[1..len(q) - 1]
+        keys.push("\"" + q + "\"")
+        if pn_special(t, e):
+            if len(pending) > 0:
+                out.push("{ " + ", ".join(pending) + " } = " + s)
+                pending = []
+            acc = "." + e.key
+            if not simple_copy(e.key) or is_digit(e.key.byte(0)) or e.key.byte(0) == 34 or e.key.byte(0) == 39:
+                acc = "[" + e.key + "]"
+            pn_elem_flatten(&p, t, k, s + acc, decl, &out)
+        else:
+            pending.push(e.text)
+    if len(pending) > 0:
+        out.push("{ " + ", ".join(pending) + " } = " + s)
+    if rest != "":
+        want_rest(&p)
+        out.push(rest + " = __rest(" + s + ", [" + ", ".join(keys) + "])")
+
+# One element from rhs, as tsc's flattenBindingOrAssignmentElement: a default reads rhs through
+# a temp, and a pattern target gets one too unless init is a literal.
+fn pn_elem_flatten(p: mut P, t: PT, k: int, rhs0: str, decl: bool, out: mut [str]):
+    e = t.nodes[k]
+    value = rhs0
+    if e.dflt != "":
+        rhs = rhs0
+        if not plain_ident(rhs):
+            rhs = rest_temp(&p, decl)
+            out.push(rhs + " = " + rhs0)
+        value = rhs + " === void 0 ? " + e.dflt + " : " + rhs
+        if e.sub >= 0 and not inline_literal(e.dflt):
+            tmp = rest_temp(&p, decl)
+            out.push(tmp + " = " + value)
+            value = tmp
+        else:
+            value = "(" + value + ")"
+    if e.sub >= 0 and (pn_needs_rest(t, e.sub) or pn_computed(t, e.sub)):
+        pn_flatten(&p, t, e.sub, value, plain_ident(value), decl, false, &out)
+    else:
+        out.push(e.target + " = " + value)
+
+fn plain_ident(t: str) bool:
+    return t != "" and is_id_start(t.byte(0)) and simple_copy(t)
+
+# What tsc inlines into a default check without a temp (isSimpleInlineableExpression).
+fn inline_literal(t: str) bool:
+    if t == "true" or t == "false" or t == "null" or t == "this":
+        return true
+    return t != "" and not is_id_start(t.byte(0)) and simple_copy(t)
+
+# Pattern n fully flattened (tsc's FlattenLevel.All), for a pattern parameter next to one with object rest:
+#   { e = 1, g: { h } } from _b -> _f = _b.e, e = _f === void 0 ? 1 : _f, h = _b.g.h
+fn pn_all(p: mut P, t: PT, n: int, src: str, simple: bool, out: mut [str]):
+    d = t.nodes[n]
+    s = src
+    if len(d.kids) != 1 and not simple:
+        s = name_temp(&p)
+        out.push(s + " = " + src)
+    if d.k == PN_OBJ:
+        for k in d.kids:
+            e = t.nodes[k]
+            acc = ""
+            if e.computed:
+                kt = name_temp(&p)
+                out.push(kt + " = " + e.key[1..len(e.key) - 1].trim())
+                acc = s + "[" + kt + "]"
+            elif e.key.byte(0) == 34 or e.key.byte(0) == 39 or is_digit(e.key.byte(0)) or not simple_copy(e.key):
+                acc = s + "[" + e.key + "]"
+            else:
+                acc = s + "." + e.key
+            pn_all_elem(&p, t, k, acc, &out)
+        return
+    i = 0
+    for k in d.kids:
+        e = t.nodes[k]
+        if e.hole:
+            i += 1
+            continue
+        if e.rest:
+            pn_all_elem(&p, t, k, s + ".slice(" + str(i) + ")", &out)
+        else:
+            pn_all_elem(&p, t, k, s + "[" + str(i) + "]", &out)
+        i += 1
+
+fn pn_all_elem(p: mut P, t: PT, k: int, acc: str, out: mut [str]):
+    e = t.nodes[k]
+    value = acc
+    vsimple = false
+    if e.dflt != "":
+        tmp = name_temp(&p)
+        out.push(tmp + " = " + acc)
+        value = tmp + " === void 0 ? " + e.dflt + " : " + tmp
+        if e.sub >= 0 and not inline_literal(e.dflt):
+            t2 = name_temp(&p)
+            out.push(t2 + " = " + value)
+            value = t2
+            vsimple = true
+        elif e.sub >= 0:
+            value = "(" + value + ")"
+    if e.sub >= 0:
+        pn_all(&p, t, e.sub, value, vsimple, &out)
+    else:
+        out.push(e.target + " = " + value)

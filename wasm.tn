@@ -1,0 +1,48 @@
+# ternts as a WebAssembly library that js/wasm.cjs loads in-process (Jest, Node hooks, Vite).
+#   tern build --lib --target wasm wasm.tn -o js/ternts.wasm
+import json
+import ts
+import tsconfig
+
+export fn transpile(src: str, file: str, esm: bool, want_map: bool, options: str) str:
+    o = opts_for(options, file)
+    o.esm = esm
+    r = ts.transpile_with(src, o, ts.empty_project(), "")
+    code = r.head + r.code
+    m = ""
+    if want_map and r.err == "":
+        name = base_name(file)
+        m = ts.source_map_from(src, code, len(r.head), name, name)
+    return f"{len(r.err)} {len(code)} {len(m)}\n" + r.err + code + m
+
+# options: the tsconfig's compilerOptions as JSON with `extends` merged (used when "$project"
+# is true), plus "$"-prefixed CLI flags that add to them.
+fn opts_for(options: str, file: str) ts.Opts:
+    flags = ts.opts()
+    project = false
+    match json.parse(options):
+        Ok(v):
+            flags.use_define = v.field("$define").bool_or(false)
+            flags.interop = v.field("$interop").bool_or(false)
+            flags.strict = v.field("$strict").bool_or(false)
+            flags.import_meta_cjs = v.field("$importMetaCjs").bool_or(false)
+            flags.jest_hoist = v.field("$jestHoist").bool_or(false)
+            t = v.field("$target").str_or("")
+            if t != "":
+                flags.target = tsconfig.target_year(t.lower())
+            project = v.field("$project").bool_or(false)
+        Err(e):
+            pass
+    # no tsconfig: ternts' defaults, as the CLI has
+    o = flags
+    if project:
+        o = tsconfig.options(tsconfig.from_options(options), flags, false)
+    o.tsx = file.ends_with(".tsx") or file.ends_with(".jsx")
+    o.file_name = file
+    return o
+
+fn base_name(p: str) str:
+    k = len(p) - 1
+    while k >= 0 and p.byte(k) != 47:
+        k -= 1
+    return p[k + 1..]

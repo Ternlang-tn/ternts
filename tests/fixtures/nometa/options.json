@@ -1,0 +1,15 @@
+{
+  "about": "Decorators without emitDecoratorMetadata.",
+  "sets": {
+    "cjs": {
+      "module": "commonjs",
+      "emitDecoratorMetadata": false,
+      "useDefineForClassFields": false
+    },
+    "esm": {
+      "module": "esnext",
+      "emitDecoratorMetadata": false,
+      "useDefineForClassFields": false
+    }
+  }
+}

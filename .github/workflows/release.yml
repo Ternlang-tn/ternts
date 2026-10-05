@@ -1,0 +1,140 @@
+# Release: push a tag vX.Y.Z (or vX.Y.Z-experimental, -beta.1...) to publish @ternlang/ternts and its
+# four platform binaries to npm, with provenance. A pre-release version (with a -suffix) goes out
+# under the dist-tag named by the suffix's first word (0.0.1-experimental -> "experimental"),
+# a plain version under "latest". Run it by hand (workflow_dispatch) to build without publishing.
+#
+#   build-mac      Tern, then @ternlang/ternts-darwin-{arm64,x64}, the two wasm files and @ternlang/ternts
+#   build-linux    @ternlang/ternts-linux-{arm64,x64}: static musl binaries, built (and
+#                  profile-trained) in Tern's linux-musl Docker image on a runner of that CPU
+#   publish        the binaries first, so @ternlang/ternts never points at missing packages
+#
+# Needs: secret TERN_DEPLOY_KEY (a read-only deploy key of the private Ternlang-tn/tern), secret
+# NPM_TOKEN (granular, publish rights to @ternlang/*, "bypass 2FA" on). Tern is built from source by its install.sh. It shares only
+# /tmp (and macOS's /Users, /private) with its Docker builds, so the Linux jobs work under /tmp.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "Build only, don't publish"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write          # npm provenance
+
+env:
+  TERN_DEPLOY_KEY: ${{ secrets.TERN_DEPLOY_KEY }}
+  NEST_SHA: 8843023c7a8d41c04ade7984cd5877122782512f   # the corpus profile-guided builds train on
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: v
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then V="${GITHUB_REF_NAME#v}"; else V="$(node -p "require('./npm/package.json').version")"; fi
+          if ! echo "$V" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then echo "::error::bad version $V"; exit 1; fi
+          case "$V" in *-*) T="${V#*-}"; T="${T%%.*}";; *) T=latest;; esac
+          echo "version=$V" >> "$GITHUB_OUTPUT"; echo "tag=$T" >> "$GITHUB_OUTPUT"
+          echo "ternts $V -> npm dist-tag $T"
+
+  build-mac:
+    needs: version
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with: { node-version: 22 }
+      - name: Tern
+        run: |
+          mkdir -p ~/.ssh && printf "%s\n" "$TERN_DEPLOY_KEY" > ~/.ssh/tern && chmod 600 ~/.ssh/tern
+          GIT_SSH_COMMAND="ssh -i ~/.ssh/tern -o StrictHostKeyChecking=accept-new" git clone -q --depth 1 git@github.com:Ternlang-tn/tern.git "$RUNNER_TEMP/tern"
+          (cd "$RUNNER_TEMP/tern" && ./install.sh "$HOME/.local/bin")
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Wasm toolchain
+        run: brew install llvm lld wasi-libc wasi-runtimes
+      - name: NestJS corpus (profile training)
+        run: |
+          mkdir -p bench/corpus/nest && cd bench/corpus/nest && git init -q
+          git fetch -q --depth 1 https://github.com/nestjs/nest.git "$NEST_SHA" && git checkout -q FETCH_HEAD
+      - name: Build
+        run: node npm/build.mjs --version "${{ needs.version.outputs.version }}" --skip-linux
+      - uses: actions/upload-artifact@v5
+        with:
+          name: npm-mac
+          path: npm/out/*.tgz
+          if-no-files-found: error
+
+  build-linux:
+    needs: version
+    strategy:
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, platform: linux-x64 }
+          - { runner: ubuntu-24.04-arm, platform: linux-arm64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with: { node-version: 22 }
+      - name: Work under /tmp (shared with Tern's Docker builds)
+        run: cp -R "$GITHUB_WORKSPACE" /tmp/ternts
+      - name: Tern
+        run: |
+          mkdir -p ~/.ssh && printf "%s\n" "$TERN_DEPLOY_KEY" > ~/.ssh/tern && chmod 600 ~/.ssh/tern
+          GIT_SSH_COMMAND="ssh -i ~/.ssh/tern -o StrictHostKeyChecking=accept-new" git clone -q --depth 1 git@github.com:Ternlang-tn/tern.git /tmp/tern
+          (cd /tmp/tern && ./install.sh "$HOME/.local/bin")
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: NestJS corpus (profile training)
+        run: |
+          mkdir -p /tmp/ternts/bench/corpus/nest && cd /tmp/ternts/bench/corpus/nest && git init -q
+          git fetch -q --depth 1 https://github.com/nestjs/nest.git "$NEST_SHA" && git checkout -q FETCH_HEAD
+      - name: Build
+        working-directory: /tmp/ternts
+        run: node npm/build.mjs --version "${{ needs.version.outputs.version }}" --platforms ${{ matrix.platform }} --no-main
+      - uses: actions/upload-artifact@v5
+        with:
+          name: npm-${{ matrix.platform }}
+          path: /tmp/ternts/npm/out/*.tgz
+          if-no-files-found: error
+
+  publish:
+    needs: [version, build-mac, build-linux]
+    if: github.ref_type == 'tag' || inputs.dry-run == false
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v5
+        with:
+          path: out
+          merge-multiple: true
+      - name: Publish (binaries first)
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          TAG: ${{ needs.version.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          ls -l out
+          # the platform binaries first, so @ternlang/ternts never points at missing packages
+          for pass in binaries main; do
+            for f in out/*.tgz; do
+              name=$(tar xzOf "$f" package/package.json | node -p 'JSON.parse(require("fs").readFileSync(0)).name')
+              if [ "$name" = "@ternlang/ternts" ] && [ $pass = binaries ]; then continue; fi
+              if [ "$name" != "@ternlang/ternts" ] && [ $pass = main ]; then continue; fi
+              if npm view "$name@$VERSION" version >/dev/null 2>&1; then echo "$name@$VERSION: already published"; continue; fi
+              echo "publishing $name"
+              npm publish "./$f" --access public --provenance --tag "$TAG"   # (./: a bare a/b.tgz is a GitHub repo to npm)
+            done
+          done

@@ -1,0 +1,14 @@
+/ternts
+/ternts_g
+*.dSYM/
+*.tern.c
+node_modules/
+*.orig
+/bench/corpus/
+/bench/out/
+/js/ternts.wasm
+/js/ternts.mjs
+/js/ternts.d.ts
+/js/ternts-cli.wasm
+# the test projects' package stores (pnpm-style) are fixtures, not installs
+!/tests/project/*/node_modules.fixture/**/node_modules/

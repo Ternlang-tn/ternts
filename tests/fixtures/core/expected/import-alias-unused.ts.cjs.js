@@ -1,0 +1,10 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.B = void 0;
+var i;
+const a_1 = require("./a");
+var B = a_1.A.C;
+exports.B = B;
+const bar = require("./b");
+var g = bar.G;
+console.log(g);

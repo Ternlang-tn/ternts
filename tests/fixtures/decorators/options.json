@@ -1,0 +1,29 @@
+{
+  "about": "Legacy decorators with emitDecoratorMetadata, per file (imported names guarded as transpileModule does).",
+  "sets": {
+    "cjs": {
+      "module": "commonjs",
+      "useDefineForClassFields": false
+    },
+    "esm": {
+      "module": "esnext",
+      "useDefineForClassFields": false
+    },
+    "strict": {
+      "module": "commonjs",
+      "esModuleInterop": true,
+      "strictNullChecks": true,
+      "useDefineForClassFields": false
+    },
+    "define": {
+      "module": "commonjs",
+      "useDefineForClassFields": true
+    },
+    "es2017": {
+      "module": "commonjs",
+      "useDefineForClassFields": false,
+      "target": "ES2017"
+    }
+  },
+  "known": {}
+}

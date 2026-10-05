@@ -1,0 +1,7 @@
+import fs from 'fs'; import ts from 'ts5'; import * as prettier from 'prettier'; import { execFileSync } from 'child_process';
+const f = process.argv[2]; const define = process.argv.includes('--define'); const esm = process.argv.includes('--esm'); const interop = process.argv.includes('--interop'); const strict = process.argv.includes('--strict');
+const src = fs.readFileSync(f, 'utf8');
+const want = ts.transpileModule(src, { fileName: f, compilerOptions: { jsx: { react: 2, 'react-jsx': 4, 'react-jsxdev': 5, preserve: 1 }[(process.argv.find(a => a.startsWith('--jsx=')) || '--jsx=react-jsx').slice(6)], module: esm ? 99 : 1, target: 10, experimentalDecorators: true, emitDecoratorMetadata: true, useDefineForClassFields: define, removeComments: true, esModuleInterop: interop, strictNullChecks: strict } }).outputText;
+const got = execFileSync(new URL('../ternts', import.meta.url).pathname, [f].concat(define ? ['--define'] : []).concat(esm ? ['--esm'] : []).concat(interop ? ['--interop'] : []).concat(strict ? ['--strict'] : []).concat(process.argv.filter(a => a.startsWith('--jsx=')))).toString();
+const fmt = async s => { try { return await prettier.format(s.replace(/\b_[a-z]\b|\b_\d+\b/g, '_T'), { parser: 'babel', printWidth: 120 }); } catch (e) { return 'PRETTIER FAIL ' + e.message + '\n' + s; } };
+fs.writeFileSync('/tmp/want.js', await fmt(want)); fs.writeFileSync('/tmp/got.js', await fmt(got));

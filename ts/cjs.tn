@@ -1,0 +1,60 @@
+# Renames an ES module's own top-level `require` to `require1` for CommonJS output (as swc does),
+# since Node's CommonJS wrapper already declares one. Only with import_meta_cjs; tsc keeps them.
+
+# The source with its own `require` renamed, or unchanged when it doesn't declare one.
+fn rename_own_require(src: str) str:
+    if src.find("require") < 0:
+        return src
+    p = new_p(src, false)
+    next(&p)
+    depth = 0
+    declares = false
+    prev_kw = 0
+    prev_op = -1
+    spots: [int] = []
+    classy: [bool] = []          # per open brace: is it a class body?
+    class_next = false           # `class` seen: its body is the next brace
+    while p.tok != T_EOF:
+        if p.tok == T_TPL_HEAD:
+            p.mute += 1
+            template(&p)
+            p.mute -= 1
+            prev_kw = 0
+            prev_op = -1
+            continue
+        if p.tok == T_OP:
+            if p.op == 123:
+                depth += 1
+                classy.push(class_next)
+                class_next = false
+            elif p.op == 125:
+                depth -= 1
+                if len(classy) > 0:
+                    classy.pop()
+            prev_op = p.op
+            prev_kw = 0
+            next(&p)
+            continue
+        if p.tok == T_NAME and p.kw == K_REQUIRE:
+            at = p.ts
+            if depth == 0 and (prev_kw == K_CONST or prev_kw == K_LET or prev_kw == K_VAR or prev_kw == K_FUNCTION or prev_kw == K_CLASS or prev_kw == K_AS or prev_kw == K_IMPORT):
+                declares = true
+            n = peek_tok(&p)
+            key = n.tok == T_OP and n.op == 58 and (prev_op == 123 or prev_op == 44)
+            # directly in a class body, a name is a member's unless an operator (`=`) comes before it
+            member = len(classy) > 0 and classy[len(classy) - 1] and (prev_op == -1 or prev_op == 123 or prev_op == 59 or prev_op == 125)
+            if prev_op != 46 and prev_op != O_QDOT and not key and not member:
+                spots.push(at)
+        if p.tok == T_NAME and p.kw == K_CLASS:
+            class_next = true
+        prev_kw = p.kw
+        prev_op = -1
+        next(&p)
+    if not declares or len(spots) == 0:
+        return src
+    out = ""
+    last = 0
+    for s in spots:
+        out += src[last..s] + "require1"
+        last = s + 7
+    return out + src[last..]

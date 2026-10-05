@@ -1,0 +1,6 @@
+{
+  "about": "verbatimModuleSyntax (ES modules): imports kept as written except type-only ones.",
+  "sets": {
+    "esm": { "module": "esnext", "verbatimModuleSyntax": true, "useDefineForClassFields": false }
+  }
+}

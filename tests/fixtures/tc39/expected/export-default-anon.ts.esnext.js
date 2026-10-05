@@ -1,0 +1,3 @@
+@dec
+export default class {
+}

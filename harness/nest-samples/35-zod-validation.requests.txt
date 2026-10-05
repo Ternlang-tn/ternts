@@ -1,0 +1,3 @@
+POST /cats {"name":"Tom","age":3,"breed":"x"}
+POST /cats {"name":5}
+GET /cats

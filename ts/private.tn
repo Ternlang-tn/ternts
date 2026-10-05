@@ -1,0 +1,499 @@
+# #private members below ES2022, lowered as tsc's class fields transform does (WeakMaps, WeakSets,
+# __classPrivateFieldGet/Set). A class's private members are known in a second pass (Hint kind 11).
+
+const H_PRIV_GET = 2048
+const H_PRIV_SET = 4096
+const H_PRIV_IN = 8192
+
+const PK_FIELD = 0
+const PK_METHOD = 1
+const PK_GET = 2
+const PK_SET = 3
+
+const HELPER_PRIV_GET = """var __classPrivateFieldGet = (this && this.__classPrivateFieldGet) || function (receiver, state, kind, f) {
+    if (kind === "a" && !f) throw new TypeError("Private accessor was defined without a getter");
+    if (typeof state === "function" ? receiver !== state || !f : !state.has(receiver)) throw new TypeError("Cannot read private member from an object whose class did not declare it");
+    return kind === "m" ? f : kind === "a" ? f.call(receiver) : f ? f.value : state.get(receiver);
+};"""
+
+const HELPER_PRIV_SET = """var __classPrivateFieldSet = (this && this.__classPrivateFieldSet) || function (receiver, state, value, kind, f) {
+    if (kind === "m") throw new TypeError("Private method is not writable");
+    if (kind === "a" && !f) throw new TypeError("Private accessor was defined without a setter");
+    if (typeof state === "function" ? receiver !== state || !f : !state.has(receiver)) throw new TypeError("Cannot write private member to an object whose class did not declare it");
+    return (kind === "a" ? f.call(receiver, value) : f ? f.value = value : state.set(receiver, value)), value;
+};"""
+
+const HELPER_PRIV_IN = """var __classPrivateFieldIn = (this && this.__classPrivateFieldIn) || function(state, receiver) {
+    if (receiver === null || (typeof receiver !== "object" && typeof receiver !== "function")) throw new TypeError("Cannot use 'in' operator on non-object");
+    return typeof state === "function" ? receiver === state : state.has(receiver);
+};"""
+
+struct PrivMember:
+    name: str           # without the "#"
+    kind: int
+    is_static: bool
+    var: str            # _C_x, _C_m, _C_g_get
+    storage: bool       # an `accessor` field's storage
+
+struct PrivClass:
+    start: int
+    members: [PrivMember]
+    inst: str           # _C_instances ("" without instance methods or accessors)
+    alias: str          # the class's temp (static members are read through it)
+    fns: [str]          # `_C_m = function _C_m() {...}`, in member order
+
+# First pass: a private member (or an accessor's storage) of the class being parsed.
+fn priv_record(p: mut P, name0: str, kind: int, is_static: bool, storage: bool):
+    if len(p.priv_rec) == 0:
+        return
+    name = ident_value(name0)
+    st = "0"
+    if is_static:
+        st = "1"
+    sg = "0"
+    if storage:
+        sg = "1"
+    k = len(p.priv_rec) - 1
+    p.priv_rec[k] = p.priv_rec[k] + name + " " + str(kind) + " " + st + " " + sg + ","
+
+# The hint of the class at `start` (its members, as recorded), or "".
+fn priv_hint(p: mut P, start: int) str:
+    for h in p.hints:
+        if h.kind == 11 and h.pos == start:
+            return h.repl
+    return ""
+
+fn priv_cf_push(p: mut P, fnid: int, name: str):
+    d = -1
+    if len(p.loop_sc) > 0:
+        d = p.loop_sc[len(p.loop_sc) - 1]
+    if d >= 0 and not fn_since(&p, d):
+        p.loop_lets[len(p.loop_lets) - 1].push(name)   # (block-scoped in a loop body, as tsc)
+        return
+    if fnid >= 0:
+        p.fn_cf_temps[fnid].push(name)
+    else:
+        p.cf_temps.push(name)
+
+# Is `name` a temp made already (_f, where #f of an unnamed class would be _f too)?
+fn temp_taken(p: mut P, name: str) bool:
+    if len(name) > 3 or not name.starts_with("_"):
+        return false
+    for t in p.temp_names:
+        if t == name:
+            return true
+    for t in p.cf_temps:
+        if t == name:
+            return true
+    for g in p.lt_mod:
+        for t in g:
+            if t == name:
+                return true
+    for ts in p.fn_temps:
+        for t in ts:
+            if t == name:
+                return true
+    for ts in p.fn_cf_temps:
+        for t in ts:
+            if t == name:
+                return true
+    for gs in p.fn_lt:
+        for g in gs:
+            for t in g:
+                if t == name:
+                    return true
+    return false
+
+# Has a function scope opened since the scope depth `d`?
+fn fn_since(p: mut P, d: int) bool:
+    for i in d..len(p.sc_fn):
+        if p.sc_fn[i]:
+            return true
+    return false
+
+fn priv_unique(p: mut P, n: str) str:
+    r = n
+    k = 0
+    while file_ident(&p, r) or (r in p.gen_names) or temp_taken(&p, r):   # (also unique against generated names)
+        k += 1
+        r = n + "_" + str(k)
+    p.gen_names[r] = true
+    return r
+
+# Second pass: the class's names, declared in tsc's order (instances, alias, members, accessor
+# storage last). `cname` is "" for an anonymous class.
+fn priv_class(p: mut P, rec: str, start: int, cname: str, fnid: int, want_alias: bool) PrivClass:
+    members: [PrivMember] = []
+    any_static = false
+    any_inst = false
+    for e in rec.split(","):
+        if e == "":
+            continue
+        f = e.split(" ")
+        m = PrivMember(f[0], f[1].to_int(0), f[2] == "1", "", f[3] == "1")
+        if m.is_static:
+            any_static = true
+        elif m.kind != PK_FIELD:
+            any_inst = true
+        members.push(m)
+    pre = "_" + cname + "_"
+    if cname == "":
+        pre = "_"
+    c = PrivClass(start, members, "", "", [])
+    if any_inst:
+        c.inst = priv_unique(&p, pre + "instances")
+        priv_cf_push(&p, fnid, c.inst)
+    if any_static or want_alias:
+        c.alias = p.ct_alias                     # (esdecorators' _classThis: class.tn esdec_this)
+        if c.alias == "":
+            c.alias = class_temp(&p, fnid)
+    for round in 0..2:
+        for i in 0..len(c.members):
+            m = c.members[i]
+            if (round == 0) == m.storage:
+                continue
+            v = pre + m.name
+            if m.kind == PK_GET:
+                v += "_get"
+            elif m.kind == PK_SET:
+                v += "_set"
+            c.members[i].var = priv_unique(&p, v)
+            priv_cf_push(&p, fnid, c.members[i].var)
+    return c
+
+# A name with its \u escapes decoded (#\u0078 is #x).
+fn ident_value(t: str) str:
+    if not t.contains("\\"):
+        return t
+    out = ""
+    k = 0
+    while k < len(t):
+        if t.byte(k) == 92 and k + 1 < len(t) and t.byte(k + 1) == 117:
+            if k + 2 < len(t) and t.byte(k + 2) == 123:
+                e = t.find_from("}", k)
+                if e > 0:
+                    out += utf8_of(entity_hex(t[k + 3..e]))
+                    k = e + 1
+                    continue
+            elif k + 6 <= len(t):
+                out += utf8_of(entity_hex(t[k + 2..k + 6]))
+                k += 6
+                continue
+        out += t[k..k + 1]
+        k += 1
+    return out
+
+# The member `name` of the innermost class that has one, for reading (getter) or writing
+# (setter): [class index, member index], or [-1, -1].
+fn priv_find(p: mut P, name0: str, write: bool) [int]:
+    name = ident_value(name0)
+    ci = len(p.privs) - 1
+    while ci >= 0:
+        best = -1
+        for mi in 0..len(p.privs[ci].members):
+            m = p.privs[ci].members[mi]
+            if m.name == name:
+                if best < 0:
+                    best = mi
+                if (write and m.kind == PK_SET) or (not write and m.kind == PK_GET):
+                    best = mi
+        if best >= 0:
+            return [ci, best]
+        ci -= 1
+    return [-1, -1]
+
+fn priv_get(p: mut P, recv: str, ci: int, mi: int) str:
+    priv_helper(&p, H_PRIV_GET)
+    c = p.privs[ci]
+    m = c.members[mi]
+    if m.kind == PK_FIELD:
+        if m.is_static:
+            return "__classPrivateFieldGet(" + recv + ", " + c.alias + ", \"f\", " + m.var + ")"
+        return "__classPrivateFieldGet(" + recv + ", " + m.var + ", \"f\")"
+    state = c.inst
+    if m.is_static:
+        state = c.alias
+    k = "m"
+    if m.kind != PK_METHOD:
+        k = "a"
+    if m.kind == PK_SET:                         # (no getter: tsc leaves the argument out)
+        return "__classPrivateFieldGet(" + recv + ", " + state + ", \"" + k + "\")"
+    return "__classPrivateFieldGet(" + recv + ", " + state + ", \"" + k + "\", " + m.var + ")"
+
+fn priv_set(p: mut P, recv: str, ci: int, mi: int, value: str) str:
+    priv_helper(&p, H_PRIV_SET)
+    c = p.privs[ci]
+    m = c.members[mi]
+    if m.kind == PK_FIELD:
+        if m.is_static:
+            return "__classPrivateFieldSet(" + recv + ", " + c.alias + ", " + value + ", \"f\", " + m.var + ")"
+        return "__classPrivateFieldSet(" + recv + ", " + m.var + ", " + value + ", \"f\")"
+    state = c.inst
+    if m.is_static:
+        state = c.alias
+    if m.kind == PK_METHOD:
+        return "__classPrivateFieldSet(" + recv + ", " + state + ", " + value + ", \"m\")"
+    if m.kind == PK_GET:                         # (no setter: the same)
+        return "__classPrivateFieldSet(" + recv + ", " + state + ", " + value + ", \"a\")"
+    return "__classPrivateFieldSet(" + recv + ", " + state + ", " + value + ", \"a\", " + m.var + ")"
+
+
+
+
+fn priv_inits(c: PrivClass, alias_of: str, env: bool) [str]:
+    out: [str] = []
+    if c.alias != "" and alias_of != "":
+        out.push(c.alias + " = " + alias_of)
+    if env:
+        for e in priv_env(c):
+            out.push(e)
+    for f in c.fns:
+        out.push(f)
+    return out
+
+# The WeakMaps and WeakSet (evaluated first when a member name is computed).
+fn priv_env(c: PrivClass) [str]:
+    out: [str] = []
+    for m in c.members:
+        if m.kind == PK_FIELD and not m.is_static and not m.storage:
+            out.push(m.var + " = new WeakMap()")
+    if c.inst != "":
+        out.push(c.inst + " = new WeakSet()")
+    for m in c.members:
+        if m.kind == PK_FIELD and not m.is_static and m.storage:
+            out.push(m.var + " = new WeakMap()")
+    return out
+
+fn pk_of(kind: int) int:
+    if kind == M_GET:
+        return PK_GET
+    if kind == M_SET:
+        return PK_SET
+    return PK_METHOD
+
+# A private method's parameters and body (output from `mark` on) become `_C_m = function _C_m(a) { ... }`
+# after the class.
+fn priv_method_out(p: mut P, mark: int, name: str, kind: int, is_async: bool, gen: bool):
+    emit_pe(&p)
+    text = p.out[mark..].trim()
+    p.out = p.out[..mark]
+    c = p.privs[p.priv_cur]
+    v = ""
+    for m in c.members:
+        if m.name == name and m.kind == kind:
+            v = m.var
+    head = "function"
+    if is_async and p.target >= 2017:
+        head = "async function"
+    if gen:
+        head += "*"
+    p.privs[p.priv_cur].fns.push(v + " = " + head + " " + v + text)
+
+# A private field (at what follows its key): its initializer moves to the constructor
+# (`_C_x.set(this, init)`) or, static, to the statics (`_C_x = { value: init }`).
+fn priv_field(p: mut P, inits: mut [str], name: str, is_static: bool, member_start: int, acc: str):
+    if at_op(&p, 63) or (at_op(&p, 33) and not p.nlb):
+        next(&p)
+    if at_op(&p, 58):
+        p.mute += 1
+        next(&p)
+        p.bad = false
+        parse_type(&p)
+        p.bad = false
+        p.mute -= 1
+    init = "void 0"
+    if at_op(&p, 61):
+        next(&p)
+        skip_ts(&p)
+        saved = begin_capture(&p)
+        if is_static and p.spl:
+            p.in_static += 1                     # (ES2022: the value stays in the class, in a
+        elif is_static:                          # static block: `this` is the class)
+            p.in_static += 1
+            p.st_on = true
+            p.this_depth -= 1
+        elif p.init_fn >= 0:
+            p.fn_stack.push(p.init_fn)
+        pb = p.priv_bucket
+        if not is_static:
+            p.priv_bucket = 1
+        else:
+            p.priv_bucket = 3                    # (statics: transformed after the members)
+        assign(&p, false)
+        p.priv_bucket = pb
+        if is_static and p.spl:
+            p.in_static -= 1
+        elif is_static:
+            p.in_static -= 1
+            p.st_on = false
+            p.this_depth += 1
+        elif p.init_fn >= 0:
+            p.fn_stack.pop()
+        emit_pe(&p)
+        t = end_capture(&p, saved)
+        init = t.trim()
+    eat_op(&p, 59)
+    emit_to(&p, member_start)
+    skip_pe(&p)
+    rd = priv_find(&p, name, false)
+    v = p.privs[rd[0]].members[rd[1]].var
+    if is_static and p.spl:
+        put(&p, "static { " + v + " = { value: " + init + " }; }")   # (the accessor after it)
+    if acc != "":
+        put(&p, acc)
+    if is_static and p.spl:
+        pass
+    elif is_static:
+        p.st_list.push(v + " = { value: " + init + " }")
+    else:
+        inits.push(" " + v + ".set(this, " + init + ");")
+
+# `accessor x` below ES2022: its getter and setter over the storage, through the helpers.
+fn priv_accessor_text(p: mut P, store: str, is_static: bool, st: str, get_key: str, set_key: str) str:
+    rd = priv_find(&p, store, false)
+    if rd[0] < 0:
+        return ""
+    recv = "this"
+    if is_static:
+        recv = p.privs[rd[0]].alias
+    if get_key.starts_with("#"):                 # (tsc makes these before the constructor's)
+        for h in [H_PRIV_GET, H_PRIV_SET]:
+            if not priv_has(p.priv_order, h):
+                p.priv_order.push(h)
+                p.helpers = p.helpers | h
+    g = priv_get(&p, recv, rd[0], rd[1])
+    s = priv_set(&p, recv, rd[0], rd[1], "value")
+    if get_key.starts_with("#"):                 # accessor #a: its #a get/set are functions too
+        rg = priv_find(&p, get_key[1..], false)
+        rs = priv_find(&p, get_key[1..], true)
+        if rg[0] >= 0 and rs[0] >= 0:
+            vg = p.privs[rg[0]].members[rg[1]].var
+            vs = p.privs[rs[0]].members[rs[1]].var
+            p.privs[p.priv_cur].fns.push(vg + " = function " + vg + "() { return " + g + "; }")
+            p.privs[p.priv_cur].fns.push(vs + " = function " + vs + "(value) { " + s + "; }")
+            return " "
+    return " " + st + "get " + get_key + "() { return " + g + "; } " + st + "set " + set_key + "(value) { " + s + "; }"
+
+fn rtrim(s: str) str:
+    k = len(s)
+    while k > 0 and (s.byte(k - 1) == 32 or s.byte(k - 1) == 10 or s.byte(k - 1) == 9 or s.byte(k - 1) == 13):
+        k -= 1
+    return s[..k]
+
+
+fn priv_helper(p: mut P, h: int):
+    if p.helpers & h != 0 and priv_has(p.priv_order, h):
+        return
+    p.helpers = p.helpers | h
+    if len(p.pq) == 0:
+        p.priv_order.push(h)
+        return
+    k = len(p.pq) - 1
+    code = p.priv_bucket * 1000000000000 + p.pq_member[k] * 10000000 + h
+    for c in p.pq[k]:
+        if c == code:
+            return
+    p.pq[k].push(code)
+
+fn priv_has(xs: [int], h: int) bool:
+    for x in xs:
+        if x == h:
+            return true
+    return false
+
+# At the class's end: its helper requests in tsc's classFields order: members, then the
+# constructor's body and instance initializers, statics last.
+fn priv_flush(p: mut P):
+    q = p.pq.pop()
+    p.pq_member.pop()
+    ctor = p.pq_ctor.pop()
+    keys: [int] = []
+    for c in q:
+        b = c / 1000000000000
+        mi = (c / 10000000) % 100000
+        key = mi * 4
+        if b == 1:
+            key = 400000 + mi                    # no constructor: after the members
+            if ctor >= 0:
+                key = ctor * 4 + 1
+        elif b == 3:
+            key = 800000 + mi
+        keys.push(key)
+    used: [bool] = [false] * len(q)
+    for _ in 0..len(q):
+        best = -1
+        for i in 0..len(q):
+            if not used[i] and (best < 0 or keys[i] < keys[best]):
+                best = i
+        used[best] = true
+        h = q[best] % 10000000
+        if not priv_has(p.priv_order, h):
+            p.priv_order.push(h)
+
+fn priv_helpers_text(p: mut P) str:
+    t = ""
+    for h in p.priv_order:
+        if h == H_PRIV_GET:
+            t += HELPER_PRIV_GET + "\n"
+        elif h == H_PRIV_SET:
+            t += HELPER_PRIV_SET + "\n"
+        elif h == H_PRIV_IN:
+            t += HELPER_PRIV_IN + "\n"
+        elif h == H_SET_FUNCTION_NAME:
+            if not esdec_wants(p.esdec_helpers, ED_SETNAME):   # (the decorators asked first)
+                t += HELPER_SET_FUNCTION_NAME + "\n"
+        else:
+            t += agen_helper_text(h)
+    return t
+
+# assign() at "{" / "[" of an assignment pattern with #private targets below ES2022:
+# `(_b = this, { x: ({ set value(_c) { __classPrivateFieldSet(_b, _A_x, _c, "f"); } }).value } = o)`.
+fn priv_pattern_ahead(p: mut P) bool:
+    s0 = save(&p)
+    a = p.ts
+    p.mute += 1
+    skip_group(&p)
+    ok = at_op(&p, 61) and p.src[a..p.ts].contains("#")
+    p.mute -= 1
+    restore(&p, s0)
+    return ok
+
+fn assign_priv_pattern(p: mut P, no_in: bool):
+    emit_ts(&p)
+    pre = p.out
+    lhs_at = p.ts
+    saved = begin_capture(&p)
+    o_pat = p.ppat
+    o_pre = p.ppat_pre
+    p.ppat = true
+    p.ppat_pre = []
+    np = p.in_pattern
+    p.in_pattern = true                          # (its { ...r } aren't spreads to lower)
+    conditional(&p, no_in)
+    p.in_pattern = np
+    emit_pe(&p)
+    lhs = end_capture(&p, saved)
+    pres = p.ppat_pre
+    p.ppat = o_pat
+    p.ppat_pre = o_pre
+    next(&p)                                     # =
+    skip_ts(&p)
+    a = p.ts
+    saved2 = begin_capture(&p)
+    assign(&p, no_in)
+    emit_pe(&p)
+    rhs = end_capture(&p, saved2)
+    text = ""
+    if p.target < 2018 and needs_rest(lhs):      # with object rest too
+        used = not rest_value_unused(&p, pre, lhs_at)
+        text = rest_assign_text(&p, lhs.trim(), rhs.trim(), simple_copy(p.src[a..p.pe].trim()), used)
+        if used and len(pres) == 0:
+            text = "(" + text + ")"
+    else:
+        text = lhs.trim() + " = " + rhs.trim()
+    if len(pres) > 0:
+        text = "(" + ", ".join(pres) + ", " + text + ")"
+    put(&p, text)
+
+
+

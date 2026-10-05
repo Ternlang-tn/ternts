@@ -1,0 +1,10 @@
+import { OrdersService, Status, LIMIT } from "./models";
+import { Svc } from "./barrel";
+import * as all from "./models";
+export { OrdersService };
+const o = new OrdersService().find("1");
+const r = o;
+const s = new Svc();
+let id = "x";
+export const out = [o, r, s, id, Status.Open, LIMIT, all.LIMIT];
+let t;

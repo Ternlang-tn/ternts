@@ -1,0 +1,116 @@
+# ternts: TypeScript to JavaScript, like `tsc` (including legacy decorators and metadata).
+# Adds dev, --watch and --serve to the commands in cli.tn.
+#
+#   ternts IN.ts [OUT.js] | --outdir DIR FILE... | --bench N FILE...
+#   ternts build [SRC OUT] [-p tsconfig.json] [--no-spec] [--force] [--watch]
+#   ternts dev [SRC OUT] [--warm] [-- CMD...]
+#   ternts --serve [-p tsconfig.json]
+import cli
+import dev
+import fs
+import os
+import task
+import time
+import ts
+import tsconfig
+
+fn main():
+    a = cli.parse(os.args())
+    if not cli.is_async(a):
+        cli.run(a)
+        return
+    rest = a.rest
+    if rest[0] == "--serve":
+        o = a.o
+        if a.project != "":
+            # the client still says per request whether it wants an ES module
+            c = tsconfig.load(a.project)
+            if c.err != "":
+                os.eprint("ternts: " + c.err)
+                os.exit(1)
+            o = tsconfig.options(c, o, a.jsx_given)
+        serve(o)
+        return
+    p = cli.project(a)
+    if rest[0] == "dev":
+        watch(p.src, p.out, p.o, cli.has(rest, "--no-spec"), dev.command(a.args, p.out, os.env("TERNTS_SOURCEMAP", "") != ""), cli.has(rest, "--warm"))
+        return
+    watch(p.src, p.out, p.o, cli.has(rest, "--no-spec"), [], false)
+
+# Requests on stdin, replies on stdout, until stdin closes. The body is read by exact length
+# because a read of "up to n bytes" waits for all n on a pipe.
+fn serve(base: ts.Opts):
+    inp = fs.open("/dev/stdin")
+    while true:
+        line = inp.read_line()
+        if line == "":
+            return
+        head = line.trim().split(" ")
+        o = base
+        want_map = len(head) > 2 and head[2] == "1"
+        file = ""
+        if len(head) > 3:
+            file = line.trim()[len(head[0]) + len(head[1]) + len(head[2]) + 3..]
+            o = cli.for_file(base, file)        # .tsx decides JSX; the map names the file
+        o.esm = head[0] == "1"
+        n = head[1].to_int(0)
+        src = ""
+        while len(src) < n:
+            more = inp.read_some(n - len(src))
+            if more == "":
+                return
+            src += more
+        r = ts.transpile_with(src, o, ts.empty_project(), "")
+        code = r.head + r.code
+        if want_map:
+            m = ""
+            if r.err == "":
+                m = ts.source_map_from(src, code, len(r.head), cli.base_name(file), cli.base_name(file))
+            print(f"{len(r.err)} {len(code)} {len(m)}\n" + r.err + code + m)
+        else:
+            print(f"{len(r.err)} {len(code)}\n" + r.err + code)
+        os.flush()
+
+# Rebuild whenever a source changes and, for dev, restart the app. Polls every 10 ms (10x the
+# poll's cost on big trees) and waits for 5 ms of quiet so a multi-file save is one rebuild.
+fn watch(src: str, out: str, o: ts.Opts, no_spec: bool, cmd: [str], warm: bool):
+    os.setenv("TERNTS_WATCHING", "1")
+    t0 = time.mono_ns()
+    n = cli.build(src, out, o, no_spec, false)
+    print(f"[ternts] built {n} files in {(time.mono_ns() - t0) / 1000000} ms; watching {src}")
+    os.flush()
+    app = dev.app(cmd, out, warm)
+    quit: chan[str] = task.channel(1)
+    if len(cmd) > 0:
+        quit = dev.signals()
+        dev.start(&app)
+    t1 = time.mono_ns()
+    seen = cli.stamps(src)
+    every = max(10, (time.mono_ns() - t1) / 1000000 * 10)
+    while true:
+        time.sleep(every)
+        dev.quit_if_asked(quit, &app)
+        dev.ended(&app)
+        now = cli.stamps(src)
+        if now == seen:
+            continue
+        settled = 0
+        while settled < 10:
+            time.sleep(5)
+            again = cli.stamps(src)
+            if again == now:
+                break
+            now = again
+            settled += 1
+        t2 = time.mono_ns()
+        n = cli.build(src, out, o, no_spec, false)
+        seen = now
+        took = (time.mono_ns() - t2) / 1000000
+        if len(cmd) == 0 or n == 0:
+            print(f"[ternts] rebuilt {n} file(s) in {took} ms")
+            os.flush()
+            continue
+        print(f"[ternts] rebuilt {n} file(s) in {took} ms; restarting")
+        os.flush()
+        dev.restart(&app)
+

@@ -1,0 +1,6 @@
+GET /cats
+POST /cats {"name":"Tom","age":3,"breed":"tabby"}
+POST /cats {"name":"Bad","age":"x"}
+GET /cats/1
+GET /cats/abc
+GET /nope

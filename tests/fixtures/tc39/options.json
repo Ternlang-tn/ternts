@@ -1,0 +1,49 @@
+{
+  "about": "TC39 decorators (TypeScript 5's, experimentalDecorators off): kept as written at ESNext, tsc's esDecorators transform below it (esdecorators.tn).",
+  "sets": {
+    "esnext": {
+      "module": "esnext",
+      "target": "ESNext",
+      "experimentalDecorators": false,
+      "emitDecoratorMetadata": false
+    },
+    "es2022": {
+      "module": "commonjs",
+      "experimentalDecorators": false,
+      "emitDecoratorMetadata": false
+    },
+    "es2022-esm": {
+      "module": "esnext",
+      "experimentalDecorators": false,
+      "emitDecoratorMetadata": false
+    },
+    "esnext-nodefine": {
+      "module": "esnext",
+      "target": "ESNext",
+      "useDefineForClassFields": false,
+      "experimentalDecorators": false,
+      "emitDecoratorMetadata": false,
+      "files": ["esnext-nodefine.ts"]
+    },
+    "es2015": {
+      "module": "commonjs",
+      "target": "ES2015",
+      "experimentalDecorators": false,
+      "emitDecoratorMetadata": false
+    }
+  },
+  "known": {
+    "export-equals.ts": {
+      "why": "export = has no ES module output (tsc reports it); only CommonJS sets apply",
+      "sets": [
+        "es2022-esm"
+      ]
+    },
+    "named-fields.ts": {
+      "why": "below ES2022: decorated classes in static field initializers of an undecorated class: tsc reads the class through a temp per class (_a = C)",
+      "sets": [
+        "es2015"
+      ]
+    }
+  }
+}

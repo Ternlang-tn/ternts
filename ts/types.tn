@@ -1,0 +1,524 @@
+# Types: parsed only to be removed, and serialized for decorator metadata
+# (`design:type`, `design:paramtypes`) the way tsc does it.
+
+const SER_VOID = 1      # void 0
+const SER_STRING = 2
+const SER_NUMBER = 3
+const SER_BOOLEAN = 4
+const SER_BIGINT = 5
+const SER_SYMBOL = 6
+const SER_ARRAY = 7
+const SER_FUNCTION = 8
+const SER_OBJECT = 9
+const SER_REF = 10      # a type name, resolved at the end: text is "A.B"
+const SER_UNION = 11    # parts, resolved at the end
+const SER_SKIP = 12     # null/undefined/never inside a union
+const SER_ANY = 13      # any/unknown: Object, and a union containing it is Object
+const SER_TPARAM = 14   # a class type parameter: serialized by its constraint (parts[0], if any)
+
+struct Ser:
+    kind: int
+    text: str
+    parts: [Ser]
+    inter: bool         # an intersection (never makes it void 0)
+
+fn ser(kind: int) Ser:
+    return Ser(kind, "", [], false)
+
+# Parse a type. On a token that can't be part of a type, sets p.bad.
+fn parse_type(p: mut P) Ser:
+    if at_op(&p, 60):                                # <T>(x: T) => R
+        skip_type_params(&p)
+        return function_type(&p)
+    if at_kw(&p, K_NEW) or (at_kw(&p, K_ABSTRACT) and peek_tok(&p).kw == K_NEW):
+        if at_kw(&p, K_ABSTRACT):
+            next(&p)
+        next(&p)
+        if at_op(&p, 60):
+            skip_type_params(&p)
+        function_type(&p)
+        return ser(SER_FUNCTION)
+    if at_op(&p, 40) and is_function_type(&p):
+        return function_type(&p)
+    t = union_type(&p)
+    if at_kw(&p, K_EXTENDS) and not p.nlb and p.no_cond == 0:
+        next(&p)
+        nt = len(p.tparams)                      # (`infer X`s are type parameters in the true type)
+        s0 = save(&p)
+        p.no_cond += 1
+        parse_type(&p)
+        p.no_cond -= 1
+        if p.src[s0.ts..p.ts].contains("infer"):
+            infer_names(&p, s0)
+        texpect(&p, 63)
+        a = parse_type(&p)
+        while len(p.tparams) > nt:
+            p.tparams.pop()
+        texpect(&p, 58)
+        b = parse_type(&p)
+        return Ser(SER_UNION, "cond", [a, b], false)
+    return t
+
+# The `infer X` names in a conditional type's extends clause (from s0): type parameters of its true type.
+fn infer_names(p: mut P, s0: LexState):
+    s1 = save(&p)
+    end = p.ts
+    p.mute += 1
+    restore(&p, s0)
+    while p.ts < end and p.tok != T_EOF:
+        if at_kw(&p, K_INFER):
+            next(&p)
+            if p.tok == T_NAME:
+                p.tparams.push(tok_text(&p))
+        next(&p)
+    p.mute -= 1
+    restore(&p, s1)
+
+fn function_type(p: mut P) Ser:
+    skip_group(&p)
+    if not eat_op(&p, O_ARROW):
+        p.bad = true
+        return ser(SER_OBJECT)
+    nc = p.no_cond                               # (X extends () => A extends B ? 1 : 2 ? C : D:
+    p.no_cond = 0                                # the return type may be conditional again)
+    return_type(&p)
+    p.no_cond = nc
+    return ser(SER_FUNCTION)
+
+# A return type: may be a predicate (`x is T`, `asserts x`, `asserts this is T`).
+fn return_type(p: mut P) Ser:
+    if at_kw(&p, K_ASSERTS):
+        k = peek_tok(&p)
+        if k.tok == T_NAME and not k.nlb:
+            next(&p)
+            next(&p)
+            if at_kw(&p, K_IS) and not p.nlb:
+                next(&p)
+                parse_type(&p)
+            return ser(SER_BOOLEAN)
+    if p.tok == T_NAME:
+        k = peek_tok(&p)
+        if k.tok == T_NAME and k.kw == K_IS and not k.nlb:
+            next(&p)
+            next(&p)
+            parse_type(&p)
+            return ser(SER_BOOLEAN)
+    return parse_type(&p)
+
+# At "(": is this `(params) => R`? TypeScript's test: ")" or "..." next, or a
+# parameter name followed by ":", ",", "?", "=", or ") =>".
+fn is_function_type(p: mut P) bool:
+    s = save(&p)
+    r = false
+    next(&p)
+    if at_op(&p, 41) or at_op(&p, O_DOTS):
+        r = true
+    else:
+        while p.tok == T_NAME and (p.kw == K_PUBLIC or p.kw == K_PRIVATE or p.kw == K_PROTECTED or p.kw == K_READONLY) and peek_tok(&p).tok == T_NAME:
+            next(&p)
+        ok = false
+        if p.tok == T_NAME:
+            next(&p)
+            ok = true
+        elif at_op(&p, 91) or at_op(&p, 123):
+            p.bad = false
+            skip_group(&p)
+            ok = not p.bad
+            p.bad = false
+        if ok:
+            if at_op(&p, 58) or at_op(&p, 44) or at_op(&p, 63) or at_op(&p, 61):
+                r = true
+            elif at_op(&p, 41):
+                next(&p)
+                r = at_op(&p, O_ARROW)
+    restore(&p, s)
+    return r
+
+fn union_type(p: mut P) Ser:
+    eat_op(&p, 124)
+    first = inter_type(&p)
+    if not at_op(&p, 124):
+        return first
+    parts = [first]
+    while eat_op(&p, 124):
+        parts.push(inter_type(&p))
+    return Ser(SER_UNION, "", parts, false)
+
+fn inter_type(p: mut P) Ser:
+    eat_op(&p, 38)
+    first = op_type(&p)
+    if not at_op(&p, 38):
+        return first
+    parts = [first]
+    while eat_op(&p, 38):
+        parts.push(op_type(&p))
+    return Ser(SER_UNION, "", parts, true)
+
+fn op_type(p: mut P) Ser:
+    if p.tok == T_NAME:
+        if p.kw == K_KEYOF or p.kw == K_UNIQUE:
+            k = peek_tok(&p)
+            if starts_type(k):
+                next(&p)
+                operand = op_type(&p)
+                return Ser(SER_OBJECT, "keyof", [operand], false)
+        if p.kw == K_READONLY:
+            k = peek_tok(&p)
+            if starts_type(k):
+                next(&p)
+                return op_type(&p)
+        if p.kw == K_INFER:
+            next(&p)
+            next(&p)
+            if at_kw(&p, K_EXTENDS) and p.no_cond == 0:
+                # `infer U extends X` is a constraint only if a `?` doesn't follow
+                s = save(&p)
+                next(&p)
+                p.no_cond += 1
+                parse_type(&p)
+                p.no_cond -= 1
+                if at_op(&p, 63):
+                    restore(&p, s)
+            elif at_kw(&p, K_EXTENDS):
+                next(&p)
+                parse_type(&p)
+            return Ser(SER_OBJECT, "infer", [], false)
+    t = primary_type(&p)
+    while at_op(&p, 91) and not p.nlb:
+        next(&p)
+        if eat_op(&p, 93):
+            t = Ser(SER_ARRAY, "elem", [t], false)
+        else:
+            ix = parse_type(&p)
+            texpect(&p, 93)
+            t = Ser(SER_OBJECT, "index", [t, ix], false)     # T["k"]: Object, unless T can't be resolved
+    return t
+
+fn starts_type(k: LexState) bool:
+    if k.tok == T_NAME or k.tok == T_STR or k.tok == T_NUM or k.tok == T_TPL or k.tok == T_TPL_HEAD:
+        return true
+    return k.tok == T_OP and (k.op == 40 or k.op == 91 or k.op == 123 or k.op == 45 or k.op == 60)
+
+fn primary_type(p: mut P) Ser:
+    if p.tok == T_NAME:
+        k = p.kw
+        if k == K_STRING or k == K_NUMBER or k == K_BOOLEAN or k == K_ANY or k == K_UNKNOWN or k == K_VOID or k == K_UNDEFINED or k == K_NULL or k == K_NEVER or k == K_OBJECT or k == K_SYMBOL or k == K_BIGINT or k == K_TRUE or k == K_FALSE or k == K_THIS:
+            s = save(&p)
+            next(&p)
+            if at_op(&p, 46) and k != K_THIS:                 # a name like `string.x`: a namespace
+                restore(&p, s)
+            else:
+                return keyword_ser(k)
+        if k == K_TYPEOF:
+            next(&p)
+            operand = ""
+            if at_kw(&p, K_IMPORT):
+                import_type(&p)
+            else:
+                a = p.ts
+                b = p.te
+                operand = entity_name(&p)
+                sb = p.self_bind
+                if sb >= 0 and p.binds[sb].active and same_text(p.src, a, b - a, p.binds[sb].name):
+                    p.binds[sb].last_ref = a
+            if at_op(&p, 60) and not p.nlb:
+                skip_type_args(&p)
+            return Ser(SER_OBJECT, "typeof", [Ser(SER_REF, operand, [], false)], false)
+        if k == K_IMPORT:
+            import_type(&p)
+            return Ser(SER_OBJECT, "import", [], false)
+        name = entity_name(&p)
+        args: [Ser] = []
+        if at_op(&p, O_SHL) and not p.nlb:
+            split_shl(&p)                        # F<<T>(x: T) => T>
+        if at_op(&p, 60) and not p.nlb:
+            # one type argument is kept: a rest parameter `...xs: Array<T>` serializes as T
+            s = save(&p)
+            next(&p)
+            one = parse_type(&p)
+            if not p.bad and at_op(&p, 62):
+                args.push(one)
+            restore(&p, s)
+            p.bad = false
+            skip_type_args(&p)
+        if is_tparam(&p, name):
+            if (name in p.tparam_cons):
+                return Ser(SER_TPARAM, name, [p.tparam_cons[name]], false)
+            return ser(SER_OBJECT)
+        return Ser(SER_REF, name, args, false)
+    if p.tok == T_STR or p.tok == T_TPL:
+        next(&p)
+        return ser(SER_STRING)
+    if p.tok == T_TPL_HEAD:
+        template_type(&p)
+        return ser(SER_STRING)
+    if p.tok == T_NUM:
+        big = p.src.byte(p.te - 1) == 110
+        next(&p)
+        if big:
+            return ser(SER_BIGINT)
+        return ser(SER_NUMBER)
+    if p.tok == T_OP:
+        if p.op == 45:                                       # -1
+            next(&p)
+            big = p.tok == T_NUM and p.src.byte(p.te - 1) == 110
+            next(&p)
+            if big:
+                return ser(SER_BIGINT)
+            return ser(SER_NUMBER)
+        if p.op == 40:
+            next(&p)
+            nc = p.no_cond                       # (A extends B ? C : D) is fine after `extends`
+            p.no_cond = 0
+            t = parse_type(&p)
+            p.no_cond = nc
+            texpect(&p, 41)
+            return t
+        if p.op == 123:
+            nc = p.no_cond
+            p.no_cond = 0
+            object_type_body(&p)
+            p.no_cond = nc
+            return ser(SER_OBJECT)
+        if p.op == 91:
+            skip_group(&p)
+            return ser(SER_ARRAY)
+        if p.op == 63 or p.op == 42:                         # JSDoc `?` and `*`
+            next(&p)
+            return ser(SER_OBJECT)
+    p.bad = true
+    return ser(SER_OBJECT)
+
+fn keyword_ser(k: int) Ser:
+    if k == K_STRING:
+        return ser(SER_STRING)
+    if k == K_NUMBER:
+        return ser(SER_NUMBER)
+    if k == K_BOOLEAN or k == K_TRUE or k == K_FALSE:
+        return ser(SER_BOOLEAN)
+    if k == K_VOID or k == K_NEVER:
+        return ser(SER_VOID)
+    if k == K_UNDEFINED or k == K_NULL:
+        return Ser(SER_VOID, "null", [], false)
+    if k == K_SYMBOL:
+        return ser(SER_SYMBOL)
+    if k == K_BIGINT:
+        return ser(SER_BIGINT)
+    if k == K_ANY or k == K_UNKNOWN:
+        return Ser(SER_ANY, "", [], k == K_UNKNOWN)
+    return ser(SER_OBJECT)
+
+# `import("mod").A.B`
+fn import_type(p: mut P):
+    next(&p)
+    skip_group(&p)
+    while at_op(&p, 46):
+        next(&p)
+        next(&p)
+    if at_op(&p, O_SHL) and not p.nlb:
+        split_shl(&p)
+    if at_op(&p, 60) and not p.nlb:
+        skip_type_args(&p)
+
+# A.B.C, returned as written.
+fn entity_name(p: mut P) str:
+    if p.tok != T_NAME:
+        p.bad = true
+        return ""
+    a = p.ts
+    next(&p)
+    while at_op(&p, 46):
+        next(&p)
+        if p.tok != T_NAME and p.tok != T_PRIV:
+            p.bad = true
+            break
+        next(&p)
+    return p.src[a..p.pe]
+
+fn template_type(p: mut P):
+    while p.tok == T_TPL_HEAD:
+        next(&p)
+        parse_type(&p)
+        if not at_op(&p, 125):
+            p.bad = true
+            return
+        rescan_tpl(&p)
+    next(&p)
+
+fn is_tparam(p: mut P, name: str) bool:
+    if len(p.tparams) == 0:
+        return false
+    first = name
+    d = name.find(".")
+    if d >= 0:
+        first = name[..d]
+    for t in p.tparams:
+        if t == first:
+            return true
+    return false
+
+# <A, B<C>, D extends E = F>
+fn skip_type_params(p: mut P):
+    if p.mute == 0:
+        p.ts_syntax += 1
+    next(&p)
+    while not at_op(&p, 62) and p.tok != T_EOF and not p.bad:
+        while p.tok == T_NAME and (p.kw == K_CONST or p.kw == K_IN or p.kw == K_OUT) and peek_tok(&p).tok == T_NAME:
+            next(&p)
+        if p.tok != T_NAME:
+            p.bad = true
+            return
+        next(&p)
+        if at_kw(&p, K_EXTENDS):
+            next(&p)
+            parse_type(&p)
+        if eat_op(&p, 61):
+            parse_type(&p)
+        if not eat_op(&p, 44):
+            break
+    if at_op(&p, 62):
+        next(&p)
+    else:
+        p.bad = true
+
+# `{ a: T; [K.b]: U }` as a type: skipped, noting computed keys as uses of their names.
+fn object_type_body(p: mut P):
+    next(&p)
+    at_start = true
+    while not at_op(&p, 125) and p.tok != T_EOF and not p.bad:
+        if at_start and at_op(&p, 91):
+            computed_key_use(&p)
+        if at_op(&p, 40) or at_op(&p, 91) or at_op(&p, 123):
+            skip_group(&p)
+            at_start = false
+            continue
+        if p.tok == T_TPL_HEAD:
+            template_type(&p)
+            at_start = false
+            continue
+        if p.tok == T_NAME and p.kw == K_TYPEOF:
+            typeof_self(&p)
+        at_start = at_op(&p, 59) or at_op(&p, 44)
+        next(&p)
+        if p.nlb:
+            at_start = true
+    if at_op(&p, 125):
+        next(&p)
+    else:
+        p.bad = true
+
+# `typeof C` in a skipped type still uses a decorated class's alias (tsc writes C_1 for it).
+fn typeof_self(p: mut P):
+    sb = p.self_bind
+    if sb < 0:
+        return
+    n = peek_tok(&p)
+    if n.tok == T_NAME and p.binds[sb].active and same_text(p.src, n.ts, n.te - n.ts, p.binds[sb].name):
+        p.binds[sb].last_ref = n.ts
+
+# At "[" in a type member: `[K.a]: T` uses the value K, which keeps its import (tsc counts it).
+fn computed_key_use(p: mut P):
+    s = save(&p)
+    next(&p)
+    if p.tok == T_NAME and (p.kw == 0 or p.kw > K_WITH):
+        a = p.ts
+        b = p.te
+        h = p.h
+        next(&p)
+        if at_op(&p, 46) or at_op(&p, 93):
+            k = find_bind(&p, a, b, h)
+            if k >= 0 and not shadowed_bind(&p, a, b, h, k):
+                use_bind(&p, k, a)
+    restore(&p, s)
+
+fn type_param_names(p: mut P) [str]:
+    names: [str] = []
+    s = save(&p)
+    next(&p)
+    while p.tok == T_NAME and not p.bad:
+        while (p.kw == K_CONST or p.kw == K_IN or p.kw == K_OUT) and peek_tok(&p).tok == T_NAME:
+            next(&p)
+        names.push(tok_text(&p))
+        next(&p)
+        if at_kw(&p, K_EXTENDS):
+            next(&p)
+            c = parse_type(&p)
+            p.tparam_cons[tok_name_last(names)] = c
+        if eat_op(&p, 61):
+            parse_type(&p)
+        if not eat_op(&p, 44):
+            break
+    restore(&p, s)
+    skip_type_params(&p)
+    return names
+
+fn skip_type_args(p: mut P):
+    next(&p)
+    nc = p.no_cond                               # F<A extends B ? C : D> after `extends`
+    p.no_cond = 0
+    while not at_op(&p, 62) and p.tok != T_EOF and not p.bad:
+        parse_type(&p)
+        if not eat_op(&p, 44):
+            break
+    p.no_cond = nc
+    if at_op(&p, 62):
+        next(&p)
+    else:
+        p.bad = true
+
+# Skip a bracketed group starting at the current ( [ or {, templates included.
+fn skip_group(p: mut P):
+    depth = 0
+    tpl: [int] = []          # depths where a "}" resumes a template
+    while p.tok != T_EOF:
+        if p.tok == T_OP:
+            o = p.op
+            if o == 60 and p.tsx and jsx_starts(&p):
+                here = p.ts                      # JSX: skipped whole
+                e = jsx_skip(&p, here)
+                jsx_resume(&p, e)
+                continue
+            if o == 40 or o == 91 or o == 123:
+                depth += 1
+            elif o == 41 or o == 93 or o == 125:
+                if o == 125 and len(tpl) > 0 and tpl[len(tpl) - 1] == depth:
+                    rescan_tpl(&p)
+                    if p.tok == T_TPL:
+                        tpl.pop()
+                    next(&p)
+                    continue
+                depth -= 1
+                if depth == 0:
+                    next(&p)
+                    return
+        elif p.tok == T_TPL_HEAD:
+            tpl.push(depth)
+        elif p.tok == T_NAME and p.kw == K_TYPEOF:
+            typeof_self(&p)
+        next(&p)
+        if p.tok == T_OP and (p.op == 47 or (p.op == O_ASSIGN and p.src.byte(p.ts) == 47)) and regex_ok_prev(&p):
+            rescan_regex(&p)
+    p.bad = true
+
+# In a skipped group (a function body in a type), could a "/" here start a regex?
+# Decided from the byte before it, like a minifier.
+fn regex_ok_prev(p: mut P) bool:
+    k = p.pe - 1
+    while k >= 0 and (p.src.byte(k) == 32 or p.src.byte(k) == 10 or p.src.byte(k) == 9 or p.src.byte(k) == 13):
+        k -= 1
+    if k < 0:
+        return true
+    c = p.src.byte(k)
+    if is_id(c) or c == 41 or c == 93 or c == 125 or c == 34 or c == 39 or c == 96:
+        return false
+    return true
+
+# In a type, a missing token only marks the type bad (it may be a lookahead).
+fn texpect(p: mut P, op: int):
+    if at_op(&p, op):
+        next(&p)
+    else:
+        p.bad = true
+
+fn tok_name_last(names: [str]) str:
+    return names[len(names) - 1]

@@ -1,0 +1,10 @@
+{
+  "name": "@ternlang/ternts",
+  "version": "0.0.1-experimental",
+  "description": "TypeScript to JavaScript as tsc emits it (legacy decorators with metadata, JSX), 6-45x faster. Written in Tern.",
+  "keywords": ["typescript", "transpiler", "compiler", "nestjs", "decorators", "emitDecoratorMetadata", "jsx", "tsc", "swc", "esbuild"],
+  "license": "MIT OR Apache-2.0",
+  "homepage": "https://ternlang.dev/ts/",
+  "repository": { "type": "git", "url": "https://github.com/Ternlang-tn/ternts" },
+  "engines": { "node": ">=18" }
+}

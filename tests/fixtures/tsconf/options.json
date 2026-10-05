@@ -1,0 +1,53 @@
+{
+  "about": "Differences from tsc that TypeScript's own test cases found (harness/tsconformance.mjs).",
+  "sets": {
+    "cjs": {
+      "module": "commonjs",
+      "useDefineForClassFields": false,
+      "files": [
+        "namespace-merge.ts",
+        "declare-class.ts",
+        "escapes.ts",
+        "export-import-require.ts",
+        "accessor-storage.ts",
+        "module-ext.mts",
+        "module-ext.cts",
+        "namespace-more.ts",
+        "enum-strings.ts"
+      ]
+    },
+    "esm": {
+      "module": "esnext",
+      "useDefineForClassFields": false,
+      "files": [
+        "namespace-merge.ts",
+        "module-ext.mts",
+        "module-ext.cts",
+        "import-meta.ts",
+        "enum-strings.ts"
+      ]
+    },
+    "es2015-module": {
+      "files": [
+        "export-star-as.ts"
+      ]
+    },
+    "esnext": {
+      "target": "esnext",
+      "module": "esnext",
+      "files": [
+        "accessor-native.ts",
+        "accessor-storage.ts"
+      ]
+    },
+    "esnext-nodefine": {
+      "target": "esnext",
+      "module": "esnext",
+      "useDefineForClassFields": false,
+      "files": [
+        "accessor-native.ts",
+        "accessor-hoist.ts"
+      ]
+    }
+  }
+}

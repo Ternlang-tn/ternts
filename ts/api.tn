@@ -1,0 +1,371 @@
+# The entry point: TypeScript in, CommonJS JavaScript out (tsc's output for
+# experimentalDecorators + emitDecoratorMetadata, target ES2022+).
+
+struct Output:
+    head: str           # the prologue (use strict, helpers, exports list)
+    code: str           # the body; the file is head + code
+    err: str
+
+fn transpile(src: str, use_define: bool) Output:
+    return transpile_opts(src, use_define, false)
+
+struct Opts:
+    use_define: bool    # useDefineForClassFields
+    esm: bool           # ES module output
+    interop: bool       # esModuleInterop
+    strict: bool        # strictNullChecks
+    tsx: bool           # the file is .tsx (or .jsx): it may contain JSX
+    jsx: int            # how JSX is emitted: JSX_AUTO (react-jsx), JSX_DEV, JSX_REACT, JSX_PRESERVE
+    jsx_source: str     # jsxImportSource
+    jsx_factory: str    # jsxFactory
+    jsx_frag: str       # jsxFragmentFactory
+    file_name: str      # the source file's name (react-jsxdev puts it in the output)
+    metadata: bool      # emitDecoratorMetadata
+    decorators: bool    # experimentalDecorators (without it, decorators are TC39's: esdecorators.tn)
+    verbatim: bool      # verbatimModuleSyntax: imports stay unless marked `type`
+    per_file_module: bool   # module node16/nodenext (the caller sets esm per file)
+    import_meta_cjs: bool   # CommonJS: import.meta.* -> require-time forms (tsc keeps them; CommonJS rejects them)
+    always_strict: bool     # alwaysStrict (or strict): a file that isn't a module gets "use strict"
+    jest_hoist: bool        # CommonJS output: top-level jest.mock(...) calls go above the requires (as babel-jest does)
+    target: int             # the target as a year (2015 .. 2022; 0: not given, ESNext: no lowering)
+    preserve: bool          # module preserve: ES module syntax as written (no `export {}` added)
+    es2015_module: bool     # module es2015/es6 (default for an ES2015+ target): no ES2020 module syntax
+    no_emit_helpers: bool   # noEmitHelpers: helper functions are used, not defined
+    esdec_pass: bool        # (esdecorators.tn) this source is already the TC39 decorators' rewrite
+    esdec_helpers: [str]    # ... and the helpers it uses, in the order first needed
+    keep_pprops: bool       # (its first pass) parameter properties stay as written; the second pass places them
+    force_module: bool      # moduleDetection force (default under module node16+): every file is a module
+
+fn opts() Opts:
+    return Opts(false, false, false, false, false, JSX_AUTO, "react", "React.createElement", "React.Fragment", "", true, true, false, false, false, false, false, 0, false, false, false, false, [], false, false)
+
+# The year ternts lowers to: ESNext (9999) when no target is given; ES2015 at the lowest.
+fn target_of_opts(o: Opts) int:
+    if o.target <= 0:
+        return 9999
+    if o.target < 2015:
+        return 2015
+    return o.target
+
+fn transpile_opts(src: str, use_define: bool, esm: bool) Output:
+    o = opts()
+    o.use_define = use_define
+    o.esm = esm
+    return transpile_with(src, o, empty_project(), "")
+
+fn transpile_in(src: str, use_define: bool, esm: bool, pr: Project, file: str) Output:
+    o = opts()
+    o.use_define = use_define
+    o.esm = esm
+    return transpile_with(src, o, pr, file)
+
+# In a project: `file` is this file's path without extension, a key of `pr.files`.
+# NUL delimits ternts' markers (emit.tn) but a source can hold one: each NUL is swapped for an
+# unused character while transpiling and put back after (tsc keeps NULs as they are).
+fn transpile_with(source: str, o: Opts, pr: Project, file: str) Output:
+    if not o.decorators and not o.esdec_pass and (target_of_opts(o) < 9999 or not o.use_define) and source.find("@") >= 0:
+        return transpile_esdec(source, o, pr, file)  # TC39 decorators, lowered (esdecorators.tn)
+    if source.find("\x00") < 0:
+        return transpile_src(source, o, pr, file)
+    stand_in = "\u{10FFFD}"
+    k = 0
+    while source.find(stand_in) >= 0:
+        k += 1
+        stand_in = "\u{10FFFD}" + str(k)
+    r = transpile_src(source.replace("\x00", stand_in), o, pr, file)
+    return Output(r.head.replace(stand_in, "\x00"), r.code.replace(stand_in, "\x00"), r.err)
+
+# tsc: a .mts file is always an ES module and a .cts file always CommonJS, whatever `module`
+# says (only .ts follows it); module preserve keeps every file's module syntax as written.
+fn output_esm(o: Opts) bool:
+    if o.preserve:
+        return true
+    if o.file_name.ends_with(".mts"):
+        return true
+    if o.file_name.ends_with(".cts"):
+        return false
+    return o.esm
+
+fn transpile_src(source: str, o: Opts, pr: Project, file: str) Output:
+    src = source
+    if src.starts_with("\u{FEFF}"):
+        src = src[3..]                           # a byte order mark: tsc doesn't write it
+    esm = output_esm(o)
+    if o.import_meta_cjs and not esm:
+        src = rename_own_require(source)          # ts/cjs.tn
+    use_define = o.use_define
+    hints: [Hint] = []
+    forced: [str] = []
+    slots = false
+    has_at = src.find("@") >= 0
+    ce_first = false
+    has_using = false        # on once a `using` declaration is found (see using.tn)
+    top_block = -1                               # set once a parse finds a top-level `using` (topusing.tn)
+    top_pro: [str] = []
+    top_hoisted: [str] = []
+    top_anon = -1
+    tried_top = false
+    has_hash = src.find("#") >= 0
+    # a TC39-decorated class's static #private members at ES2022 are lowered, as tsc does (class.tn spl)
+    spl_file = o.esdec_pass and target_of_opts(o) >= 2022 and src.find("static { _classThis") >= 0 and (has_hash or src.find("accessor") >= 0)
+    for attempt in 0..4:
+        p = new_p(src, use_define)
+        p.hints = hints
+        p.forced = forced
+        p.spl_file = spl_file
+        p.has_at = has_at or has_hint_kind(hints, 10) or o.target > 0 and o.target < 2022 or p.spl_file
+        p.has_hash = has_hash
+        p.has_using = has_using
+        p.top_block = top_block
+        p.top_pro = top_pro
+        p.top_anon = top_anon
+        for n in top_hoisted:
+            p.top_vars[n] = true                 # (assigned in the block, exported by its list)
+        if len(top_pro) == 0 and len(top_hoisted) > 0:
+            p.top_var_stmt = "var " + ", ".join(top_hoisted) + ";"
+        p.esm = esm
+        if o.file_name.ends_with(".mts") or o.file_name.ends_with(".cts") or o.force_module:
+            p.is_module = true                   # .mts/.cts files, and every file under module node16+, are modules
+        p.project = pr
+        p.interop = o.interop
+        p.node_module = o.per_file_module
+        p.preserve = o.preserve
+        p.es2015_module = o.es2015_module
+        p.native_accessor = o.target >= 9999
+        p.strict = o.strict
+        p.metadata = o.metadata
+        p.legacy_decorators = o.decorators
+        p.no_emit_helpers = o.no_emit_helpers
+        p.esdec_helpers = o.esdec_helpers
+        p.esdec_pass = o.esdec_pass
+        p.keep_pprops = o.keep_pprops
+        p.verbatim = o.verbatim
+        p.import_meta_cjs = o.import_meta_cjs
+        p.jest_hoist = o.jest_hoist
+        p.always_strict = o.always_strict
+        p.target = target_of_opts(o)
+        if p.use_define and p.target < 2022:
+            p.use_define = false                 # (fields aren't kept as they are: defineProperty)
+            p.define_low = true
+        # expression lowering (ir.tn): ?. ?? (ES2020), ||= &&= ??= (ES2021), ** (ES2016), #private (ES2022)
+        p.ir_low = (p.target < 2020 and (src.find("?.") >= 0 or src.find("??") >= 0)) or (p.target < 2021 and (src.find("&&=") >= 0 or src.find("||=") >= 0 or src.find("??=") >= 0)) or (p.target < 2016 and src.find("**") >= 0)
+        p.ir_mode = p.ir_low or (has_hash and p.target < 2022) or p.spl_file
+        p.priv_low = p.target < 2022 or p.spl_file
+        p.tsx = o.tsx
+        if o.tsx:
+            p.jsx = o.jsx
+            p.jsx_source = o.jsx_source
+            p.jsx_factory = o.jsx_factory
+            p.jsx_frag = o.jsx_frag
+            if not jsx_entity_name(p.jsx_factory):   # (not a name: tsc reports it, then uses the default)
+                p.jsx_factory = "React.createElement"
+            if not jsx_entity_name(p.jsx_frag):
+                p.jsx_frag = "React.Fragment"
+            p.jsx_file = o.file_name
+            jsx_pragmas(&p)
+            if p.jsx == JSX_AUTO or p.jsx == JSX_DEV:
+                # the runtime import is the file's first: its module variable is numbered first
+                rb = module_base(js_string(jsx_runtime_source(&p)))
+                p.modnames[rb] = 1
+                p.reserved[rb] = 1
+                if ce_first:
+                    p.jsx_ce = true
+                    cb = module_base(js_string(p.jsx_source))
+                    p.modnames[cb] = 1
+                    p.reserved[cb] = 1
+        p.file = file
+        p.has_export_list = slots
+        p.has_xalias = has_hint_kind(hints, H_XALIAS)
+        next(&p)
+        apply_hints(&p, 0)
+        for i in 0..len(p.hints):                # top-level declarations used before them
+            if p.hints[i].kind == 0 and p.hints[i].pos == 0:   # (that shadow an import: add_bind_sub)
+                hn = p.hints[i].name
+                push_decl_name(&p, hn)
+        skip_use_strict(&p)
+        if top_block >= 0:
+            module_statements_using(&p)           # (topusing.tn: off the hot path)
+        else:
+            statements(&p, true)
+        if p.tok != T_EOF and p.err == "":
+            fail(&p, f"unexpected '{tok_text(&p)}'")
+        emit_all(&p)
+        if p.export_eq != "" and export_eq_is_type(&p):
+            p.export_eq = ""                     # export = T where T is only a type: tsc drops it
+            p.export_equals = false
+        if p.export_eq != "":
+            eq = p.export_eq
+            put(&p, eq)
+        if p.err != "":
+            return Output("", "", p.err)
+        xlist_check(&p)
+        if not p.retry:
+            resolve_export_items(&p)
+            head = finish(&p)
+            if p.err != "":
+                return Output("", "", p.err)
+            if check_names(&p) or attempt == 3:
+                return Output(head, p.out, "")
+            forced = p.forced
+            continue
+        if p.want_top_using and not tried_top:
+            tried_top = true
+            tu = top_using_rewrite(src, o.tsx, o.decorators)
+            if tu.err != "":
+                return Output("", "", tu.err)
+            if tu.block >= 0:
+                src = tu.src                     # a new text: the hints (positions) start over
+                top_block = tu.block
+                top_pro = tu.pro
+                top_hoisted = tu.hoisted
+                top_anon = tu.anon
+                has_using = true
+                hints = []
+                forced = []
+                slots = false
+                ce_first = false
+                continue
+        if p.want_slots:
+            slots = true
+        if p.want_using:
+            has_using = true
+        if p.want_ce:
+            ce_first = true
+        for h in p.new_hints:
+            if (h.kind == B_XLIST or h.kind == H_XALIAS) and h.name != "":
+                hints = drop_hint(hints, h.name, h.kind)   # (kind 11 unnamed: class.tn's #private record)
+            hints.push(h)
+    return Output("", "", "names could not be resolved")
+
+# A name an export list exports and that's assigned: parse again with its binding, whose chain
+# has every list's names (exports.b = exports.a = x). "\x01" marks an `export let x` exported again.
+fn xlist_check(p: mut P):
+    merged: {str: str} = {}
+    order: [str] = []
+    for i in 0..len(p.xlist_names):
+        name = p.xlist_names[i]
+        chain = p.xlist_chains[i]
+        if not (name in merged):
+            merged[name] = chain
+            order.push(name)
+        elif chain.starts_with("\x01"):
+            merged[name] = chain + " = " + merged[name][1..]
+        else:
+            merged[name] = chain + " = " + merged[name]
+    for name in order:
+        if not (name in p.assigned):
+            continue
+        chain = merged[name]
+        kind = B_XLIST
+        pos = 0
+        if chain.starts_with("\x01"):
+            chain = chain[1..]
+            kind = H_XALIAS
+            pos = -2                             # (no binding: see export_alias_ref)
+        if hint_repl(p.hints, name, kind) != chain:
+            p.retry = true
+            p.new_hints.push(Hint(pos, name, kind, chain, -1, -1))
+
+# The repl of the hint of this kind for `name` ("\x00" when there's none).
+fn hint_repl(hints: [Hint], name: str, kind: int) str:
+    for h in hints:
+        if h.kind == kind and h.name == name:
+            return h.repl
+    return "\x00"
+
+# Without the hints of this kind for `name` (a new chain replaces the old).
+fn drop_hint(hints: [Hint], name: str, kind: int) [Hint]:
+    r: [Hint] = []
+    for h in hints:
+        if h.kind != kind or h.name != name:
+            r.push(h)
+    return r
+
+fn has_hint_kind(hints: [Hint], kind: int) bool:
+    for h in hints:
+        if h.kind == kind:
+            return true
+    return false
+
+# The directive prologue ("use client"; ...): tsc writes it first, ahead of its own
+# "use strict" (which replaces the source's, in CommonJS output) and the helpers.
+fn skip_use_strict(p: mut P):
+    while p.tok == T_STR:
+        n = peek_tok(&p)
+        if not ((n.tok == T_OP and n.op == 59) or n.nlb or n.tok == T_EOF):
+            return
+        text = tok_text(&p)
+        a = p.ts
+        next(&p)
+        eat_op(&p, 59)
+        emit_to(&p, a)
+        skip_pe(&p)
+        if text == "\"use strict\"" or text == "'use strict'":
+            p.has_use_strict = true
+            if not p.esm:
+                continue                 # CommonJS output: finish() writes it
+        p.directives += text + ";\n"
+
+# TC39 decorators below ESNext (esdecorators.tn): transpile at ESNext with decorators kept, rewrite
+# decorated classes as tsc's esDecorators transform does, then transpile with the real options.
+fn transpile_esdec(source: str, o: Opts, pr: Project, file: str) Output:
+    o1 = o
+    o1.target = 9999
+    o1.esm = true
+    o1.preserve = false
+    o1.es2015_module = false
+    o1.per_file_module = false
+    o1.force_module = false
+    o1.use_define = true
+    o1.metadata = false
+    o1.no_emit_helpers = true
+    o1.import_meta_cjs = false
+    o1.jest_hoist = false
+    o1.esdec_pass = true
+    o1.keep_pprops = not o.use_define            # (with useDefineForClassFields they're fields first)
+    if has_export_equals(source) and not output_esm(o):
+        o1.esm = false                           # (ES module output drops `export =`)
+    if o1.file_name.ends_with(".mts") or o1.file_name.ends_with(".cts"):
+        o1.file_name = o1.file_name[..len(o1.file_name) - 4] + ".ts"
+    r1 = transpile_with(source, o1, pr, file)
+    if r1.err != "":
+        return r1
+    js = r1.head + r1.code
+    ef = EdFile([], {}, target_of_opts(o), o.use_define)
+    out = esdec_rewrite(js, source_idents(source), &ef)
+    o2 = o
+    o2.esdec_pass = true
+    if out == js:
+        return transpile_with(source, o2, pr, file)
+    o2.tsx = false
+    o2.esdec_helpers = ef.helpers
+    return transpile_with(out, o2, pr, file)
+
+# `export = T` (the whole of p.export_eq) where T is an interface, a type alias, a type-only
+# import or a namespace without values, and no value of that name exists?
+fn export_eq_is_type(p: mut P) bool:
+    t = p.export_eq.trim()
+    if not (t.starts_with("module.exports = ") and t.ends_with(";")):
+        return false
+    name = t[17..len(t) - 1].trim()
+    if name == "" or not is_simple_name(name) or not (name in p.locals) or top_declared(&p, name):
+        return false
+    k = p.locals[name]
+    if not (k == 4 or k == 5 or k == 7 or k == 6 or k == 8):   # (8: a callable interface)
+        return false
+    return not has_ident(p.out, name)            # (a value of the name is in the output: kept)
+
+# Does the source have `export =` (not `export ==`, which isn't TypeScript anyway)?
+fn has_export_equals(src: str) bool:
+    k = src.find("export")
+    while k >= 0:
+        j = k + 6
+        while j < len(src) and (src.byte(j) == 32 or src.byte(j) == 9 or src.byte(j) == 10 or src.byte(j) == 13):
+            j += 1
+        if j < len(src) and src.byte(j) == 61 and (j + 1 >= len(src) or src.byte(j + 1) != 61):
+            return true
+        n = src[k + 6..].find("export")
+        if n < 0:
+            return false
+        k = k + 6 + n
+    return false

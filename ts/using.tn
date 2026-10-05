@@ -1,0 +1,429 @@
+# `using` declarations, lowered as tsc does for ES2022: the block becomes a try/finally that disposes
+# its resources. Block edges and the env_/e_/result_ names are markers, resolved once the block ends.
+
+struct UBlock:
+    env: int            # u_reqs index of env_N; e_N and result_N follow at the end
+    e: int
+    r: int
+    used: bool
+    is_async: bool      # has `await using`: the disposal is awaited
+    pre_var: int        # a `for (using x of ...)` body: x = __addDisposableResource(env, x_N)
+    pre_name: str
+    pre_async: bool
+    awt: int            # how the disposal is awaited: 0 await, 1 yield (in __awaiter), 2 yield __await()
+
+# A generated name, numbered at the end.
+struct UReq:
+    base: str
+    owner: int          # the function it belongs to, numbered in source order
+    seq: int
+    used: bool
+    copy: bool          # a parameter's copy (x_1): unique in its function only, not file-wide
+
+const H_USING = 256
+
+fn u_req(p: mut P, base: str, used: bool) int:
+    p.u_seq += 1
+    f = 0
+    if len(p.u_fn) > 0:
+        f = p.u_fn[len(p.u_fn) - 1]
+    p.u_reqs.push(UReq(base, f, p.u_seq, used, false))
+    return len(p.u_reqs) - 1
+
+# The function being parsed (its u_fn number; 0 for the module).
+fn u_fn_top(p: mut P) int:
+    if len(p.u_fn) == 0:
+        return 0
+    return p.u_fn[len(p.u_fn) - 1]
+
+# A statement list that may declare `using`: its start (after "{", or before a switch).
+fn u_open(p: mut P) int:
+    if p.mute > 0:
+        p.u_stack.push(-1)
+        return -1
+    env = u_req(&p, "env", false)
+    p.u_blocks.push(UBlock(env, -1, -1, false, false, p.u_pre_var, p.u_pre_name, p.u_pre_async, 0))
+    id = len(p.u_blocks) - 1
+    if p.u_hoist:
+        p.u_hoist = false
+        p.u_hoisted.push(id)
+        p.u_reqs[env].seq = -1000000 + env       # (in the module's var: named first)
+        m = "\x00U" + str(env) + "\x00"
+        k = -1
+        if p.top_var_stmt != "":
+            k = p.out.find(p.top_var_stmt)
+        if k >= 0:
+            e = k + len(p.top_var_stmt) - 1      # (the hoisted names' var, written already)
+            p.out = p.out[..e] + ", " + m + p.out[e..]
+            p.top_var_stmt = p.top_var_stmt[..len(p.top_var_stmt) - 1] + ", " + m + ";"
+        else:
+            p.top_pro.push(m)
+    if p.u_pre_var >= 0:
+        a = p.u_pre_async
+        u_use(&p, id, a)
+        p.u_pre_var = -1
+    p.u_stack.push(id)
+    marker(&p, "W", str(id))
+    return id
+
+fn u_close(p: mut P, id: int):
+    p.u_stack.pop()
+    if id < 0:
+        return
+    marker(&p, "X", str(id))
+    used = p.u_blocks[id].used
+    is_async = p.u_blocks[id].is_async
+    p.u_blocks[id].e = u_req(&p, "e", used)
+    p.u_blocks[id].r = u_req(&p, "result", is_async)
+    if is_async and len(p.aw) > 0 and async_top(&p) >= 0:
+        # an async function lowered below ES2017 (or an async generator below ES2018)
+        p.u_blocks[id].awt = 1
+        if in_agen(&p):
+            p.u_blocks[id].awt = 2
+            agen_req(&p, H_AWAIT)
+
+fn u_use(p: mut P, id: int, is_async: bool):
+    p.u_blocks[id].used = true
+    p.u_reqs[p.u_blocks[id].env].used = true
+    if is_async:
+        p.u_blocks[id].is_async = true
+    p.helpers = p.helpers | H_USING
+
+fn u_top(p: mut P) int:
+    if len(p.u_stack) == 0:
+        return -1
+    return p.u_stack[len(p.u_stack) - 1]
+
+# At `using` or `await using`: a declaration follows?
+fn at_using_decl(p: mut P, in_for: bool) bool:
+    if p.tok != T_NAME or (p.kw != K_USING and p.kw != K_AWAIT):
+        return false
+    s = save(&p)
+    ok = true
+    if p.kw == K_AWAIT:
+        next(&p)
+        ok = at_kw(&p, K_USING) and not p.nlb
+    if ok:
+        next(&p)
+        ok = p.tok == T_NAME and not p.nlb and p.kw != K_IN and p.kw != K_INSTANCEOF
+        if ok and p.kw == K_OF:
+            ok = not in_for
+        if ok and in_for:
+            next(&p)
+            ok = at_kw(&p, K_OF)
+    restore(&p, s)
+    return ok
+
+# `[await] using` becomes `const` (nothing at a module's top level: topusing.tn hoists the names).
+# Says whether it was `await using`.
+fn using_keyword(p: mut P) bool:
+    emit_ts(&p)
+    if p.top_u < 0 or u_top(&p) != p.top_u:
+        put(&p, "const")
+    is_await = at_kw(&p, K_AWAIT)
+    if is_await:
+        next(&p)
+    next(&p)
+    skip_pe(&p)
+    return is_await
+
+# using x = f(), y = g();
+fn using_decl(p: mut P):
+    if p.target >= 9999:
+        # ESNext: `using` is the language's own, and tsc leaves it (types dropped)
+        if at_kw(&p, K_AWAIT):
+            next(&p)
+        next(&p)
+        var_decls(&p, false, false)
+        return
+    id = u_top(&p)
+    if id < 0 and p.mute == 0 and p.top_block < 0 and p.ns_name == "" and len(p.fn_stack) == 0 and len(p.sc_start) == 0:
+        p.retry = true                           # at the top level of a module: topusing.tn
+        p.want_top_using = true
+    if not p.has_using:
+        p.retry = true
+        p.want_using = true
+    elif id < 0 and p.mute == 0 and not p.want_top_using:
+        fail(&p, "`using` at the top level of a module or namespace isn't supported yet: move it into a function")
+        return
+    is_async = using_keyword(&p)
+    if id >= 0:
+        u_use(&p, id, is_async)
+    while p.err == "":
+        binding(&p, false)
+        if at_op(&p, 58):
+            drop_annotation(&p)
+        if at_op(&p, 61):
+            next(&p)
+            emit_pe(&p)
+            put(&p, " __addDisposableResource(")
+            if id >= 0:
+                marker(&p, "U", str(p.u_blocks[id].env))
+            put(&p, ", ")
+            skip_ts(&p)
+            assign(&p, false)
+            emit_pe(&p)
+            put(&p, ", " + bool_text(is_async) + ")")
+        if not eat_op(&p, 44):
+            break
+    end_stmt(&p)
+
+fn bool_text(b: bool) str:
+    if b:
+        return "true"
+    return "false"
+
+# `for (using a = x; c; i) body` below ESNext (after "("): a using block declaring a, then the loop.
+fn for_using_classic(p: mut P, fstart: int):
+    emit_to(&p, fstart)
+    put(&p, "{")
+    at0 = p.ts
+    skip_to(&p, at0)                             # (drops `for (`)
+    id = u_open(&p)
+    using_decl(&p)                               # through its `;`
+    emit_pe(&p)
+    put(&p, " for (;")
+    if not at_op(&p, 59):
+        parse_expr(&p)
+    expect_op(&p, 59)
+    if not at_op(&p, 41):
+        parse_expr(&p)
+    expect_op(&p, 41)
+    p.loop_depth += 1
+    statement(&p, false)
+    p.loop_depth -= 1
+    emit_pe(&p)
+    u_close(&p, id)
+    put(&p, " }")
+
+# `for ([await] using x of xs) body`: `for (const x_1 of xs)`, and the body declares x.
+fn using_for_head(p: mut P):
+    if not p.has_using:
+        p.retry = true
+        p.want_using = true
+    is_async = using_keyword(&p)
+    name = tok_text(&p)
+    declare_tok(&p, false)
+    emit_ts(&p)
+    skip_te(&p)
+    req = -1
+    if p.mute == 0:
+        req = u_req(&p, name, true)
+        put(&p, " ")
+        marker(&p, "U", str(req))
+    next(&p)
+    if at_op(&p, 58):
+        drop_annotation(&p)
+    p.u_pre_var = req
+    p.u_pre_name = name
+    p.u_pre_async = is_async
+
+# The loop body of a `for (using ...)`: always a block with the declaration first.
+fn using_for_body(p: mut P):
+    if at_op(&p, 123):
+        statement(&p, false)
+        return
+    emit_ts(&p)
+    put(&p, "{")
+    id = u_open(&p)
+    statement(&p, false)
+    emit_pe(&p)
+    u_close(&p, id)
+    put(&p, " }")
+
+# The generated names, numbered function by function, then in declaration order.
+fn u_names(p: mut P) [str]:
+    order: [int] = []
+    for i in 0..len(p.u_reqs):
+        if p.u_reqs[i].used:
+            k = len(order)
+            order.push(i)
+            while k > 0 and u_before(&p, i, order[k - 1]):
+                order[k] = order[k - 1]
+                k -= 1
+            order[k] = i
+    names = [""] * len(p.u_reqs)
+    count: {str: int} = {}
+    copies: {str: bool} = {}                     # "owner name" of the parameter copies made
+    for i in order:
+        r = p.u_reqs[i]
+        base = r.base
+        name = ""
+        if r.copy:
+            # tsc: unique against the file's names and earlier unique names, not other functions' copies
+            n = 0
+            while true:
+                n += 1
+                name = gen_name(base, n)
+                if not file_ident(&p, name) and not (name in p.gen_names) and not import_var(&p, name) and not (str(r.owner) + " " + name in copies) and not u_taken(&p, names, order, name):
+                    break
+            copies[str(r.owner) + " " + name] = true
+            names[i] = name
+            continue
+        n = count.get(base, 0)
+        while true:
+            n += 1
+            name = gen_name(base, n)
+            if not file_ident(&p, name) and not (name in p.gen_names) and not import_var(&p, name) and not copy_in_scope(&p, copies, r.owner, name):
+                break
+        count[base] = n
+        names[i] = name
+    return names
+
+# Is `name` an import's module variable (mod_1)?
+fn import_var(p: mut P, name: str) bool:
+    for im in p.imports:
+        if im.var == name and (im.used or im.side):
+            return true                          # (decided at the end: used means kept)
+    return false
+
+# (copies) Is `name` one of the unique names given so far?
+fn u_taken(p: mut P, names: [str], order: [int], name: str) bool:
+    for j in order:
+        if names[j] == name and not p.u_reqs[j].copy:
+            return true
+    return false
+
+# (unique names) Is `name` a parameter copy of the function `owner` or one around it?
+fn copy_in_scope(p: mut P, copies: {str: bool}, owner: int, name: str) bool:
+    o = owner
+    while o > 0:
+        if (str(o) + " " + name) in copies:
+            return true
+        o0 = o
+        o = 0
+        if o0 - 1 < len(p.u_parent):
+            o = p.u_parent[o0 - 1]
+    return false
+
+fn u_before(p: mut P, a: int, b: int) bool:
+    x = p.u_reqs[a]
+    y = p.u_reqs[b]
+    return x.owner < y.owner or (x.owner == y.owner and x.seq < y.seq)
+
+# Is `name` an identifier of the file (tsc's sourceFile.identifiers: not in comments or strings)?
+fn file_ident(p: mut P, name: str) bool:
+    if not p.id_built:
+        p.id_built = true
+        q = new_p(p.src, false)
+        q.tsx = p.tsx
+        q.mute += 1
+        next(&q)
+        depth = 0
+        tpl: [int] = []
+        while q.tok != T_EOF:
+            if q.tok == T_OP:
+                o = q.op
+                if o == 40 or o == 91 or o == 123:
+                    depth += 1
+                elif o == 125 and len(tpl) > 0 and tpl[len(tpl) - 1] == depth:
+                    rescan_tpl(&q)
+                    if q.tok == T_TPL:
+                        tpl.pop()
+                    depth -= 1
+                elif o == 41 or o == 93 or o == 125:
+                    depth -= 1
+                elif (o == 47 or (o == O_ASSIGN and q.src.byte(q.ts) == 47)) and regex_ok_prev(&q):
+                    rescan_regex(&q)
+            elif q.tok == T_TPL_HEAD:
+                depth += 1
+                tpl.push(depth)
+            elif q.tok == T_NAME:
+                p.id_set[q.src[q.ts..q.te]] = true
+            next(&q)
+    return name in p.id_set
+
+# Is `name` an identifier somewhere in the text (comments and strings too)?
+fn has_ident(src: str, name: str) bool:
+    k = src.find(name)
+    while k >= 0:
+        e = k + len(name)
+        if (k == 0 or not is_id(src.byte(k - 1))) and (e >= len(src) or not is_id(src.byte(e))):
+            return true
+        k = src.find_from(name, k + 1)
+    return false
+
+fn using_open_text(p: mut P, names: [str], id: int) str:
+    b = p.u_blocks[id]
+    if not b.used:
+        return ""
+    env = names[b.env]
+    decl = " const "
+    for h in p.u_hoisted:
+        if h == id:
+            decl = " "                           # (declared in the module's var)
+    text = decl + env + " = { stack: [], error: void 0, hasError: false }; try {"
+    if b.pre_var >= 0:
+        text += " const " + b.pre_name + " = __addDisposableResource(" + env + ", " + names[b.pre_var] + ", " + bool_text(b.pre_async) + ");"
+    return text
+
+fn using_close_text(p: mut P, names: [str], id: int) str:
+    b = p.u_blocks[id]
+    if not b.used:
+        return ""
+    env = names[b.env]
+    e = names[b.e]
+    text = " } catch (" + e + ") { " + env + ".error = " + e + "; " + env + ".hasError = true; } finally { "
+    if b.is_async:
+        r = names[b.r]
+        w = "await " + r
+        if b.awt == 1:
+            w = "yield " + r
+        elif b.awt == 2:
+            w = "yield __await(" + r + ")"
+        return text + "const " + r + " = __disposeResources(" + env + "); if (" + r + ") " + w + "; }"
+    return text + "__disposeResources(" + env + "); }"
+
+const HELPER_USING = """var __addDisposableResource = (this && this.__addDisposableResource) || function (env, value, async) {
+    if (value !== null && value !== void 0) {
+        if (typeof value !== "object" && typeof value !== "function") throw new TypeError("Object expected.");
+        var dispose, inner;
+        if (async) {
+            if (!Symbol.asyncDispose) throw new TypeError("Symbol.asyncDispose is not defined.");
+            dispose = value[Symbol.asyncDispose];
+        }
+        if (dispose === void 0) {
+            if (!Symbol.dispose) throw new TypeError("Symbol.dispose is not defined.");
+            dispose = value[Symbol.dispose];
+            if (async) inner = dispose;
+        }
+        if (typeof dispose !== "function") throw new TypeError("Object not disposable.");
+        if (inner) dispose = function() { try { inner.call(this); } catch (e) { return Promise.reject(e); } };
+        env.stack.push({ value: value, dispose: dispose, async: async });
+    }
+    else if (async) {
+        env.stack.push({ async: true });
+    }
+    return value;
+};
+var __disposeResources = (this && this.__disposeResources) || (function (SuppressedError) {
+    return function (env) {
+        function fail(e) {
+            env.error = env.hasError ? new SuppressedError(e, env.error, "An error was suppressed during disposal.") : e;
+            env.hasError = true;
+        }
+        var r, s = 0;
+        function next() {
+            while (r = env.stack.pop()) {
+                try {
+                    if (!r.async && s === 1) return s = 0, env.stack.push(r), Promise.resolve().then(next);
+                    if (r.dispose) {
+                        var result = r.dispose.call(r.value);
+                        if (r.async) return s |= 2, Promise.resolve(result).then(next, function(e) { fail(e); return next(); });
+                    }
+                    else s |= 1;
+                }
+                catch (e) {
+                    fail(e);
+                }
+            }
+            if (s === 1) return env.hasError ? Promise.reject(env.error) : Promise.resolve();
+            if (env.hasError) throw env.error;
+        }
+        return next();
+    };
+})(typeof SuppressedError === "function" ? SuppressedError : function (error, suppressed, message) {
+    var e = new Error(message);
+    return e.name = "SuppressedError", e.error = error, e.suppressed = suppressed, e;
+});
+"""

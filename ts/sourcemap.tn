@@ -1,0 +1,294 @@
+# Source maps. Each output line is found in the source by its first characters, then each word and
+# string on it is mapped to its exact column; text ternts made up is left unmapped.
+
+const B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+fn vlq(v: int) str:
+    x = v * 2
+    if v < 0:
+        x = (-v) * 2 + 1
+    out = ""
+    while true:
+        digit = x & 31
+        x = x >> 5
+        if x > 0:
+            digit = digit | 32
+        out += B64[digit..digit + 1]
+        if x == 0:
+            break
+    return out
+
+fn line_starts(s: str) [int]:
+    starts = [0]
+    for k in 0..len(s):
+        if s.byte(k) == 10:
+            starts.push(k + 1)
+    return starts
+
+fn line_of(starts: [int], pos: int) int:
+    lo = 0
+    hi = len(starts) - 1
+    while lo < hi:
+        mid = (lo + hi + 1) / 2
+        if starts[mid] <= pos:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+# Where `probe` = out[a..b] occurs in src at or after `start` (within `window` bytes), or -1.
+fn find_near(src: str, out: str, a: int, b: int, start: int, window: int) int:
+    n = b - a
+    first = out.byte(a)
+    last = min(len(src) - n, start + window)
+    k = max(start, 0)
+    while k <= last:
+        if src.byte(k) == first:
+            ok = true
+            for i in 1..n:
+                if src.byte(k + i) != out.byte(a + i):
+                    ok = false
+                    break
+            if ok:
+                return k
+        k += 1
+    return -1
+
+# out[a..b] (a word or string) as a whole token in src, in [start, start + window), or -1.
+fn find_token(src: str, out: str, a: int, b: int, start: int, window: int) int:
+    n = b - a
+    first = out.byte(a)
+    word = is_id(first)
+    last = min(len(src) - n, start + window)
+    k = start
+    while k <= last:
+        if src.byte(k) == first:
+            ok = true
+            for i in 1..n:
+                if src.byte(k + i) != out.byte(a + i):
+                    ok = false
+                    break
+            if ok and word and ((k > 0 and is_id(src.byte(k - 1))) or (k + n < len(src) and is_id(src.byte(k + n)))):
+                ok = false
+            if ok:
+                return k
+        k += 1
+    return -1
+
+# The nearest occurrence of out[a..b] in src before `start` (decorators, emitted after their
+# class, come from just above it), or -1.
+fn find_before(src: str, out: str, a: int, b: int, start: int) int:
+    n = b - a
+    first = out.byte(a)
+    k = min(start, len(src) - n)
+    while k >= 0:
+        if src.byte(k) == first:
+            ok = true
+            for i in 1..n:
+                if src.byte(k + i) != out.byte(a + i):
+                    ok = false
+                    break
+            if ok:
+                return k
+        k -= 1
+    return -1
+
+# The source map (JSON) for `out`, generated from `src` (named `source` in the map).
+fn source_map(src: str, out: str, file: str, source: str) str:
+    return source_map_from(src, out, 0, file, source)
+
+# The same, with out[..skip] (ternts' prologue: helpers, exports list) left unmapped:
+# pass len(output.head).
+fn source_map_from(src: str, out: str, skip: int, file: str, source: str) str:
+    starts = line_starts(src)
+    idx = line_index(src, starts)
+    mappings = ""
+    sp = 0                 # where in the source the last match ended
+    prev_line = 0
+    prev_col = 0
+    k = 0
+    first_line = true
+    while k < skip:
+        if out.byte(k) == 10:
+            mappings += ";"
+        k += 1
+    if k > 0 and out.byte(k - 1) != 10:
+        while k > 0 and out.byte(k - 1) != 10:
+            k -= 1
+        mappings = mappings[..len(mappings) - 1]
+    first_line = true          # (the prologue's lines already have their ";")
+    while k <= len(out):
+        e = k
+        while e < len(out) and out.byte(e) != 10:
+            e += 1
+        if not first_line:
+            mappings += ";"
+        first_line = false
+        a = k
+        while a < e and (out.byte(a) == 32 or out.byte(a) == 9):
+            a += 1
+        # the line's start, by its first characters
+        b = min(e, a + 8)
+        wn = 0                       # the length of the line's first word, if it starts with one
+        while a + wn < e and is_id(out.byte(a + wn)):
+            wn += 1
+        if wn > 8:
+            b = a + wn
+        anchored = false
+        prev_gen = 0
+        sep = ""
+        if b - a >= 3 and not (wn > 0 and made_up_start(out, a, a + wn)) and not made_up_line(out, a, e):
+            # a source line that starts the same way, nearest after where we are (else before);
+            # then, for a line that starts mid-way through a source line, a short scan ahead
+            q = indexed_anchor(src, out, a, b, wn, sp, idx)
+            if q < 0:
+                q = find_anchor(src, out, a, b, wn, sp, min(len(src), sp + 1024))
+            if q >= 0:
+                line = line_of(starts, q)
+                col = q - starts[line]
+                mappings += vlq(a - k) + "A" + vlq(line - prev_line) + vlq(col - prev_col)
+                prev_line = line
+                prev_col = col
+                prev_gen = a - k
+                sep = ","
+                anchored = true
+                sp = q
+        # then each word and string, a little further on in the source
+        t = a
+        while t < e:
+            c = out.byte(t)
+            w = t
+            if is_id(c):
+                while w < e and is_id(out.byte(w)):
+                    w += 1
+            elif c == 34 or c == 39 or c == 96:
+                w = t + 1
+                while w < e and out.byte(w) != c:
+                    if out.byte(w) == 92:
+                        w += 1
+                    w += 1
+                w = min(w + 1, e)
+            else:
+                t += 1
+                continue
+            if not made_up_name(out, t, w) and (anchored or not made_up_word(out, t, w)):
+                f = find_token(src, out, t, w, sp, 256)
+                if f >= 0:
+                    if t > a or not anchored:
+                        fl = line_of(starts, f)
+                        fc = f - starts[fl]
+                        mappings += sep + vlq(t - k - prev_gen) + "A" + vlq(fl - prev_line) + vlq(fc - prev_col)
+                        sep = ","
+                        prev_gen = t - k
+                        prev_line = fl
+                        prev_col = fc
+                    sp = f + (w - t)
+            t = w
+        k = e + 1
+    return "{\"version\":3,\"file\":" + json_quote(file) + ",\"sources\":[" + json_quote(source) + "],\"names\":[],\"mappings\":\"" + mappings + "\"}"
+
+# Where each source line's first 8 bytes (from its first non-blank) occur: key -> positions.
+fn line_index(src: str, starts: [int]) {str: [int]}:
+    idx: {str: [int]} = {}
+    for s in starts:
+        a = s
+        while a < len(src) and (src.byte(a) == 32 or src.byte(a) == 9):
+            a += 1
+        e = a
+        while e < len(src) and e < a + 8 and src.byte(e) != 10 and src.byte(e) != 13:
+            e += 1
+        if e - a >= 3:
+            key = src[a..e]
+            if (key in idx):
+                idx[key].push(a)
+            else:
+                idx[key] = [a]
+    return idx
+
+# The anchor for out[a..b] among the indexed line starts: the first at or after `sp` that
+# matches (and whose first word is whole), else the nearest before it; -1 if none.
+fn indexed_anchor(src: str, out: str, a: int, b: int, wn: int, sp: int, idx: {str: [int]}) int:
+    e = a
+    while e < len(out) and e < a + 8 and out.byte(e) != 10 and out.byte(e) != 13:
+        e += 1
+    key = out[a..e]
+    if not (key in idx):
+        return -1
+    ps = idx[key]
+    lo = 0
+    hi = len(ps)
+    while lo < hi:
+        mid = (lo + hi) / 2
+        if ps[mid] < sp:
+            lo = mid + 1
+        else:
+            hi = mid
+    for i in lo..len(ps):
+        if anchor_ok(src, out, a, b, wn, ps[i]):
+            return ps[i]
+    k = lo - 1
+    while k >= 0:
+        if anchor_ok(src, out, a, b, wn, ps[k]):
+            return ps[k]
+        k -= 1
+    return -1
+
+fn anchor_ok(src: str, out: str, a: int, b: int, wn: int, q: int) bool:
+    n = b - a
+    if q + n > len(src):
+        return false
+    for i in 0..n:
+        if src.byte(q + i) != out.byte(a + i):
+            return false
+    return wn == 0 or whole_word(src, q, wn)
+
+# Names only ternts writes: m_1-style module variables, __helpers, exports.
+fn made_up_name(out: str, a: int, b: int) bool:
+    if b - a >= 2 and out.byte(a) == 95 and out.byte(a + 1) == 95:
+        return true
+    if out.byte(b - 1) >= 48 and out.byte(b - 1) <= 57:
+        k = b - 1
+        while k > a and out.byte(k) >= 48 and out.byte(k) <= 57:
+            k -= 1
+        return out.byte(k) == 95 and k > a
+    return b - a == 7 and out[a..b] == "exports"
+
+fn whole_word(src: str, at: int, n: int) bool:
+    return (at == 0 or not is_id(src.byte(at - 1))) and (at + n >= len(src) or not is_id(src.byte(at + n)))
+
+# out[a..b] in src between `lo` and `to`, where a first word of `wn` bytes is a whole word.
+fn find_anchor(src: str, out: str, a: int, b: int, wn: int, lo: int, to: int) int:
+    k = lo
+    while k <= to:
+        q = find_near(src, out, a, b, k, to - k)
+        if q < 0 or wn == 0 or whole_word(src, q, wn):
+            return q
+        k = q + 1
+    return -1
+
+fn find_anchor_before(src: str, out: str, a: int, b: int, wn: int, start: int) int:
+    k = start
+    while k >= 0:
+        q = find_before(src, out, a, b, k)
+        if q < 0 or wn == 0 or whole_word(src, q, wn):
+            return q
+        k = q - 1
+    return -1
+
+# A line starting with this can't be anchored by it: ternts wrote it (exports.x, m_1.f,
+# __decorate, __metadata).
+fn made_up_start(out: str, a: int, b: int) bool:
+    w = out[a..b]
+    return w == "exports" or w == "require" or w.starts_with("__") or (out.byte(b - 1) >= 48 and out.byte(b - 1) <= 57 and w.contains("_"))
+
+# Lines ternts writes around decorators: `], C.prototype, "m", null);`, `], C);`.
+fn made_up_line(out: str, a: int, e: int) bool:
+    return out.byte(a) == 93 and a + 1 < e and out.byte(a + 1) == 44
+
+# Words ternts writes itself (a require, `exports.x = void 0`, `(0, m_1.f)`): on a line whose
+# start wasn't found, these aren't looked for in the source.
+fn made_up_word(out: str, a: int, b: int) bool:
+    w = out[a..b]
+    if w == "const" or w == "var" or w == "exports" or w == "require" or w == "void" or w == "Object" or w == "defineProperty" or w == "value" or w == "true" or w == "default":
+        return true
+    return out.byte(b - 1) >= 48 and out.byte(b - 1) <= 57 and w.contains("_")

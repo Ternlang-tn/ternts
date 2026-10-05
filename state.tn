@@ -1,0 +1,80 @@
+# The build state in OUT/.ternts-state, so `ternts build` rebuilds only what changed.
+# Output depends on other files' exports (which imports are types), so if any file's exports,
+# the file set or the options change, everything is rebuilt; otherwise only stale files are.
+import fs
+import json
+import ts
+
+struct State:
+    opts: str
+    outs: {str: str}        # source (relative to SRC) -> output (relative to OUT)
+    exports: {str: str}     # source -> exports_sig of it
+
+fn load_state(out: str) State:
+    s = State("", {}, {})
+    if not fs.exists(out + "/.ternts-state"):
+        return s
+    lines = fs.read(out + "/.ternts-state").split("\n")
+    if not lines[0].starts_with("ternts-state 1 "):
+        return s
+    s.opts = lines[0][15..]
+    for k in 1..len(lines):
+        f = lines[k].split("\t")
+        if len(f) == 3:
+            s.outs[f[0]] = f[1]
+            s.exports[f[0]] = f[2]
+    return s
+
+fn save_state(out: str, s: State):
+    lines = ["ternts-state 1 " + s.opts]
+    for k, v in s.outs:
+        lines.push(k + "\t" + v + "\t" + s.exports[k])
+    fs.write(out + "/.ternts-state", "\n".join(lines) + "\n")
+
+# A file's path under dir, starting with "/" (the walk lists files of "." without "./").
+fn below(dir: str, f: str) str:
+    if dir == "." or dir == "":
+        return "/" + f
+    return f[len(dir)..]
+
+fn new_state(o: ts.Opts, maps: bool, src: str, out: str, files: [str], outs: [str], infos: [ts.Exports]) State:
+    base = o
+    base.tsx = false                 # set per file (for_file)
+    base.file_name = ""
+    s = State(f"{json.encode(base)} maps={maps}", {}, {})
+    for k in 0..len(files):
+        f = below(src, files[k])
+        s.outs[f] = outs[k][len(out)..]
+        s.exports[f] = exports_sig(infos[k])
+    return s
+
+# Whether outputs depend on the same things as last time (see the top).
+fn same_shape(old: State, now: State) bool:
+    if old.opts != now.opts or len(old.exports) != len(now.exports):
+        return false
+    for k, v in now.exports:
+        if not (k in old.exports) or old.exports[k] != v:
+            return false
+    return true
+
+# Remove outputs and maps of deleted sources; returns how many.
+fn remove_gone(old: State, now: State, out: str) int:
+    n = 0
+    for k, v in old.outs:
+        if not (k in now.outs) and not v.contains(".."):
+            if fs.remove(out + v):
+                n += 1
+            if fs.exists(out + v + ".map"):
+                fs.remove(out + v + ".map")
+    return n
+
+fn exports_sig(e: ts.Exports) str:
+    parts: [str] = []
+    for name in e.types.keys().sorted():
+        if e.types[name]:
+            parts.push("t:" + name)
+        else:
+            parts.push("v:" + name)
+    for r in e.reexports:
+        parts.push("r:" + ",".join(r.names) + "=" + ",".join(r.remotes) + "@" + r.spec)
+    return " ".join(parts).replace("\t", " ").replace("\n", " ")

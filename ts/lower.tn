@@ -1,0 +1,1069 @@
+# Lowering to targets below ES2022, as tsc's transforms do (p.target is the year).
+# Static fields and blocks below ES2022 move out of the class, after it.
+
+const ST_DECL = 0           # a class declaration: the statics follow it as statements
+const ST_EXPR = 1           # a class expression: a comma list through a temp
+const ST_DECORATED = 2      # a decorated class: `this` in its statics is (void 0), as tsc has it
+
+const H_SET_FUNCTION_NAME = 512
+
+const HELPER_SET_FUNCTION_NAME = """var __setFunctionName = (this && this.__setFunctionName) || function (f, name, prefix) {
+    if (typeof name === "symbol") name = name.description ? "[".concat(name.description, "]") : "";
+    return Object.defineProperty(f, "name", { configurable: true, value: prefix ? "".concat(prefix, " ", name) : name });
+};"""
+
+# `this` in a static initializer or block, below ES2022.
+fn static_this(p: mut P) str:
+    if p.st_kind == ST_DECORATED:
+        return "(void 0)"
+    if p.spriv_bind >= 0:
+        p.st_tmp = p.binds[p.spriv_bind].repl
+        return p.st_tmp
+    if p.st_tmp == "":
+        f = p.st_fn
+        p.st_tmp = class_temp(&p, f)
+    return p.st_tmp
+
+const HINT_STATIC_SUPER = 30    # a class whose statics use `super` (Hint.pos: where it starts)
+
+fn super_hinted(p: mut P, at: int) bool:
+    for h in p.hints:
+        if h.kind == HINT_STATIC_SUPER and h.pos == at:
+            return true
+    return false
+
+# `super.x` / `super[k]` in a static below ES2022 (moved out of the class) goes through the class's temps.
+# The class learns it needs them on a second pass: parse again with a hint at its start.
+fn static_super_hint(p: mut P):
+    cs = p.st_start
+    if cs >= 0 and not super_hinted(&p, cs):
+        p.retry = true
+        p.new_hints.push(Hint(cs, "", HINT_STATIC_SUPER, "", -1, -1))
+
+
+# After `super.x` in a static initializer: is it a destructuring target ([super.x, y] = v)?
+fn super_target_ahead(p: mut P) bool:
+    if not (at_op(&p, 44) or at_op(&p, 93) or at_op(&p, 125) or at_op(&p, 61)):
+        return false
+    s = save(&p)
+    p.mute += 1
+    depth = 0
+    r = false
+    while p.tok != T_EOF:
+        if p.tok == T_OP and (p.op == 40 or p.op == 91 or p.op == 123):
+            depth += 1
+        elif p.tok == T_OP and (p.op == 41 or p.op == 93 or p.op == 125):
+            if depth > 0:
+                depth -= 1
+            else:
+                if p.op == 41:
+                    break
+                next(&p)
+                if at_op(&p, 61):
+                    r = true
+                    break
+                if not (at_op(&p, 44) or at_op(&p, 93) or at_op(&p, 125)):
+                    break
+                continue
+        elif depth == 0 and p.tok == T_OP and (p.op == 59 or p.op == O_ARROW):
+            break
+        next(&p)
+    p.mute -= 1
+    restore(&p, s)
+    return r
+
+# An async arrow captures `this` (for tsc), so in a static initializer the class reads through its temp.
+fn async_arrow_in_static(p: mut P):
+    if p.st_on and p.mute == 0:
+        static_this(&p)
+
+# A class fields temp declared in the function `fnid` (-1: the module).
+fn class_temp(p: mut P, fnid: int) str:
+    saved = p.fn_stack
+    if fnid < 0:
+        p.fn_stack = []
+    elif len(p.fn_stack) == 0 or p.fn_stack[len(p.fn_stack) - 1] != fnid:
+        p.fn_stack = [fnid]
+    t = field_temp(&p)
+    p.fn_stack = saved
+    return t
+
+# The name tsc gives a class expression at `at` from context (`const B = class {}`), or "".
+fn context_name(src: str, at: int) str:
+    k = back_space(src, at)
+    if k < 0:
+        return ""
+    c = src.byte(k)
+    if c == 61:                                  # `=`, not `==`, `+=`, `=>`...
+        if k > 0:
+            d = src.byte(k - 1)
+            if d == 61 or d == 33 or d == 60 or d == 62 or d == 43 or d == 45 or d == 42 or d == 47 or d == 37 or d == 38 or d == 124 or d == 94 or d == 63:
+                return ""
+        e = back_space(src, k)
+        name = back_ident(src, e)
+        if name == "":
+            return ""
+        before = back_space(src, e - len(name) + 1)
+        if before >= 0:
+            b = src.byte(before)
+            if b == 46 or b == 58 or b == 63:      # a.b = ..., x: T = ..., a?.b
+                return ""
+            if b == 35:
+                return "#" + name                # (#x = class: named "#x", as tsc)
+        return name
+    if c == 58:                                  # `{ b: class` / `, b: class`
+        e = back_space(src, k)
+        name = back_ident(src, e)
+        if name == "":
+            return ""
+        before = back_space(src, e - len(name) + 1)
+        if before >= 0 and (src.byte(before) == 123 or src.byte(before) == 44):
+            return name
+    return ""
+
+# The last non-blank position before `at`, or -1.
+fn back_space(src: str, at: int) int:
+    k = at - 1
+    while k >= 0:
+        c = src.byte(k)
+        if c != 32 and c != 9 and c != 10 and c != 13:
+            return k
+        k -= 1
+    return -1
+
+# The identifier ending at `e` (inclusive), or "".
+fn back_ident(src: str, e: int) str:
+    if e < 0:
+        return ""
+    k = e
+    while k >= 0:
+        c = src.byte(k)
+        if not is_id(c):
+            break
+        k -= 1
+    if k == e or is_digit(src.byte(k + 1)):
+        return ""
+    return src[k + 1..e + 1]
+
+# After the class: its moved statics. `ref` is the class's name for a declaration.
+fn statics_text(p: mut P, ref: str, keys: [str]) str:
+    text = ""
+    if p.priv_init != "" and len(keys) > 0:
+        text += "\n" + p.priv_init + ", " + ", ".join(keys) + ";"     # (one statement, as tsc)
+    elif p.priv_init != "":
+        text += "\n" + p.priv_init + ";"
+    elif p.st_tmp != "" and p.st_kind == ST_DECL:
+        text += "\n" + p.st_tmp + " = " + ref + ";"
+    if len(keys) > 0 and p.priv_init == "":
+        text += "\n" + ", ".join(keys) + ";"
+    for s in p.st_list:
+        text += "\n" + s.replace("\x02", ref) + ";"
+    return text
+
+# The index of the bracket closing the one at k (strings skipped), or -1.
+fn matching_bracket(t: str, k: int) int:
+    depth = 0
+    j = k
+    while j < len(t):
+        c = t.byte(j)
+        if c == 34 or c == 39 or c == 96:
+            j = skip_quoted(t, j)
+            continue
+        if c == 40 or c == 91 or c == 123:
+            depth += 1
+        elif c == 41 or c == 93 or c == 125:
+            depth -= 1
+            if depth == 0:
+                return j
+        j += 1
+    return -1
+
+# Past the string or template starting at k.
+fn skip_quoted(t: str, k: int) int:
+    q = t.byte(k)
+    j = k + 1
+    nest = 0
+    while j < len(t):
+        c = t.byte(j)
+        if c == 92:
+            j += 2
+            continue
+        if q == 96 and c == 36 and j + 1 < len(t) and t.byte(j + 1) == 123:
+            nest += 1
+            j += 2
+            continue
+        if q == 96 and c == 125 and nest > 0:
+            nest -= 1
+        elif c == q and nest == 0:
+            return j + 1
+        j += 1
+    return j
+
+# A temp of the transform for `year` (2015 .. 2021): each transform has its own `var`, lower years first.
+fn low_temp(p: mut P, year: int) str:
+    t = parse_temp(&p)
+    g = year - 2015
+    if len(p.fn_stack) > 0:
+        f = p.fn_stack[len(p.fn_stack) - 1]
+        p.fn_temps[f].pop()
+        if len(p.fn_lt[f]) == 0:
+            p.fn_lt[f] = [[], [], [], [], [], [], []]
+        p.fn_lt[f][g].push(t)
+    else:
+        p.temp_names.pop()
+        if len(p.lt_mod) == 0:
+            p.lt_mod = [[], [], [], [], [], [], []]
+        p.lt_mod[g].push(t)
+    return t
+
+# A generated name that isn't declared (a catch binding, a parameter).
+fn name_temp(p: mut P) str:
+    t = parse_temp(&p)
+    if len(p.fn_stack) > 0:
+        p.fn_temps[p.fn_stack[len(p.fn_stack) - 1]].pop()
+    else:
+        p.temp_names.pop()
+    return t
+
+# What tsc copies without a temp: an identifier, `this`, a literal.
+fn simple_copy(t: str) bool:
+    if t == "":
+        return false
+    c = t.byte(0)
+    if c == 34 or c == 39:
+        return skip_quoted(t, 0) == len(t)
+    if is_digit(c):
+        for k in 0..len(t):
+            if not (is_id(t.byte(k)) or t.byte(k) == 46):
+                return false
+        return true
+    if not is_id_start(c):
+        return false
+    for k in 1..len(t):
+        if not is_id(t.byte(k)):
+            return false
+    return true
+
+# simple_copy, or a name the module transform rewrote (`mod_1.x`): tsc decides before rewriting.
+fn simple_ref(t: str) bool:
+    if simple_copy(t):
+        return true
+    d = t.find(".")
+    if d <= 0 or not simple_copy(t[..d]) or not simple_copy(t[d + 1..]):
+        return false
+    first = t[..d]
+    if first == "exports":
+        return true
+    k = len(first) - 1
+    while k > 0 and is_digit(first.byte(k)):
+        k -= 1
+    return k < len(first) - 1 and first.byte(k) == 95
+
+
+# simple_ref, but `name_1.x` only for an import's module variable (C_1.x is a property access to tsc).
+fn import_ref(p: mut P, t: str) bool:
+    if not simple_ref(t):
+        return false
+    d = t.find(".")
+    if d <= 0:
+        return true
+    first = t[..d]
+    if first == "exports":
+        return true
+    for im in p.imports:
+        if im.var == first:
+            return true
+    return false
+
+fn nullish(p: mut P, left: str, right: str) str:
+    if import_ref(&p, left):
+        return left + " !== null && " + left + " !== void 0 ? " + left + " : " + right
+    tmp = low_temp(&p, 2020)
+    return "(" + tmp + " = " + left + ") !== null && " + tmp + " !== void 0 ? " + tmp + " : " + right
+
+# ---- ES2019 and below: optional chaining and nullish coalescing
+
+
+
+fn prev_binds(p: mut P) bool:
+    e = p.pe
+    if e <= 0:
+        return false
+    c = p.src.byte(e - 1)
+    if c == 40 or c == 91 or c == 44 or c == 123 or c == 59 or c == 58 or c == 63 or c == 125 or c == 41:
+        return false                         # ( [ , { ; : ? } )
+    if c == 46:
+        return false                         # ...spread
+    if c == 61:
+        d = 0
+        if e >= 2:
+            d = p.src.byte(e - 2)
+        if d == 61 or d == 33 or (d == 60 and not (e >= 3 and p.src.byte(e - 3) == 60)) or (d == 62 and not (e >= 3 and p.src.byte(e - 3) == 62)):
+            return true                      # == != <= >=
+        return false                         # = += <<= ...
+    if c == 62 and e >= 2 and p.src.byte(e - 2) == 61:
+        return false                         # =>
+    if is_id(c):
+        w = back_ident(p.src, e - 1)
+        if w == "return" or w == "yield" or w == "else" or w == "do" or w == "case" or w == "throw" or w == "of" or w == "default":
+            return false
+        return true
+    return true
+
+# After it: does the next token make it an operand?
+fn next_binds(p: mut P) bool:
+    if p.tok == T_EOF:
+        return false
+    if p.tok == T_OP:
+        o = p.op
+        return not (o == 41 or o == 93 or o == 44 or o == 59 or o == 125 or o == 58 or o == 61 or o == O_ASSIGN or o == O_ARROW)
+    if p.nlb:
+        return false
+    return true
+
+
+
+fn fparams(p: mut P, collect: bool) Params:
+    if p.target >= 2022 or p.mute > 0 or not p.has_at:
+        return parse_params(&p, collect)
+    id = fn_open(&p)
+    before = temp_count(&p, id)
+    emit_ts(&p)
+    saved = begin_capture(&p)
+    info = parse_params(&p, collect)
+    emit_pe(&p)
+    text = end_capture(&p, saved)
+    if temp_count(&p, id) > before:
+        text = moved_defaults(&p, text, id)
+    if p.target < 2018 and text.contains("..."):
+        text = rest_params(&p, text, id)
+    put(&p, text)
+    p.fn_stack.pop()
+    p.pre_fn = id
+    return info
+
+fn temp_count(p: mut P, id: int) int:
+    n = len(p.fn_temps[id]) + len(p.fn_cf_temps[id])
+    if id < len(p.fn_lt):
+        for g in p.fn_lt[id]:
+            n += len(g)
+    return n
+
+fn moved_defaults(p: mut P, text: str, id: int) str:
+    t = text.trim()
+    if not (t.starts_with("(") and t.ends_with(")")):
+        return text
+    news: [str] = []
+    stmts = ""
+    for piece in top_split(t[1..len(t) - 1], 44):
+        q = piece.trim()
+        if q == "":
+            continue
+        eq = top_assign(q)
+        if eq < 0 and (q.starts_with("{") or q.starts_with("[")):
+            tmp = parse_temp(&p)                 # a pattern goes into the body too (tsc's addDefaultValueAssignmentsIfNeeded)
+            p.fn_temps[id].pop()
+            news.push(tmp)
+            stmts += " var " + q + " = " + tmp + ";"
+            continue
+        if q.starts_with("...") or eq < 0:
+            news.push(q)
+            continue
+        name = q[..eq].trim()
+        init = q[eq + 1..].trim()
+        if simple_copy(name):
+            news.push(name)
+            stmts += " if (" + name + " === void 0) { " + name + " = " + init + "; }"
+        else:
+            tmp = parse_temp(&p)
+            p.fn_temps[id].pop()                 # a parameter, not a variable
+            news.push(tmp)
+            stmts += " var " + name + " = " + tmp + " === void 0 ? " + init + " : " + tmp + ";"
+    p.fn_pre[id] = p.fn_pre[id] + stmts
+    return "(" + ", ".join(news) + ")"
+
+# t split at the top-level occurrences of the byte c.
+fn top_split(t: str, c: int) [str]:
+    out: [str] = []
+    depth = 0
+    start = 0
+    k = 0
+    while k < len(t):
+        b = t.byte(k)
+        if b == 34 or b == 39 or b == 96:
+            k = skip_quoted(t, k)
+            continue
+        if b == 40 or b == 91 or b == 123:
+            depth += 1
+        elif b == 41 or b == 93 or b == 125:
+            depth -= 1
+        elif b == c and depth == 0:
+            out.push(t[start..k])
+            start = k + 1
+        k += 1
+    out.push(t[start..])
+    return out
+
+# The first top-level `=` that is an assignment (not == != <= >= =>), or -1.
+fn top_assign(t: str) int:
+    depth = 0
+    k = 0
+    while k < len(t):
+        b = t.byte(k)
+        if b == 34 or b == 39 or b == 96:
+            k = skip_quoted(t, k)
+            continue
+        if b == 40 or b == 91 or b == 123:
+            depth += 1
+        elif b == 41 or b == 93 or b == 125:
+            depth -= 1
+        elif b == 61 and depth == 0:
+            nb = 0
+            if k + 1 < len(t):
+                nb = t.byte(k + 1)
+            pb = 0
+            if k > 0:
+                pb = t.byte(k - 1)
+            if nb != 61 and nb != 62 and pb != 61 and pb != 33 and pb != 60 and pb != 62:
+                return k
+        k += 1
+    return -1
+
+# The temps of `src` declared in `dst` too (moved field initializers in an explicit constructor).
+fn merge_fn_vars(p: mut P, src: int, dst: int):
+    a = p.fn_temps[src]
+    for t in a:
+        p.fn_temps[dst].push(t)
+    b = p.fn_cf_temps[src]
+    for t in b:
+        p.fn_cf_temps[dst].push(t)
+    groups = p.fn_lt[src]
+    if len(groups) > 0 and len(p.fn_lt[dst]) == 0:
+        p.fn_lt[dst] = [[], [], [], [], [], [], []]
+    for g in 0..len(groups):
+        for t in groups[g]:
+            p.fn_lt[dst][g].push(t)
+    p.fn_temps[src] = []
+    p.fn_cf_temps[src] = []
+    p.fn_lt[src] = []
+
+# ---- ES2017 and below: object spread, `{ ...a, b }` -> Object.assign(Object.assign({}, a), { b })
+fn object_assign(parts: [str], spread: [bool]) str:
+    acc = ""
+    group: [str] = []
+    first = true
+    for i in 0..len(parts):
+        if spread[i]:
+            if first and len(group) == 0 and parts[i].starts_with("{") and matching_bracket(parts[i], 0) == len(parts[i]) - 1:
+                acc = parts[i]                   # `{ ...{ a: 1 }, b }`: the literal is the target
+                first = false
+                continue
+            if first:
+                acc = "{}"
+                if len(group) > 0:
+                    acc = "{ " + ", ".join(group) + " }"
+                first = false
+            elif len(group) > 0:
+                acc = "Object.assign(" + acc + ", { " + ", ".join(group) + " })"
+            group = []
+            acc = "Object.assign(" + acc + ", " + parts[i] + ")"
+        else:
+            group.push(parts[i])
+    if len(group) > 0:
+        acc = "Object.assign(" + acc + ", { " + ", ".join(group) + " })"
+    if not acc.starts_with("Object.assign("):
+        acc = "Object.assign(" + acc + ")"       # `{ ...{ a: 1 } }` alone: Object.assign({ a: 1 })
+    return acc
+
+# ---- ES2017 and below: object rest in destructuring, through __rest
+#   const { a, ...r } = o     -> const { a } = o, r = __rest(o, ["a"]);
+
+# The end of a pattern element's key: its top-level `:` or `=`, or the whole element.
+fn key_end(e: str) int:
+    k = 0
+    while k < len(e):
+        c = e.byte(k)
+        if c == 34 or c == 39:
+            k = skip_quoted(e, k)
+            continue
+        if c == 58 or c == 61:
+            return k
+        k += 1
+    return len(e)
+
+# __rest is wanted (in tsc's order among the ES2018 transform's other helpers: agen_order).
+fn want_rest(p: mut P):
+    if p.helpers & H_REST == 0:
+        p.rest_seq = len(p.agen_order)
+        p.helpers = p.helpers | H_REST
+
+# Parameters with object rest (and then, as in tsc, all pattern parameters) become temps destructured in the body.
+fn rest_params(p: mut P, text: str, id: int) str:
+    t = text.trim()
+    if not (t.starts_with("(") and t.ends_with(")")):
+        return text
+    tree = pat_tree("[" + t[1..len(t) - 1] + "]")   # (a parameter list reads as an array pattern)
+    if len(tree.nodes) == 0:
+        return text
+    params = tree.nodes[0].kids
+    any = false
+    for k in params:
+        e = tree.nodes[k]
+        if e.sub >= 0 and not e.rest and pn_needs_rest(tree, e.sub):
+            any = true
+    if not any:
+        return text
+    news: [str] = []
+    stmts = ""
+    moved = false                                # (after a destructured one, defaults go in the
+    for k in params:                             # body: they may read its names, tsc #47079)
+        e = tree.nodes[k]
+        if e.hole:
+            continue
+        if e.sub >= 0 and not e.rest and e.dflt != "" and pn_needs_rest(tree, e.sub):
+            tmp1 = name_temp(&p)                 # `{ a, ...r } = {}`: _a = {}, destructured in the body
+            news.push(tmp1 + " = " + e.dflt)
+            stmts += " var " + rest_parts(&p, e.target, tmp1, true, true) + ";"
+            moved = true
+            continue
+        if e.sub < 0 and not e.rest and moved and e.dflt != "":
+            news.push(e.target)
+            stmts += " if (" + e.target + " === void 0) { " + e.target + " = " + e.dflt + "; }"
+            continue
+        if e.sub < 0 or e.rest:
+            news.push(e.text)
+            continue
+        tmp = name_temp(&p)
+        news.push(tmp)
+        if pn_needs_rest(tree, e.sub):
+            stmts += " var " + rest_parts(&p, e.target, tmp, true, true) + ";"
+            moved = true
+            continue
+        # the others are flattened all the way (`{ e = 1 }` -> _f = _b.e, e = _f === void 0 ? 1 : _f)
+        out: [str] = []
+        if e.dflt == "":
+            pn_all(&p, tree, e.sub, tmp, true, &out)
+        else:
+            v = tmp + " === void 0 ? " + e.dflt + " : " + tmp
+            if inline_literal(e.dflt):
+                pn_all(&p, tree, e.sub, "(" + v + ")", false, &out)
+            else:
+                t2 = name_temp(&p)
+                out.push(t2 + " = " + v)
+                pn_all(&p, tree, e.sub, t2, true, &out)
+        stmts += " var " + ", ".join(out) + ";"
+    p.fn_pre[id] = p.fn_pre[id] + stmts
+    return "(" + ", ".join(news) + ")"
+
+# ---- ES2016 and below: async functions, through __awaiter and a generator
+# `arguments` becomes arguments_1 and `super.x` _super.x; parameters that aren't plain names move
+# to the generator, and the function keeps copies for its length.
+
+const H_AWAITER = 1024
+
+const HELPER_AWAITER = """var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
+    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
+    return new (P || (P = Promise))(function (resolve, reject) {
+        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
+        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
+        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
+        step((generator = generator.apply(thisArg, _arguments || [])).next());
+    });
+};"""
+
+struct ACtx:
+    args: str           # what `arguments` became ("" while unused)
+    this_used: bool
+    supers: [str]       # super.x names read or written
+    super_set: bool
+    arrow: bool
+    gen: bool           # an async generator (asyncgen.tn): awaits are yield __await(x)
+    params: str         # its parameters' text (a for await over one hoists its var)
+    sindex: bool        # super[k] read or written: `_superIndex` (async_super)
+
+fn lower_async(p: mut P) bool:
+    return p.target < 2017 and p.mute == 0
+
+# The innermost lowered async function `this`/`arguments`/`super` belong to, or -1.
+# Entering a non-async function below ES2017: it hides outer this/arguments and owns its arrows' _super.
+fn plain_fn_open(p: mut P):
+    p.sctx.push(ACtx("", false, [], false, false, false, "", false))
+    p.aw.push(-1 - len(p.sctx))
+
+fn async_top(p: mut P) int:
+    if len(p.aw) == 0:
+        return -1
+    return p.aw[len(p.aw) - 1]
+
+# Remove the `async` keyword at p.async_at from the output.
+fn drop_async(p: mut P):
+    a = p.async_at
+    p.async_at = -1
+    if a < 0 or a + 5 > p.n or p.src[a..a + 5] != "async":
+        return
+    e = a + 5
+    while e < p.n and (p.src.byte(e) == 32 or p.src.byte(e) == 9 or p.src.byte(e) == 10 or p.src.byte(e) == 13):
+        e += 1
+    if p.cp <= a:
+        emit_to(&p, a)
+        skip_to(&p, e)
+        return
+    k = len(p.out) - 5
+    while k >= 0 and not (p.out[k..k + 5] == "async" and (k == 0 or not is_id(p.out.byte(k - 1))) and k + 5 < len(p.out) and not is_id(p.out.byte(k + 5))):
+        k -= 1
+    if k >= 0:
+        j = k + 5
+        while j < len(p.out) and (p.out.byte(j) == 32 or p.out.byte(j) == 9 or p.out.byte(j) == 10):
+            j += 1
+        p.out = p.out[..k] + p.out[j..]
+
+# A name tsc makes unique in the file: arguments_1, x_1, args_1.
+fn unique_name(p: mut P, base: str) str:
+    n = p.uniq.get(base, 0)
+    while true:
+        n += 1
+        c = gen_name(base, n)
+        if not file_ident(&p, c) and not (c in p.gen_names):
+            p.uniq[base] = n
+            return c
+    return ""
+
+# Are the parameters (text "(a, b, ...c)") all plain names without defaults?
+fn params_simple(t: str) bool:
+    inner = t.trim()
+    inner = inner[1..len(inner) - 1]
+    for e0 in top_split(inner, 44):
+        e = e0.trim()
+        if e.starts_with("..."):
+            e = e[3..].trim()
+        if e != "" and not simple_copy(e):
+            return false
+    return true
+
+# The copies a function keeps of the parameters before the first default or rest (tsc keeps
+# its length): names x_1, patterns temps. `more` is set when parameters follow them.
+struct Copies:
+    names: [str]
+    more: bool
+
+fn param_copies(p: mut P, t: str, owner: int) Copies:
+    p.made = []
+    inner = t.trim()
+    inner = inner[1..len(inner) - 1]
+    out: [str] = []
+    pieces = top_split(inner, 44)
+    for i in 0..len(pieces):
+        e = pieces[i].trim()
+        if e == "":
+            continue
+        if e.starts_with("...") or top_assign(e) >= 0:
+            return Copies(out, true)
+        if simple_copy(e):
+            out.push(copy_name(&p, e, owner))
+        else:
+            out.push(name_temp(&p))
+    return Copies(out, false)
+
+# A parameter copy (x_1) of function `owner`, named at the end with its other generated names (u_names).
+fn copy_name(p: mut P, base: str, owner: int) str:
+    r = u_req(&p, base, p.mute == 0)
+    p.u_reqs[r].copy = true
+    p.u_reqs[r].owner = owner
+    p.u_reqs[r].seq = p.u_reqs[r].seq - 2000000000   # (in the header: before the body's names)
+    p.markers = true
+    return "\x00U" + str(r) + "\x00"
+
+# x_1: tsc's unique name for a node, unique against the file's identifiers only.
+fn scoped_name(p: mut P, base: str) str:
+    n = 1
+    while name_taken(&p, gen_name(base, n)):
+        n += 1
+    c = gen_name(base, n)
+    p.made.push(c)
+    p.gen_names[c] = true                        # (unique_name's names avoid it, file-wide)
+    return c
+
+# base_N, as tsc's makeUniqueName writes it: no second underscore after a base ending in one (_1).
+fn gen_name(base: str, n: int) str:
+    if base.ends_with("_"):
+        return base + str(n)
+    return base + "_" + str(n)
+
+# Taken for a generated name: in the source, a module variable, or made for this function.
+fn name_taken(p: mut P, c: str) bool:
+    if file_ident(&p, c):
+        return true
+    for m in p.made:
+        if m == c:
+            return true
+    for im in p.imports:
+        if im.var == c and (im.used or im.side):
+            return true
+    return false
+
+# What goes before `return __awaiter(...)`: `var arguments_1 = arguments;`, `const _super = ...`.
+fn async_prelude(c: ACtx, sn: SuperNames) str:
+    pre = ""
+    if c.args != "":
+        pre += " var " + c.args + " = arguments;"
+    if c.sindex:
+        if c.super_set:
+            pre += " const " + sn.index + " = (function (geti, seti) { const cache = Object.create(null); return name => cache[name] || (cache[name] = { get value() { return geti(name); }, set value(v) { seti(name, v); } }); })(name => super[name], (name, value) => super[name] = value);"
+        else:
+            pre += " const " + sn.index + " = name => super[name];"
+    if len(c.supers) > 0:
+        ents: [str] = []
+        for s in c.supers:
+            if c.super_set:
+                ents.push(s + ": { get: () => super." + s + ", set: v => super." + s + " = v }")
+            else:
+                ents.push(s + ": { get: () => super." + s + " }")
+        pre += " const " + sn.sup + " = Object.create(null, { " + ", ".join(ents) + " });"
+    return pre
+
+# An async generator's: the same, and `_super` whenever super is used at all (tsc writes
+# `Object.create(null, {})` for one that only indexes it).
+fn agen_prelude(c: ACtx, sn: SuperNames) str:
+    if not c.sindex and len(c.supers) == 0:
+        return ""
+    pre = async_prelude(c, sn)
+    if len(c.supers) == 0:
+        pre += " const " + sn.sup + " = Object.create(null, {});"
+    return pre
+
+struct SuperNames:
+    sup: str
+    index: str
+
+# _super / _superIndex, or _super_1 ... when the file has the name (the same in every method, as tsc).
+fn super_names_of(p: mut P) SuperNames:
+    if p.sup_name == "":
+        p.sup_name = file_unique(&p, "_super")
+        p.sup_index_name = file_unique(&p, "_superIndex")
+    return SuperNames(p.sup_name, p.sup_index_name)
+
+fn file_unique(p: mut P, base: str) str:
+    if not file_ident(&p, base):
+        return base
+    n = 1
+    while file_ident(&p, gen_name(base, n)):
+        n += 1
+    return gen_name(base, n)
+
+struct AsyncRes:
+    params: Params
+    rt: Ser
+    has_rt: bool
+
+# A function's or method's parameters and body, lowered (at its "(" or "<"; `async` dropped).
+fn async_fn_rest(p: mut P, collect: bool) AsyncRes:
+    drop_async(&p)
+    id = len(p.actx)
+    p.actx.push(ACtx("", false, [], false, false, false, "", false))
+    p.aw.push(id)
+    emit_ts(&p)
+    saved = begin_capture(&p)
+    if at_op(&p, 60):
+        emit_ts(&p)
+        skip_type_params(&p)
+        skip_pe(&p)
+    info = fparams(&p, collect)
+    emit_pe(&p)
+    pt = end_capture(&p, saved)
+    p.actx[id].params = pt
+    rt = ser(SER_VOID)
+    has_rt = false
+    if at_op(&p, 58):
+        rt = drop_return_type(&p)
+        has_rt = true
+    skip_ts(&p)
+    pt = pt.trim()
+    outer = pt
+    gen = "()"
+    arg2 = "void 0"
+    if not params_simple(pt):                    # (the copies are named before the body's names)
+        cp = param_copies(&p, pt, p.u_fns + 1)
+        outer = "(" + ", ".join(cp.names) + ")"
+        gen = pt
+        arg2 = "arguments"
+    saved2 = begin_capture(&p)
+    ga = p.in_gen
+    aa = p.in_async
+    p.in_gen = 0
+    p.in_async = 1
+    p.this_depth += 1
+    fn_body(&p)
+    p.this_depth -= 1
+    p.in_gen = ga
+    p.in_async = aa
+    emit_pe(&p)
+    body = end_capture(&p, saved2)
+    p.aw.pop()
+    c = p.actx[id]
+    p.helpers = p.helpers | H_AWAITER
+    sn = super_names_of(&p)
+    put(&p, outer + " {" + async_prelude(c, sn) + " return __awaiter(this, " + arg2 + ", void 0, function* " + gen + " " + body.trim() + "); }")
+    return AsyncRes(info, rt, has_rt)
+
+# An async arrow function, lowered (at its parameter or "("; `async` dropped).
+fn async_arrow(p: mut P, no_in: bool, single: bool):
+    drop_async(&p)
+    id = len(p.actx)
+    p.actx.push(ACtx("", false, [], false, true, false, "", false))
+    p.aw.push(id)
+    push_scope_here(&p, true)
+    emit_ts(&p)
+    saved = begin_capture(&p)
+    if single:
+        declare_tok(&p, false)
+        next(&p)
+    else:
+        if at_op(&p, 60):
+            emit_ts(&p)
+            skip_type_params(&p)
+            skip_pe(&p)
+        fparams(&p, false)
+    emit_pe(&p)
+    pt = end_capture(&p, saved)
+    p.actx[id].params = pt                       # (a for await of a parameter: tsc hoists its names)
+    if at_op(&p, 58):
+        drop_return_type(&p)
+    expect_op(&p, O_ARROW)
+    skip_ts(&p)
+    pt = pt.trim()
+    outer = pt
+    gen = "()"
+    arg2 = "void 0"
+    if single:
+        outer = "(" + pt + ")"
+    elif not params_simple(pt):                  # (copies are named before the body's names;
+        owner = p.u_fns + 1                      # owner: the body's function, fresh for an expression body)
+        if not at_op(&p, 123):
+            p.u_fns += 1
+            p.u_parent.push(u_fn_top(&p))
+            owner = p.u_fns
+        cp = param_copies(&p, pt, owner)
+        names = cp.names
+        if cp.more:
+            names.push("..." + copy_name(&p, "args", owner))
+        outer = "(" + ", ".join(names) + ")"
+        gen = pt
+        arg2 = "[" + ", ".join(names) + "]"
+    ga = p.in_gen
+    aa = p.in_async
+    p.in_gen = 0
+    p.in_async = 1
+    body = ""
+    if at_op(&p, 123):
+        saved2 = begin_capture(&p)
+        fn_body(&p)
+        emit_pe(&p)
+        b0 = end_capture(&p, saved2)
+        body = b0.trim()
+    else:
+        fid = p.pre_fn
+        p.pre_fn = -1
+        if fid < 0:
+            fid = fn_open(&p)
+        else:
+            p.fn_stack.push(fid)
+        saved3 = begin_capture(&p)
+        assign(&p, no_in)
+        emit_pe(&p)
+        t = end_capture(&p, saved3)
+        p.fn_stack.pop()
+        body = "{" + fn_vars_text(&p, fid) + " return " + t.trim() + "; }"
+    p.in_gen = ga
+    p.in_async = aa
+    pop_scope(&p)
+    p.aw.pop()
+    c = p.actx[id]
+    this_arg = "void 0"
+    if c.this_used or p.this_depth > 0:
+        this_arg = "this"
+    p.helpers = p.helpers | H_AWAITER
+    if c.args != "":                             # (arguments read inside: captured here)
+        put(&p, outer + " => { var " + c.args + " = arguments; return __awaiter(" + this_arg + ", " + arg2 + ", void 0, function* " + gen + " " + body + "); }")
+        return
+    put(&p, outer + " => __awaiter(" + this_arg + ", " + arg2 + ", void 0, function* " + gen + " " + body + ")")
+
+# `await x` in a lowered async function: `yield x`, parenthesized where an operand.
+fn await_to_yield(p: mut P):
+    before = prev_binds(&p)
+    a = p.ts
+    emit_to(&p, a)
+    next(&p)
+    skip_ts(&p)
+    saved = begin_capture(&p)
+    unary(&p)
+    emit_pe(&p)
+    t = end_capture(&p, saved)
+    s = "yield " + t.trim()
+    if in_agen(&p):
+        agen_req(&p, H_AWAIT)
+        s = "yield __await(" + t.trim() + ")"
+    if before or next_binds(&p):
+        s = "(" + s + ")"
+    put(&p, s)
+
+# `arguments` in a lowered async function: arguments_1. In an async arrow it is captured by the
+# lowered async function around it, or else by the outermost async arrow, as tsc does.
+fn async_arguments(p: mut P) bool:
+    top = async_top(&p)
+    if top < 0 or p.actx[top].gen:
+        return false
+    if p.actx[top].arrow:
+        i = len(p.aw) - 1
+        outer = -1                               # the outermost arrow in the chain
+        while i >= 0 and p.aw[i] >= 0 and p.actx[p.aw[i]].arrow:
+            outer = p.aw[i]
+            i -= 1
+        if i >= 0 and p.aw[i] >= 0 and not p.actx[p.aw[i]].gen:
+            top = p.aw[i]                        # a lowered async function: its capture
+        elif i >= 0 and p.aw[i] < 0:
+            top = outer                          # a plain function: the arrow captures
+        else:
+            return false                         # (the module's: no arguments)
+    if p.actx[top].args == "":
+        p.actx[top].args = unique_name(&p, "arguments")
+    a = p.ts
+    emit_to(&p, a)
+    nm = p.actx[top].args
+    put(&p, nm)
+    next(&p)
+    skip_to(&p, a + 9)
+    return true
+
+# `super.x` in a lowered async method, or an async arrow in a method: `_super.x` (a call
+# `_super.x.call(this, ...)`); the method declares `_super` (tsc's async super helper).
+fn async_super(p: mut P) bool:
+    top = async_top(&p)
+    n = peek_tok(&p)
+    if top < 0 or not (n.tok == T_OP and (n.op == 46 or n.op == 91)):
+        return false
+    sup = top                                    # whose `_super`: actx index, or -2 - sctx index
+    if p.actx[top].arrow:
+        i = len(p.aw) - 1
+        sup = -1
+        while i >= 0:
+            v = p.aw[i]
+            if v >= 0 and p.actx[v].arrow:
+                i -= 1
+                continue
+            if v >= 0:
+                sup = v
+            elif v <= -2:
+                sup = v
+            break
+        if sup == -1:
+            return false
+    if n.op == 91:
+        return async_super_index(&p, sup)
+    a = p.ts
+    s = save(&p)
+    next(&p)
+    next(&p)
+    if p.tok != T_NAME:
+        restore(&p, s)
+        return false
+    name = tok_text(&p)
+    found = false
+    names = super_names(&p, sup)
+    for x in names:
+        if x == name:
+            found = true
+    if not found:
+        if sup >= 0:
+            p.actx[sup].supers.push(name)
+        else:
+            p.sctx[-2 - sup].supers.push(name)
+    emit_to(&p, a)
+    put(&p, super_names_of(&p).sup + "." + name)
+    next(&p)
+    e = p.pe
+    skip_to(&p, e)
+    if at_op(&p, 61) or at_op(&p, O_ASSIGN):
+        if sup >= 0:
+            p.actx[sup].super_set = true
+        else:
+            p.sctx[-2 - sup].super_set = true
+    if at_op(&p, 60):
+        try_type_args(&p)                        # super.m<T>(...): the type arguments go
+    if at_op(&p, 40):
+        put(&p, ".call(this")
+        next(&p)
+        skip_ts(&p)
+        if not at_op(&p, 41):
+            put(&p, ", ")
+        while not at_op(&p, 41) and p.tok != T_EOF:
+            eat_op(&p, O_DOTS)
+            assign(&p, false)
+            if not eat_op(&p, 44):
+                break
+        expect_op(&p, 41)
+    return true
+
+fn super_names(p: mut P, sup: int) [str]:
+    if sup >= 0:
+        return p.actx[sup].supers
+    return p.sctx[-2 - sup].supers
+
+# A method's `const _super = ...` for the async arrows in it (marker "Z").
+fn plain_super_text(p: mut P, id: int) str:
+    sn = super_names_of(&p)
+    c = p.sctx[id]
+    return async_prelude(c, sn)
+
+# `super[k]` in a lowered async method or arrow: `_superIndex(k)`, plus `.value` if the method assigns
+# to super anywhere (marker "Q"); the method declares _superIndex.
+fn async_super_index(p: mut P, sup: int) bool:
+    a = p.ts
+    emit_to(&p, a)
+    next(&p)                                     # super
+    next(&p)                                     # [
+    at0 = p.ts
+    skip_to(&p, at0)
+    put(&p, super_names_of(&p).index + "(")
+    parse_expr(&p)
+    emit_pe(&p)
+    put(&p, ")")
+    expect_op(&p, 93)
+    e = p.pe
+    skip_to(&p, e)
+    if sup >= 0:
+        p.actx[sup].sindex = true
+    else:
+        p.sctx[-2 - sup].sindex = true
+    p.markers = true
+    put(&p, "\x00Q" + str(sup) + "\x00")
+    if at_op(&p, 61) or at_op(&p, O_ASSIGN):
+        if sup >= 0:
+            p.actx[sup].super_set = true
+        else:
+            p.sctx[-2 - sup].super_set = true
+    if at_op(&p, 60):
+        try_type_args(&p)                        # super.m<T>(...): the type arguments go
+    if at_op(&p, 40):
+        put(&p, ".call(this")
+        next(&p)
+        skip_ts(&p)
+        if not at_op(&p, 41):
+            put(&p, ", ")
+        while not at_op(&p, 41) and p.tok != T_EOF:
+            eat_op(&p, O_DOTS)
+            assign(&p, false)
+            if not eat_op(&p, 44):
+                break
+        expect_op(&p, 41)
+    return true
+
+# Marker "Q": `.value` when the method's super is assigned somewhere (async_super_index).
+fn super_index_value(p: mut P, sup: int) str:
+    set = false
+    if sup >= 0:
+        set = p.actx[sup].super_set
+    else:
+        set = p.sctx[-2 - sup].super_set
+    if set:
+        return ".value"
+    return ""

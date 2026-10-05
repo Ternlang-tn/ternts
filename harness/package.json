@@ -1,0 +1,2 @@
+{ "private": true, "type": "module",
+  "dependencies": { "acorn": "8.18.0", "prettier": "3.9.9", "@swc/core": "1.16.12", "@swc/cli": "0.8.1", "esbuild": "0.28.2", "typescript": "7.0.2", "ts5": "npm:typescript@5.9.3" } }

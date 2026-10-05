@@ -1,0 +1,6 @@
+POST /graphql {"query":"{ __schema { types { name kind fields { name type { name kind ofType { name kind ofType { name kind } } } } inputFields { name type { name kind ofType { name kind } } } } } }"}
+POST /graphql {"query":"{ recipes(skip: 0, take: 5) { id description ingredients creationDate } }"}
+POST /graphql {"query":"{ recipe(id: \"1\") { id description } }"}
+POST /graphql {"query":"mutation { addRecipe(newRecipeData: {title: \"Soup\", description: \"short\", ingredients: [\"water\"]}) { id } }"}
+POST /graphql {"query":"mutation { addRecipe(newRecipeData: {title: \"This title is way too long to pass the validation\", ingredients: []}) { id } }"}
+POST /graphql {"query":"mutation { removeRecipe(id: \"1\") }"}
