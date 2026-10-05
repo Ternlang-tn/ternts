@@ -108,12 +108,12 @@ for (const p of PLATFORMS) {
 if (!noMain) {
   // the wasm engine the per-file hooks use (the loader tern writes isn't needed)
   console.log('building ternts.wasm...');
-  run('tern', ['build', '--small', '--lib', '--target', 'wasm', 'wasm.tn', '-o', 'js/ternts.wasm']);
+  run('tern', ['build', '--lib', '--target', 'wasm', 'wasm.tn', '-o', 'js/ternts.wasm']);
   for (const f of ['js/ternts.mjs', 'js/ternts.d.ts']) fs.rmSync(path.join(ROOT, f), { force: true });
 
   // the command for platforms without a native binary, run by cli.cjs under Node's WASI
   console.log('building ternts-cli.wasm...');
-  run('tern', ['build', '--small', '--target', 'wasm', 'wasi.tn', '-o', 'js/ternts-cli.wasm']);
+  run('tern', ['build', '--target', 'wasm', 'wasi.tn', '-o', 'js/ternts-cli.wasm']);
 
   const main = path.join(OUT, 'ternts');
   fs.mkdirSync(path.join(main, 'js'), { recursive: true });
