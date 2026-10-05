@@ -8,6 +8,28 @@ const path = require('node:path');
 const { findBin } = require('./client.cjs');
 
 const args = process.argv.slice(2);
+const version = () => {   // (the package's; in a checkout, npm/package.json)
+  for (const p of ['../package.json', '../npm/package.json']) {
+    try { return require(p).version; } catch {}
+  }
+  return 'dev';
+};
+if (args.length === 1 && (args[0] === '--version' || args[0] === '-v')) {
+  process.stdout.write(version() + '\n');
+  process.exit(0);
+}
+if (args.length === 0 || (args.length === 1 && (args[0] === '--help' || args[0] === '-h'))) {
+  process.stdout.write(`ternts ${version()}: TypeScript to JavaScript, as tsc emits it
+
+  ternts build [-p tsconfig.json] [--watch]   the project in tsconfig.json
+  ternts build SRC OUT [--esm]                a directory, without a tsconfig
+  ternts dev [--warm] [-- CMD...]             build, run, and rebuild + restart on save
+  ternts IN.ts [OUT.js]                       one file
+
+https://ternlang.dev/ts/
+`);
+  process.exit(0);
+}
 const bin = process.env.TERNTS_CLI === 'wasm' ? null : findBin(undefined, true);
 if (!bin) process.exit(runWasm(args));
 const r = spawnSync(bin, args, { stdio: 'inherit' });
